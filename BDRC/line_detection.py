@@ -13,7 +13,7 @@ import numpy as np
 import numpy.typing as npt
 from typing import List, Tuple, Sequence
 
-from BDRC.Data import BBox, Line
+from BDRC.data import BBox, Line
 from uuid import uuid1
 
 
