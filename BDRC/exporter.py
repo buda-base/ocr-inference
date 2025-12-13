@@ -216,8 +216,8 @@ class PageXMLExporter(Exporter):
         text_region_coords = etree.SubElement(text_region, "Coords")
         text_region_coords.attrib["points"] = text_bbox
 
-        print(f"Exporting XML Lines: {len(text_lines)}")
-        print(f"Exporting Line Info: {len(lines)}")
+        #print(f"Exporting XML Lines: {len(text_lines)}")
+        #print(f"Exporting Line Info: {len(lines)}")
 
         for l_idx, line in enumerate(lines):
             if text_lines is not None and len(text_lines) > 0:

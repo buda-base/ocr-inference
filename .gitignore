@@ -208,3 +208,5 @@ __marimo__/
 
 # Models Directory
 Models
+Output
+dev_cli.py

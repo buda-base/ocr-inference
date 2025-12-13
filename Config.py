@@ -11,6 +11,24 @@ from BDRC.data import (
 )
 
 """
+MODELS on HuggingFace
+"""
+
+MODEL_DICT = {
+    "Lines_v1": "BDRC/PhotiLines",
+    "Photi_v2": "BDRC/Photi-v2",
+    "Woodblock": "BDRC/Woodblock",
+    "UCHAN": "BDRC/BigUCHAN_v1",
+    "DergeTenjur": "BDRC/DergeTenjur",
+    "GoogleBooks_C": "BDRC/GoogleBooks_C_v1",
+    "GoogleBooks_E": "BDRC/GoogleBooks_E_v1",
+    "Norbuketaka_C": "BDRC/Norbuketaka_C_V1",
+    "Norbuketaka_E": "BDRC/Norbuketaka_E_V1",
+    "Drutsa-A_E": "BDRC/Drutsa-A_E_v1",
+}
+
+
+"""
 Mappings for each data type
 """
 
@@ -26,6 +44,15 @@ COLOR_DICT = {
     "footer": "255, 255, 100",
     "line": "0, 100, 255",
 }
+"""
+page_classes = {
+    "background": "0, 0, 0",
+    "image": "45, 255, 0",
+    "line": "255, 100, 0",
+    "margin": "255, 0, 0",
+    "caption": "255, 100, 243",
+}"""
+
 
 LANGUAGES = {
     "en": Language.ENGLISH,

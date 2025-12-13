@@ -22,24 +22,44 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 import onnxruntime as ort
 
-from BDRC.data import BBox, Line, OCRData, OCRModel, OCRModelConfig
+from BDRC.data import BBox, Line, OCRData, OCRModel, OCRModelConfig, LineDetectionConfig, LayoutDetectionConfig
 
 # Import functions from specialized modules for backward compatibility
 # Import generate_guid from line_detection module for backward compatibility
 from BDRC.line_detection import calculate_rotation_angle_from_lines, generate_guid, mask_n_crop, rotate_from_angle
-from Config import CHARSETENCODER, OCRARCHITECTURE
+from Config import CHARSETENCODER, OCRARCHITECTURE, COLOR_DICT
 
-page_classes = {
-    "background": "0, 0, 0",
-    "image": "45, 255, 0",
-    "line": "255, 100, 0",
-    "margin": "255, 0, 0",
-    "caption": "255, 100, 243",
-}
+from huggingface_hub import snapshot_download
+
+def show_image(
+    image: npt.NDArray, cmap: str = "", axis="off", fig_x: int = 24, fix_y: int = 13
+) -> None:
+    plt.figure(figsize=(fig_x, fix_y))
+    plt.axis(axis)
+
+    if cmap != "":
+        plt.imshow(image, cmap=cmap)
+    else:
+        plt.imshow(image)
+
+
+def show_overlay(
+    image: npt.NDArray,
+    mask: npt.NDArray,
+    alpha=0.4,
+    axis="off",
+    fig_x: int = 24,
+    fix_y: int = 13,
+):
+    plt.figure(figsize=(fig_x, fix_y))
+    plt.axis(axis)
+    plt.imshow(image)
+    plt.imshow(mask, alpha=alpha)
 
 
 def get_utc_time():
@@ -53,6 +73,88 @@ def get_utc_time():
     utc_time = utc_time.strftime("%Y-%m-%dT%H:%M:%S")
 
     return utc_time
+
+
+def download_model(identifier: str) -> str:  
+    model_path = snapshot_download(
+        repo_id=identifier,
+        repo_type="model",
+        local_dir=f"Models/{identifier}",
+        force_download=True
+    )
+
+    model_config = f"{model_path}/model_config.json"
+    assert os.path.isfile(model_config)
+
+    return model_config
+
+
+def read_ocr_model_config(config_file: str):
+    model_dir = os.path.dirname(config_file)
+    file = open(config_file, encoding="utf-8")
+    json_content = json.loads(file.read())
+
+    onnx_model_file = f"{model_dir}/{json_content['onnx-model']}"
+
+    input_width = json_content["input_width"]
+    input_height = json_content["input_height"]
+    input_layer = json_content["input_layer"]
+    output_layer = json_content["output_layer"]
+    squeeze_channel_dim = (
+        True if json_content["squeeze_channel_dim"] == "yes" else False
+    )
+    swap_hw = True if json_content["swap_hw"] == "yes" else False
+    characters = get_charset(json_content["charset"])
+
+    config = OCRModelConfig(
+        onnx_model_file,
+        input_width,
+        input_height,
+        input_layer,
+        output_layer,
+        squeeze_channel_dim,
+        swap_hw,
+        characters
+    )
+
+    return config
+
+
+def read_line_model_config(config_file: str) -> LineDetectionConfig:
+    model_dir = os.path.dirname(config_file)
+    file = open(config_file, encoding="utf-8")
+    json_content = json.loads(file.read())
+
+    onnx_model_file = f"{model_dir}/{json_content['onnx-model']}"
+    patch_size = int(json_content["patch_size"])
+
+    config = LineDetectionConfig(onnx_model_file, patch_size)
+
+    return config
+
+
+def read_layout_model_config(config_file: str) -> LayoutDetectionConfig:
+    model_dir = os.path.dirname(config_file)
+    file = open(config_file, encoding="utf-8")
+    json_content = json.loads(file.read())
+
+    onnx_model_file = f"{model_dir}/{json_content['onnx-model']}"
+    patch_size = int(json_content["patch_size"])
+    classes = json_content["classes"]
+
+    config = LayoutDetectionConfig(onnx_model_file, patch_size, classes)
+
+    return config
+
+
+def get_charset(charset: str) -> List[str]:
+    if isinstance(charset, str):
+        charset = [x for x in charset]
+
+    elif isinstance(charset, List):
+        charset = charset
+    
+    return [x for x in charset]
 
 
 def get_execution_providers() -> List[str]:
@@ -682,25 +784,25 @@ def create_preview_image(
     mask = np.zeros(image.shape, dtype=np.uint8)
 
     if image_predictions is not None and len(image_predictions) > 0:
-        color = tuple([int(x) for x in page_classes["image"].split(",")])
+        color = tuple([int(x) for x in COLOR_DICT["image"].split(",")])
 
         for idx, _ in enumerate(image_predictions):
             cv2.drawContours(mask, image_predictions, contourIdx=idx, color=color, thickness=-1)
 
     if line_predictions is not None:
-        color = tuple([int(x) for x in page_classes["line"].split(",")])
+        color = tuple([int(x) for x in COLOR_DICT["line"].split(",")])
 
         for idx, _ in enumerate(line_predictions):
             cv2.drawContours(mask, line_predictions, contourIdx=idx, color=color, thickness=-1)
 
     if len(caption_predictions) > 0:
-        color = tuple([int(x) for x in page_classes["caption"].split(",")])
+        color = tuple([int(x) for x in COLOR_DICT["caption"].split(",")])
 
         for idx, _ in enumerate(caption_predictions):
             cv2.drawContours(mask, caption_predictions, contourIdx=idx, color=color, thickness=-1)
 
     if len(margin_predictions) > 0:
-        color = tuple([int(x) for x in page_classes["margin"].split(",")])
+        color = tuple([int(x) for x in COLOR_DICT["margin"].split(",")])
 
         for idx, _ in enumerate(margin_predictions):
             cv2.drawContours(mask, margin_predictions, contourIdx=idx, color=color, thickness=-1)

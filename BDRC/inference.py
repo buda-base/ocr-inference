@@ -53,10 +53,10 @@ class CTCDecoder:
             self.charset = charset
 
         self.ctc_vocab = self.charset.copy()
-        self.add_blank = add_blank
-
-        if self.add_blank:
+        
+        if add_blank and " " not in self.ctc_vocab:
             self.ctc_vocab.insert(0, " ")
+
         self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
 
     def encode(self, label: str):
@@ -304,9 +304,6 @@ class OCRInference:
         return text
 
 
-
-
-
 class OCRPipeline:
     """
     Note: The handling of line model vs. layout model is kind of provisional here and totally depends on
@@ -316,7 +313,7 @@ class OCRPipeline:
     """
 
     def __init__(
-        self, ocr_config: OCRModelConfig, line_config: LineDetectionConfig | LayoutDetectionConfig
+        self, ocr_config: OCRModelConfig, line_config: LineDetectionConfig | LayoutDetectionConfig, use_line_prepadding: bool = False
     ):
         self.ready = False
         self.ocr_model_config = ocr_config
@@ -324,6 +321,7 @@ class OCRPipeline:
         self.encoder = ocr_config.encoder
         self.ocr_inference = OCRInference(self.ocr_model_config)
         self.converter = pyewts.pyewts()
+        self.use_line_prepadding = use_line_prepadding
 
         if isinstance(self.line_config, LineDetectionConfig):
             self.line_inference = LineDetection(self.line_config)
@@ -362,7 +360,7 @@ class OCRPipeline:
             line_mask = self.line_inference.predict(image)
         else:
             layout_mask = self.line_inference.predict(image)
-            line_mask = layout_mask[:, :, 2]
+            line_mask = layout_mask[:, :, self.line_config.classes.index("line")]
         return OpStatus.SUCCESS, line_mask
 
     def build_lines(
@@ -471,7 +469,10 @@ class OCRPipeline:
         """
         ocr_lines = []
         for line_img, line_info in zip(line_images, sorted_lines):
-            pred = self.ocr_inference.run(line_img).strip().replace("§", " ")
+            if line_img.shape[0] == 0 or line_img.shape[1] == 0:
+                    continue
+
+            pred = self.ocr_inference.run(line_img, self.use_line_prepadding).strip().replace("§", " ")
 
             if self.encoder == CharsetEncoder.WYLIE and target_encoding == Encoding.UNICODE:
                 pred = self.converter.toUnicode(pred)
