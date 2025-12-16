@@ -207,6 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 # Models Directory
-Models
-Output
+models
+output
+ocr_models
 dev_cli.py
+test_data

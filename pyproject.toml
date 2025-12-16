@@ -1,0 +1,31 @@
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+exclude = ["tests", "venv", ".venv"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "--verbose --log-cli-level=DEBUG"
+
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "PLR0913",  # Too many arguments in function definition
+    "D",
+    "COM812",  # Trailing comma missing
+    "TRY003",
+    "EM101",
+    "EM102",
+    "ERA001",
+    "C901",
+    "TD",
+    "PLR0912",
+    "PLR0915",
+    "S318",
+]

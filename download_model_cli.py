@@ -1,15 +1,14 @@
+# ruff: noqa: T201
 import argparse
-import os
 import sys
+from pathlib import Path
 
-from Config import MODEL_DICT
-from BDRC.utils import download_model
+from bdrc.utils import download_model
+from config import MODEL_DICT
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Download a model from HuggingFace."
-    )
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Download a model from HuggingFace.")
     parser.add_argument(
         "--model",
         required=True,
@@ -24,11 +23,11 @@ def main():
 
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     try:
         download_model(MODEL_DICT[args.model])  # ideally pass args.output_dir
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[ERROR] Failed to download model '{args.model}': {e}", file=sys.stderr)
         sys.exit(1)
 

@@ -8,16 +8,37 @@ various configuration options.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Tuple, Optional
 from uuid import UUID
 
 import numpy.typing as npt
+
 
 class OpStatus(Enum):
     """Operation status indicators for various OCR operations."""
 
     SUCCESS = 0
     FAILED = 1
+
+
+class OCRError(Exception):
+    """Base exception for OCR pipeline errors."""
+
+
+class LineDetectionError(OCRError):
+    """Raised when line detection fails."""
+
+
+class LineExtractionError(OCRError):
+    """Raised when line extraction or filtering fails."""
+
+
+class DewarpingError(OCRError):
+    """Raised when dewarping fails."""
+
+
+class TextRecognitionError(OCRError):
+    """Raised when text recognition fails."""
+
 
 class Encoding(Enum):
     """Text encoding formats for OCR output."""
@@ -39,7 +60,6 @@ class ExportFormat(Enum):
     TXT = 0
     XML = 1
     JSON = 2
-
 
 
 class LineMode(Enum):
@@ -116,7 +136,7 @@ class Line:
     guid: UUID
     contour: npt.NDArray
     bbox: BBox
-    center: Tuple[int, int]
+    center: tuple[int, int]
 
 
 @dataclass
@@ -134,12 +154,12 @@ class LayoutData:
 
     image: npt.NDArray
     rotation: float
-    images: List[BBox]
-    text_bboxes: List[BBox]
-    lines: List[Line]
-    captions: List[BBox]
-    margins: List[BBox]
-    predictions: Dict[str, npt.NDArray]
+    images: list[BBox]
+    text_bboxes: list[BBox]
+    lines: list[Line]
+    captions: list[BBox]
+    margins: list[BBox]
+    predictions: dict[str, npt.NDArray]
 
 
 @dataclass
@@ -150,10 +170,11 @@ class OCRData:
     image_path: str
     image_name: str
     image: npt.NDArray
-    ocr_lines: List[OCRLine] | None
-    lines: List[Line] | None
+    ocr_lines: list[OCRLine] | None
+    lines: list[Line] | None
     preview: npt.NDArray | None
     angle: float
+
 
 @dataclass
 class DewarpingResult:
@@ -161,12 +182,13 @@ class DewarpingResult:
 
     work_img: npt.NDArray
     work_mask: npt.NDArray
-    filtered_contours: List
+    filtered_contours: list
     page_angle: float
     applied: bool
-    tps_ratio: Optional[float] = None
-    dewarped_img: Optional[npt.NDArray] = None
-    dewarped_mask: Optional[npt.NDArray] = None
+    tps_ratio: float | None = None
+    dewarped_img: npt.NDArray | None = None
+    dewarped_mask: npt.NDArray | None = None
+
 
 @dataclass
 class LineDetectionConfig:
@@ -182,7 +204,7 @@ class LayoutDetectionConfig:
 
     model_file: str
     patch_size: int
-    classes: List[str]
+    classes: list[str]
 
 
 @dataclass
@@ -198,7 +220,7 @@ class OCRModelConfig:
     squeeze_channel: bool
     swap_hw: bool
     encoder: CharsetEncoder
-    charset: List[str]
+    charset: list[str]
     add_blank: bool
     version: str
 
@@ -208,7 +230,7 @@ class LineDataResult:
     """Result container for line detection operations."""
 
     guid: UUID
-    lines: List[Line]
+    lines: list[Line]
 
 
 @dataclass
@@ -217,8 +239,8 @@ class OCResult:
 
     guid: UUID
     mask: npt.NDArray
-    lines: List[Line]
-    text: List[OCRLine]
+    lines: list[Line]
+    text: list[OCRLine]
     angle: float
 
 

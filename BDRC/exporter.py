@@ -6,19 +6,20 @@ including plain text, PageXML, and JSON. The base Exporter class defines
 the interface, with concrete implementations for each format.
 """
 
-import abc
 import json
 import logging
-import xml.etree.ElementTree as etree  # nosec B405
-from typing import List
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from xml.dom import minidom
 
 import numpy.typing as npt
 import pyewts
-from xml.dom import minidom
 
-from BDRC.data import BBox, Line, OCRLine
-from BDRC.line_detection import optimize_countour
-from BDRC.utils import get_text_bbox, get_utc_time, rotate_contour
+from bdrc.data import BBox, Line, OCRLine
+from bdrc.line_detection import optimize_countour
+from bdrc.utils import get_text_bbox, get_utc_time, rotate_contour
+
+logger = logging.getLogger(__name__)
 
 
 class Exporter:
@@ -29,7 +30,7 @@ class Exporter:
     to various formats. Subclasses implement specific export formats.
     """
 
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir: str) -> None:
         """
         Initialize the exporter with output directory.
 
@@ -38,27 +39,7 @@ class Exporter:
         """
         self.output_dir = output_dir
         self.converter = pyewts.pyewts()
-        logging.info("Init Exporter")
-
-    @classmethod
-    def __subclasshook__(cls, subclass):
-        return hasattr(subclass, "export_lines") and callable(subclass.export_lines) or NotImplemented
-
-    @abc.abstractmethod
-    def export_text(self, image_name: str, text_lines: List[OCRLine]):
-        """Exports only the text lines"""
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def export_lines(
-        self,
-        image: npt.NDArray | None,
-        image_name: str,
-        lines: List[Line],
-        text_lines: List[str],
-    ):
-        """Exports text lines and line informations"""
-        raise NotImplementedError
+        logger.info("Init Exporter")
 
     @staticmethod
     def get_bbox(bbox: BBox) -> tuple[int, int, int, int]:
@@ -79,7 +60,7 @@ class Exporter:
         return x, y, w, h
 
     @staticmethod
-    def get_text_points(contour):
+    def get_text_points(contour: npt.NDArray) -> str:
         """
         Convert contour points to string format for XML export.
 
@@ -96,7 +77,7 @@ class Exporter:
         return points
 
     @staticmethod
-    def get_bbox_points(bbox: BBox):
+    def get_bbox_points(bbox: BBox) -> str:
         """
         Convert BBox to coordinate points string for XML export.
 
@@ -106,11 +87,10 @@ class Exporter:
         Returns:
             String of corner coordinates in XML format
         """
-        points = (
+        return (
             f"{bbox.x},{bbox.y} {bbox.x + bbox.w},{bbox.y} "
             f"{bbox.x + bbox.w},{bbox.y + bbox.h} {bbox.x},{bbox.y + bbox.h}"
         )
-        return points
 
 
 class PageXMLExporter(Exporter):
@@ -129,9 +109,9 @@ class PageXMLExporter(Exporter):
             output_dir: Directory path for exported XML files
         """
         super().__init__(output_dir)
-        logging.info("Init XML Exporter")
+        logger.info("Init XML Exporter")
 
-    def get_text_line_block(self, coordinate, index: int, unicode_text: str):
+    def get_text_line_block(self, coordinate: str, index: int, unicode_text: str) -> ET.Element:
         """
         Create XML element for a single text line.
 
@@ -143,18 +123,18 @@ class PageXMLExporter(Exporter):
         Returns:
             XML element representing the text line
         """
-        text_line = etree.Element("Textline", id="", custom=f"readingOrder {{index:{index};}}")
-        text_line = etree.Element("TextLine")
+        text_line = ET.Element("Textline", id="", custom=f"readingOrder {{index:{index};}}")
+        text_line = ET.Element("TextLine")
         text_line_coords = coordinate
 
-        text_line.attrib["id"] = f"line_9874_{str(index)}"
-        text_line.attrib["custom"] = f"readingOrder {{index: {str(index)};}}"
+        text_line.attrib["id"] = f"line_9874_{index!s}"
+        text_line.attrib["custom"] = f"readingOrder {{index: {index!s};}}"
 
-        coords_points = etree.SubElement(text_line, "Coords")
+        coords_points = ET.SubElement(text_line, "Coords")
         coords_points.attrib["points"] = text_line_coords
 
-        text_equiv = etree.SubElement(text_line, "TextEquiv")
-        unicode_field = etree.SubElement(text_equiv, "Unicode")
+        text_equiv = ET.SubElement(text_line, "TextEquiv")
+        unicode_field = ET.SubElement(text_equiv, "Unicode")
         unicode_field.text = unicode_text
 
         return text_line
@@ -164,9 +144,9 @@ class PageXMLExporter(Exporter):
         image: npt.NDArray,
         image_name: str,
         text_bbox: str,
-        lines: List[str],
-        text_lines: List[OCRLine] | None,
-    ):
+        lines: list[str],
+        text_lines: list[OCRLine] | None,
+    ) -> str:
         """
         Build complete PageXML document structure.
 
@@ -180,7 +160,7 @@ class PageXMLExporter(Exporter):
         Returns:
             Formatted XML document string
         """
-        root = etree.Element("PcGts")
+        root = ET.Element("PcGts")
         root.attrib["xmlns"] = "http://schema.primaresearch.org/PAGE/gts/pagecontent/2013-07-15"
         root.attrib["xmlns:xsi"] = "http://www.w3.org/2001/XMLSchema-instance"
         root.attrib["xsi:schemaLocation"] = (
@@ -188,36 +168,36 @@ class PageXMLExporter(Exporter):
             "http://schema.primaresearch.org/PAGE/gts/pagecontent/2013-07-15/pagecontent.xsd"
         )
 
-        metadata = etree.SubElement(root, "Metadata")
-        creator = etree.SubElement(metadata, "Creator")
+        metadata = ET.SubElement(root, "Metadata")
+        creator = ET.SubElement(metadata, "Creator")
         creator.text = "Transkribus"
-        created = etree.SubElement(metadata, "Created")
+        created = ET.SubElement(metadata, "Created")
         created.text = get_utc_time()
 
-        page = etree.SubElement(root, "Page")
+        page = ET.SubElement(root, "Page")
         page.attrib["imageFilename"] = image_name
         page.attrib["imageWidth"] = f"{image.shape[1]}"
         page.attrib["imageHeight"] = f"{image.shape[0]}"
 
-        reading_order = etree.SubElement(page, "ReadingOrder")
-        ordered_group = etree.SubElement(reading_order, "OrderedGroup")
+        reading_order = ET.SubElement(page, "ReadingOrder")
+        ordered_group = ET.SubElement(reading_order, "OrderedGroup")
         ordered_group.attrib["id"] = f"1234_{0}"
         ordered_group.attrib["caption"] = "Regions reading order"
 
-        region_ref_indexed = etree.SubElement(reading_order, "RegionRefIndexed")
+        region_ref_indexed = ET.SubElement(reading_order, "RegionRefIndexed")
         region_ref_indexed.attrib["index"] = "0"
         region_ref = "region_main"
         region_ref_indexed.attrib["regionRef"] = region_ref
 
-        text_region = etree.SubElement(page, "TextRegion")
+        text_region = ET.SubElement(page, "TextRegion")
         text_region.attrib["id"] = region_ref
         text_region.attrib["custom"] = "readingOrder {index:0;}"
 
-        text_region_coords = etree.SubElement(text_region, "Coords")
+        text_region_coords = ET.SubElement(text_region, "Coords")
         text_region_coords.attrib["points"] = text_bbox
 
-        #print(f"Exporting XML Lines: {len(text_lines)}")
-        #print(f"Exporting Line Info: {len(lines)}")
+        # print(f"Exporting XML Lines: {len(text_lines)}")
+        # print(f"Exporting Line Info: {len(lines)}")
 
         for l_idx, line in enumerate(lines):
             if text_lines is not None and len(text_lines) > 0:
@@ -227,21 +207,22 @@ class PageXMLExporter(Exporter):
             else:
                 text_region.append(self.get_text_line_block(coordinate=line, index=l_idx, unicode_text=""))
 
-        parsed_xml = minidom.parseString(etree.tostring(root))
-        parsed_xml = parsed_xml.toprettyxml()
-
-        return parsed_xml
+        parsed_xml = minidom.parseString(ET.tostring(root))
+        return parsed_xml.toprettyxml()
 
     def export_lines(
         self,
         image: npt.NDArray | None,
         image_name: str,
-        lines: List[Line],
-        text_lines: List[OCRLine],
+        lines: list[Line],
+        text_lines: list[OCRLine],
+        *,
         optimize: bool = True,
         bbox: bool = False,
         angle: float = 0.0,
-    ):
+    ) -> None:
+        if image is None:
+            raise ValueError("image is required for PageXML export")
 
         if angle != abs(0):
             x_center = image.shape[1] // 2
@@ -255,7 +236,7 @@ class PageXMLExporter(Exporter):
                 line.contour = optimize_countour(line.contour)
 
         if bbox:
-            plain_lines = [self.get_bbox(x.bbox) for x in lines]
+            plain_lines = [self.get_bbox_points(x.bbox) for x in lines]
         else:
             plain_lines = [self.get_text_points(x.contour) for x in lines]
 
@@ -272,7 +253,7 @@ class PageXMLExporter(Exporter):
 
         out_file = f"{self.output_dir}/{image_name}.xml"
 
-        with open(out_file, "w", encoding="UTF-8") as f:
+        with Path(out_file).open("w", encoding="UTF-8") as f:
             f.write(xml_doc)
 
 
@@ -291,15 +272,13 @@ class TextExporter(Exporter):
             output_dir: Directory path for exported text files
         """
         super().__init__(output_dir)
-        logging.info("Init Text Exporter")
+        logger.info("Init Text Exporter")
 
     def export_lines(
         self,
-        image: npt.NDArray | None,
         image_name: str,
-        lines: List[Line],
         text_lines: list[OCRLine],
-    ):
+    ) -> None:
         """
         Export OCR results to plain text file.
 
@@ -315,11 +294,10 @@ class TextExporter(Exporter):
 
         out_file = f"{self.output_dir}/{image_name}.txt"
 
-        with open(out_file, "w", encoding="UTF-8") as f:
-            for _line in text_lines:
-                f.write(f"{_line.text}\n")
+        with Path(out_file).open("w", encoding="UTF-8") as f:
+            f.writelines(f"{_line.text}\n" for _line in text_lines)
 
-    def export_text(self, image_name: str, text_lines: List[OCRLine]):
+    def export_text(self, image_name: str, text_lines: list[OCRLine]) -> None:
         """
         Export text lines to a plain text file.
 
@@ -329,9 +307,8 @@ class TextExporter(Exporter):
         """
         out_file = f"{self.output_dir}/{image_name}.txt"
 
-        with open(out_file, "w", encoding="UTF-8") as f:
-            for _line in text_lines:
-                f.write(f"{_line.text}\n")
+        with Path(out_file).open("w", encoding="UTF-8") as f:
+            f.writelines(f"{_line.text}\n" for _line in text_lines)
 
 
 class JsonExporter(Exporter):
@@ -350,18 +327,19 @@ class JsonExporter(Exporter):
             output_dir: Directory path for exported JSON files
         """
         super().__init__(output_dir)
-        logging.info("Init JSON Exporter")
+        logger.info("Init JSON Exporter")
 
     def export_lines(
         self,
         image: npt.NDArray | None,
         image_name: str,
-        lines: List[Line],
+        lines: list[Line],
         text_lines: list[OCRLine],
+        *,
         optimize: bool = True,
         bbox: bool = False,
         angle: float = 0.0,
-    ):
+    ) -> None:
         """
         Export OCR results to JSON Lines format.
 
@@ -375,7 +353,7 @@ class JsonExporter(Exporter):
             angle: Rotation angle for coordinate transformation
         """
 
-        if angle != abs(0):
+        if angle != abs(0) and image is not None:
             x_center = image.shape[1] // 2
             y_center = image.shape[0] // 2
 
@@ -403,5 +381,5 @@ class JsonExporter(Exporter):
 
         out_file = f"{self.output_dir}/{image_name}.jsonl"
 
-        with open(out_file, "w", encoding="UTF-8") as f:
+        with Path(out_file).open("w", encoding="UTF-8") as f:
             json.dump(json_record, f, ensure_ascii=False, indent=1)

@@ -6,9 +6,9 @@ Handles structured storage of all artifacts generated during OCR processing.
 
 import json
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import cv2
 import numpy as np
@@ -20,25 +20,25 @@ SUBDIR_NAMES = ["detection", "dewarping", "lines", "results"]
 class ArtifactManager:
     """Manages structured artifact storage for OCR pipeline outputs."""
 
-    def __init__(self, base_output_dir: str, job_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, base_output_dir: str, job_id: str | None = None, config: dict[str, Any] | None = None) -> None:
         self.base_output_dir = Path(base_output_dir)
-        self.job_id = job_id or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}"
+        self.job_id = job_id or f"{datetime.now(tz=UTC).strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}"
         self.job_dir = self.base_output_dir / self.job_id
         self.config = config or {}
-        self.manifest: List[Dict[str, str]] = []
-        self.page_metrics: Dict[str, Dict[str, Any]] = {}
-        self.current_page: Optional[str] = None
+        self.manifest: list[dict[str, str]] = []
+        self.page_metrics: dict[str, dict[str, Any]] = {}
+        self.current_page: str | None = None
         self._base_dir: Path = self.job_dir  # Where subdirs are rooted
 
     @property
-    def subdirs(self) -> Dict[str, Path]:
+    def subdirs(self) -> dict[str, Path]:
         return {name: self._base_dir / name for name in SUBDIR_NAMES}
 
-    def create_directory_structure(self):
+    def create_directory_structure(self) -> None:
         """Create the base job directory."""
         self.job_dir.mkdir(parents=True, exist_ok=True)
 
-    def set_current_page(self, page_name: str):
+    def set_current_page(self, page_name: str) -> None:
         """Set current page context for batch processing (creates page subdirectory)."""
         self.current_page = page_name
         self._base_dir = self.job_dir / page_name
@@ -56,15 +56,15 @@ class ArtifactManager:
         """Get results directory path, creating it if necessary."""
         return self._ensure_subdir("results")
 
-    def _add_to_manifest(self, name: str, artifact_type: str, path: str):
+    def _add_to_manifest(self, name: str, artifact_type: str, path: str) -> None:
         self.manifest.append(
-            {"name": name, "type": artifact_type, "path": path, "timestamp": datetime.now().isoformat()}
+            {"name": name, "type": artifact_type, "path": path, "timestamp": datetime.now(tz=UTC).isoformat()}
         )
 
-    def save_config(self):
+    def save_config(self) -> None:
         """Save job configuration to config.json."""
         path = self.job_dir / "config.json"
-        with open(path, "w", encoding="utf-8") as f:
+        with Path.open(path, "w", encoding="utf-8") as f:
             json.dump(self.config, f, indent=2, default=str)
         self._add_to_manifest("config.json", "configuration", str(path))
 
@@ -75,10 +75,10 @@ class ArtifactManager:
         self._add_to_manifest(name, "image", str(path))
         return path
 
-    def save_json(self, name: str, data: Any, subdir: str) -> Path:
+    def save_json(self, name: str, data: object, subdir: str) -> Path:
         """Save JSON data artifact."""
         path = self._ensure_subdir(subdir) / f"{name}.json"
-        with open(path, "w", encoding="utf-8") as f:
+        with Path.open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
         self._add_to_manifest(name, "json", str(path))
         return path
@@ -93,7 +93,7 @@ class ArtifactManager:
     def save_text(self, name: str, text: str, subdir: str, ext: str = "txt") -> Path:
         """Save text artifact."""
         path = self._ensure_subdir(subdir) / f"{name}.{ext}"
-        with open(path, "w", encoding="utf-8") as f:
+        with Path.open(path, "w", encoding="utf-8") as f:
             f.write(text)
         self._add_to_manifest(name, "text", str(path))
         return path
@@ -101,19 +101,21 @@ class ArtifactManager:
     def generate_manifest(self) -> Path:
         """Generate and save the artifact manifest."""
         path = self.job_dir / "manifest.json"
-        with open(path, "w", encoding="utf-8") as f:
+        with Path.open(path, "w", encoding="utf-8") as f:
             json.dump(
-                {"job_id": self.job_id, "created": datetime.now().isoformat(), "artifacts": self.manifest}, f, indent=2
+                {"job_id": self.job_id, "created": datetime.now(tz=UTC).isoformat(), "artifacts": self.manifest},
+                f,
+                indent=2,
             )
         return path
 
-    def save_metrics(self, metrics: Dict[str, Any]) -> Path:
+    def save_metrics(self, metrics: dict[str, Any]) -> Path:
         """Save metrics (stores for aggregation in batch mode, writes directly otherwise)."""
         if self.current_page:
             self.page_metrics[self.current_page] = metrics
             return self.job_dir / "metrics.json"
         path = self.job_dir / "metrics.json"
-        with open(path, "w", encoding="utf-8") as f:
+        with Path.open(path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2, default=str)
         return path
 
@@ -134,6 +136,6 @@ class ArtifactManager:
             "per_page_metrics": self.page_metrics,
         }
         path = self.job_dir / "metrics.json"
-        with open(path, "w", encoding="utf-8") as f:
+        with Path.open(path, "w", encoding="utf-8") as f:
             json.dump(aggregate, f, indent=2, default=str)
         return path

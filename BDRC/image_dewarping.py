@@ -8,18 +8,25 @@ This module contains functions for:
 - TPS control point calculation and optimization
 """
 
-from typing import List
-
 import cv2
 import numpy as np
 import numpy.typing as npt
 import scipy
 from tps import ThinPlateSpline
 
-from BDRC.line_detection import get_line_image
+from bdrc.line_detection import get_line_image
+
+RGB_NDIM = 3  # RGB images have 3 dimensions (height, width, channels)
 
 
-def run_tps(image: npt.NDArray, input_pts, output_pts, add_corners=True, alpha=0.5):
+def run_tps(
+    image: npt.NDArray,
+    input_pts: npt.NDArray | list,
+    output_pts: npt.NDArray | list,
+    *,
+    add_corners: bool = True,
+    alpha: float = 0.5,
+) -> npt.NDArray:
     """
     Apply Thin Plate Spline transformation to dewarp an image.
 
@@ -33,17 +40,16 @@ def run_tps(image: npt.NDArray, input_pts, output_pts, add_corners=True, alpha=0
     Returns:
         Dewarped image array
     """
-    if len(image.shape) == 3:
-        height, width, _ = image.shape
-    else:
+    if len(image.shape) != RGB_NDIM:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        height, width, _ = image.shape
 
-    input_pts = npt.NDArray(input_pts)
-    output_pts = npt.NDArray(output_pts)
+    height, width, _ = image.shape
+
+    input_pts = np.array(input_pts)
+    output_pts = np.array(output_pts)
 
     if add_corners:
-        corners = npt.NDArray(  # Add corners ctrl points
+        corners = np.array(  # Add corners ctrl points
             [
                 [0.0, 0.0],
                 [1.0, 0.0],
@@ -63,7 +69,7 @@ def run_tps(image: npt.NDArray, input_pts, output_pts, add_corners=True, alpha=0
 
     output_indices = np.indices((height, width), dtype=np.float64).transpose(1, 2, 0)  # Shape: (H, W, 2)
     input_indices = tps.transform(output_indices.reshape(-1, 2)).reshape(height, width, 2)
-    warped = np.concatenate(
+    return np.concatenate(
         [
             scipy.ndimage.map_coordinates(image[..., channel], input_indices.transpose(2, 0, 1))[..., None]
             for channel in (0, 1, 2)
@@ -71,10 +77,8 @@ def run_tps(image: npt.NDArray, input_pts, output_pts, add_corners=True, alpha=0
         axis=-1,
     )
 
-    return warped
 
-
-def get_global_center(slice_image: npt.NDArray, start_x: int, bbox_y: int):
+def get_global_center(slice_image: npt.NDArray, start_x: int, bbox_y: int) -> tuple[int, int, int]:
     """
     Transfer coordinates of a 'local' bbox taken from a line back to the image space.
 
@@ -115,7 +119,9 @@ def get_global_center(slice_image: npt.NDArray, start_x: int, bbox_y: int):
     return global_x, global_y, bbox_h
 
 
-def check_line_tps(image: npt.NDArray, contour: npt.NDArray, slice_width: int = 40):
+def check_line_tps(
+    image: npt.NDArray, contour: npt.NDArray, slice_width: int = 40
+) -> tuple[bool, list | None, list | None, float]:
     """
     Check if a line contour requires TPS correction by analyzing distortion.
 
@@ -189,11 +195,10 @@ def check_line_tps(image: npt.NDArray, contour: npt.NDArray, slice_width: int = 
         ]
 
         return True, input_pts, output_pts, max_ydelta
-    else:
-        return False, None, None, 0.0
+    return False, None, None, 0.0
 
 
-def check_for_tps(image: npt.NDArray, line_contours: List[npt.NDArray]):
+def check_for_tps(image: npt.NDArray, line_contours: list[npt.NDArray]) -> tuple[float, list[dict]]:
     """
     Check if an image requires TPS dewarping based on line distortion analysis.
 
@@ -227,7 +232,7 @@ def check_for_tps(image: npt.NDArray, line_contours: List[npt.NDArray]):
     return ratio, line_data
 
 
-def get_global_tps_line(line_data: List):
+def get_global_tps_line(line_data: list[dict]) -> int:
     """
     Find the most representative curved line for global TPS transformation.
 
@@ -259,12 +264,12 @@ def get_global_tps_line(line_data: List):
                 best_diff = delta
                 best_y = yd
 
-    target_idx = all_y_deltas.index(best_y)
-
-    return target_idx
+    return all_y_deltas.index(best_y)
 
 
-def apply_global_tps(image: npt.NDArray, line_mask: npt.NDArray, line_data: List):
+def apply_global_tps(
+    image: npt.NDArray, line_mask: npt.NDArray, line_data: list[dict]
+) -> tuple[npt.NDArray, npt.NDArray]:
     """
     Apply global TPS transformation to dewarp an entire image.
 
@@ -289,7 +294,9 @@ def apply_global_tps(image: npt.NDArray, line_mask: npt.NDArray, line_data: List
     return warped_img, warped_mask
 
 
-def get_line_images_via_local_tps(image: npt.NDArray, line_data: list, k_factor: float = 1.7):
+def get_line_images_via_local_tps(
+    image: npt.NDArray, line_data: list[dict], k_factor: float = 1.7
+) -> list[npt.NDArray]:
     """
     Extract line images using local TPS transformations for each line.
 

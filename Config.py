@@ -1,4 +1,4 @@
-from BDRC.data import (
+from bdrc.data import (
     CharsetEncoder,
     Encoding,
     ExportFormat,

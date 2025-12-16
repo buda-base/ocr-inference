@@ -1,27 +1,24 @@
-from dataclasses import dataclass
-from typing import List, Tuple, Union
-
 import cv2
 import numpy as np
 import numpy.typing as npt
 import onnxruntime as ort
 import pyewts
-from pyctcdecode import build_ctcdecoder
+from pyctcdecode.decoder import build_ctcdecoder
 from scipy.special import softmax
 
-from BDRC.data import (
+from bdrc.data import (
     CharsetEncoder,
-    Encoding,
     DewarpingResult,
+    Encoding,
     LayoutDetectionConfig,
     LineDetectionConfig,
+    LineExtractionError,
+    OCRError,
     OCRLine,
     OCRModelConfig,
-    OpStatus,
-    
 )
-from BDRC.image_dewarping import apply_global_tps, check_for_tps
-from BDRC.line_detection import (
+from bdrc.image_dewarping import apply_global_tps, check_for_tps
+from bdrc.line_detection import (
     build_line_data,
     build_raw_line_data,
     extract_line_images,
@@ -29,7 +26,7 @@ from BDRC.line_detection import (
     optimize_countour,
     sort_lines_by_threshold2,
 )
-from BDRC.utils import (
+from bdrc.utils import (
     binarize,
     get_execution_providers,
     normalize,
@@ -40,37 +37,38 @@ from BDRC.utils import (
     stitch_predictions,
     tile_image,
 )
-from Config import COLOR_DICT
+from config import COLOR_DICT
+
+RGB_NDIM = 3  # RGB images have 3 dimensions (height, width, channels)
 
 
 class CTCDecoder:
-    def __init__(self, charset: str | List[str], add_blank: bool):
-
+    def __init__(self, charset: str | list[str], *, add_blank: bool) -> None:
         if isinstance(charset, str):
-            self.charset = [x for x in charset]
+            self.charset = list(charset)
 
-        elif isinstance(charset, List):
+        elif isinstance(charset, list):
             self.charset = charset
 
         self.ctc_vocab = self.charset.copy()
-        
+
         if add_blank and " " not in self.ctc_vocab:
             self.ctc_vocab.insert(0, " ")
 
         self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
 
-    def encode(self, label: str):
+    def encode(self, label: str) -> list[int]:
         return [self.charset.index(x) + 1 for x in label]
 
-    def decode(self, inputs: List[int]) -> str:
+    def decode(self, inputs: list[int]) -> str:
         return "".join(self.charset[x - 1] for x in inputs)
 
-    def ctc_decode(self, logits):
+    def ctc_decode(self, logits: npt.NDArray) -> str:
         return self.ctc_decoder.decode(logits).replace(" ", "")
 
 
 class Detection:
-    def __init__(self, config: LineDetectionConfig | LayoutDetectionConfig):
+    def __init__(self, config: LineDetectionConfig | LayoutDetectionConfig) -> None:
         self.config = config
         self._config_file = config
         self._onnx_model_file = config.model_file
@@ -78,7 +76,9 @@ class Detection:
         self._execution_providers = get_execution_providers()
         self._inference = ort.InferenceSession(self._onnx_model_file, providers=self._execution_providers)
 
-    def _preprocess_image(self, image: npt.NDArray, patch_size: int = 512):
+    def _preprocess_image(
+        self, image: npt.NDArray, patch_size: int = 512
+    ) -> tuple[npt.NDArray, npt.NDArray, int, int, int]:
         padded_img, pad_x, pad_y = preprocess_image(image, patch_size)
         tiles, y_steps = tile_image(padded_img, patch_size)
         tiles = [binarize(x) for x in tiles]
@@ -92,20 +92,16 @@ class Detection:
         y_lim = prediction.shape[0] - y_pad
 
         prediction = prediction[:y_lim, :x_lim]
-        prediction = cv2.resize(prediction, dsize=(image.shape[1], image.shape[0]))
+        return cv2.resize(prediction, dsize=(image.shape[1], image.shape[0]))
 
-        return prediction
-
-    def _predict(self, image_batch: npt.NDArray):
+    def _predict(self, image_batch: npt.NDArray) -> npt.NDArray:
         image_batch = np.transpose(image_batch, axes=[0, 3, 1, 2])
         ort_batch = ort.OrtValue.ortvalue_from_numpy(image_batch)
         prediction = self._inference.run_with_ort_values(["output"], {"input": ort_batch})
-        prediction = prediction[0].numpy()
-
-        return prediction
+        return prediction[0].numpy()
 
     def predict(self, image: npt.NDArray, class_threshold: float = 0.8) -> npt.NDArray:
-        pass
+        raise NotImplementedError
 
 
 class LineDetection(Detection):
@@ -127,13 +123,15 @@ class LineDetection(Detection):
 
 
 class LayoutDetection(Detection):
-    def __init__(self, config: LayoutDetectionConfig, debug: bool = False) -> None:
+    BIN_THRESHOLD = 200
+
+    def __init__(self, config: LayoutDetectionConfig, *, debug: bool = False) -> None:
         super().__init__(config)
         self._classes = config.classes
         self._debug = debug
 
-    def _get_contours(self, prediction: npt.NDArray, optimize: bool = True, size_tresh: int = 200) -> List:
-        prediction = np.where(prediction > 200, 255, 0)
+    def _get_contours(self, prediction: npt.NDArray, *, optimize: bool = True, size_tresh: int = 200) -> list:
+        prediction = np.where(prediction > self.BIN_THRESHOLD, 255, 0)
         prediction = prediction.astype(np.uint8)
 
         if np.sum(prediction) > 0:
@@ -142,9 +140,8 @@ class LayoutDetection(Detection):
             if optimize:
                 contours = [optimize_countour(x) for x in contours]
                 contours = [x for x in contours if cv2.contourArea(x) > size_tresh]
-            return contours
-        else:
-            return []
+            return list(contours)
+        return []
 
     def create_preview_image(
         self,
@@ -152,7 +149,6 @@ class LayoutDetection(Detection):
         prediction: npt.NDArray,
         alpha: float = 0.4,
     ) -> npt.NDArray | None:
-
         if image is None:
             return None
 
@@ -164,25 +160,25 @@ class LayoutDetection(Detection):
         mask = np.zeros(image.shape, dtype=np.uint8)
 
         if len(image_predictions) > 0:
-            color = tuple([int(x) for x in COLOR_DICT["image"].split(",")])
+            color = tuple(int(x) for x in COLOR_DICT["image"].split(","))
 
             for idx, _ in enumerate(image_predictions):
                 cv2.drawContours(mask, image_predictions, contourIdx=idx, color=color, thickness=-1)
 
         if len(line_predictions) > 0:
-            color = tuple([int(x) for x in COLOR_DICT["line"].split(",")])
+            color = tuple(int(x) for x in COLOR_DICT["line"].split(","))
 
             for idx, _ in enumerate(line_predictions):
                 cv2.drawContours(mask, line_predictions, contourIdx=idx, color=color, thickness=-1)
 
         if len(caption_predictions) > 0:
-            color = tuple([int(x) for x in COLOR_DICT["caption"].split(",")])
+            color = tuple(int(x) for x in COLOR_DICT["caption"].split(","))
 
             for idx, _ in enumerate(caption_predictions):
                 cv2.drawContours(mask, caption_predictions, contourIdx=idx, color=color, thickness=-1)
 
         if len(margin_predictions) > 0:
-            color = tuple([int(x) for x in COLOR_DICT["margin"].split(",")])
+            color = tuple(int(x) for x in COLOR_DICT["margin"].split(","))
 
             for idx, _ in enumerate(margin_predictions):
                 cv2.drawContours(mask, margin_predictions, contourIdx=idx, color=color, thickness=-1)
@@ -206,8 +202,7 @@ class LayoutDetection(Detection):
 
 
 class OCRInference:
-    def __init__(self, ocr_config: OCRModelConfig):
-
+    def __init__(self, ocr_config: OCRModelConfig) -> None:
         self.config = ocr_config
         self._onnx_model_file = ocr_config.model_file
         self._input_width = ocr_config.input_width
@@ -220,14 +215,13 @@ class OCRInference:
         self._execution_providers = get_execution_providers()
         self.ocr_session = ort.InferenceSession(self._onnx_model_file, providers=self._execution_providers)
         self._add_blank = ocr_config.add_blank
-        self.decoder = CTCDecoder(self._characters, self._add_blank)
+        self.decoder = CTCDecoder(self._characters, add_blank=self._add_blank)
 
     def _pad_ocr_line(
         self,
         img: npt.NDArray,
         padding: str = "black",
     ) -> npt.NDArray:
-
         width_ratio = self._input_width / img.shape[1]
         height_ratio = self._input_height / img.shape[0]
 
@@ -249,24 +243,21 @@ class OCRInference:
         line_image = self._pad_ocr_line(image)
         line_image = binarize(line_image)
 
-        if len(line_image.shape) == 3:
+        if len(line_image.shape) == RGB_NDIM:
             line_image = cv2.cvtColor(line_image, cv2.COLOR_RGB2GRAY)
 
         line_image = line_image.reshape((1, self._input_height, self._input_width))
         line_image = (line_image / 127.5) - 1.0
-        line_image = line_image.astype(np.float32)
+        return line_image.astype(np.float32)
 
-        return line_image
-
-    def _pre_pad(self, image: npt.NDArray):
+    def _pre_pad(self, image: npt.NDArray) -> npt.NDArray:
         """
         Adds a small white patch of size HxH to the left and right of the line
         """
         h, _, c = image.shape
         patch = np.ones(shape=(h, h, c), dtype=np.uint8)
         patch *= 255
-        out_img = np.hstack(tup=[patch, image, patch])
-        return out_img
+        return np.hstack(tup=[patch, image, patch])
 
     def _predict(self, image_batch: npt.NDArray) -> npt.NDArray:
         image_batch = image_batch.astype(np.float32)
@@ -274,20 +265,15 @@ class OCRInference:
         ocr_results = self.ocr_session.run_with_ort_values([self._output_layer], {self._input_layer: ort_batch})
 
         logits = ocr_results[0].numpy()
-        logits = np.squeeze(logits)
-
-        return logits
+        return np.squeeze(logits)
 
     def _decode(self, logits: npt.NDArray) -> str:
         if logits.shape[0] == len(self.decoder.ctc_vocab):
             logits = np.transpose(logits, axes=[1, 0])  # adjust logits to have shape time, vocab
 
-        text = self.decoder.ctc_decode(logits)
+        return self.decoder.ctc_decode(logits)
 
-        return text
-
-    def run(self, line_image: npt.NDArray, pre_pad: bool = True) -> str:
-
+    def run(self, line_image: npt.NDArray, *, pre_pad: bool = True) -> str:
         if pre_pad:
             line_image = self._pre_pad(line_image)
         line_image = self._prepare_ocr_line(line_image)
@@ -299,9 +285,7 @@ class OCRInference:
             line_image = np.expand_dims(line_image, axis=1)
 
         logits = self._predict(line_image)
-        text = self._decode(logits)
-
-        return text
+        return self._decode(logits)
 
 
 class OCRPipeline:
@@ -313,8 +297,12 @@ class OCRPipeline:
     """
 
     def __init__(
-        self, ocr_config: OCRModelConfig, line_config: LineDetectionConfig | LayoutDetectionConfig, use_line_prepadding: bool = False
-    ):
+        self,
+        ocr_config: OCRModelConfig,
+        line_config: LineDetectionConfig | LayoutDetectionConfig,
+        *,
+        use_line_prepadding: bool = False,
+    ) -> None:
         self.ready = False
         self.ocr_model_config = ocr_config
         self.line_config = line_config
@@ -333,15 +321,15 @@ class OCRPipeline:
             self.line_inference = None
             self.ready = False
 
-    def update_ocr_model(self, config: OCRModelConfig):
+    def update_ocr_model(self, config: OCRModelConfig) -> None:
         self.ocr_model_config = config
-        self.ocr_inference = OCRInference(self.platform, config)
+        self.ocr_inference = OCRInference(config)
 
-    def update_line_detection(self, config: Union[LineDetectionConfig, LayoutDetectionConfig]):
+    def update_line_detection(self, config: LineDetectionConfig | LayoutDetectionConfig) -> None:
         if isinstance(config, LineDetectionConfig) and isinstance(self.line_config, LayoutDetectionConfig):
-            self.line_inference = LineDetection(self.platform, config)
+            self.line_inference = LineDetection(config)
         elif isinstance(config, LayoutDetectionConfig) and isinstance(self.line_config, LineDetectionConfig):
-            self.line_inference = LayoutDetection(self.platform, config)
+            self.line_inference = LayoutDetection(config)
 
         else:
             return
@@ -350,54 +338,63 @@ class OCRPipeline:
     # These methods break down the OCR pipeline into discrete stages
     # that can be called individually or composed together.
 
-    def detect_lines(self, image: npt.NDArray) -> Tuple[OpStatus, npt.NDArray | str]:
+    def detect_lines(self, image: npt.NDArray) -> npt.NDArray:
         """Stage 1: Run line/layout detection to get line mask.
 
         Returns:
-            (OpStatus.SUCCESS, line_mask) or (OpStatus.FAILED, error_message)
+            line_mask: The detected line mask.
+
+        Raises:
+            RuntimeError: If line detection model is not initialized.
         """
+        if self.line_inference is None:
+            raise RuntimeError("Line detection model is not initialized")
+
         if isinstance(self.line_config, LineDetectionConfig):
             line_mask = self.line_inference.predict(image)
         else:
             layout_mask = self.line_inference.predict(image)
             line_mask = layout_mask[:, :, self.line_config.classes.index("line")]
-        return OpStatus.SUCCESS, line_mask
+        return line_mask
 
     def build_lines(
         self, image: npt.NDArray, line_mask: npt.NDArray
-    ) -> Tuple[OpStatus, Tuple[npt.NDArray, npt.NDArray, List, List, float] | str]:
+    ) -> tuple[npt.NDArray, npt.NDArray, list, list, float]:
         """Stage 2: Build and filter line contours from mask.
 
         Returns:
-            (OpStatus.SUCCESS, (rot_img, rot_mask, raw_contours, filtered_contours, page_angle))
-            or (OpStatus.FAILED, error_message)
+            (rot_img, rot_mask, raw_contours, filtered_contours, page_angle)
+
+        Raises:
+            LineExtractionError: If no lines are detected or all lines are filtered out.
         """
         rot_img, rot_mask, line_contours, page_angle = build_raw_line_data(image, line_mask)
         if len(line_contours) == 0:
-            return OpStatus.FAILED, "No lines detected"
+            raise LineExtractionError("No lines detected")
 
         filtered_contours = filter_line_contours(rot_mask, line_contours)
         if len(filtered_contours) == 0:
-            return OpStatus.FAILED, "No valid lines after filtering"
+            raise LineExtractionError("No valid lines after filtering")
 
-        return OpStatus.SUCCESS, (rot_img, rot_mask, line_contours, filtered_contours, page_angle)
+        return rot_img, rot_mask, line_contours, filtered_contours, page_angle
 
     def apply_dewarping(
         self,
         rot_img: npt.NDArray,
         rot_mask: npt.NDArray,
-        filtered_contours: List,
+        filtered_contours: list,
         page_angle: float,
+        *,
         use_tps: bool = False,
         tps_threshold: float = 0.25,
-    ) -> Tuple[OpStatus, DewarpingResult | str]:
+    ) -> DewarpingResult:
         """Stage 3: Optionally apply TPS dewarping.
 
         Returns:
-            (OpStatus.SUCCESS, DewarpingResult) or (OpStatus.FAILED, error_message)
+            DewarpingResult with dewarping information.
         """
         if not use_tps:
-            return OpStatus.SUCCESS, DewarpingResult(
+            return DewarpingResult(
                 work_img=rot_img,
                 work_mask=rot_mask,
                 filtered_contours=filtered_contours,
@@ -407,7 +404,7 @@ class OCRPipeline:
 
         ratio, tps_line_data = check_for_tps(rot_img, filtered_contours)
         if ratio <= tps_threshold:
-            return OpStatus.SUCCESS, DewarpingResult(
+            return DewarpingResult(
                 work_img=rot_img,
                 work_mask=rot_mask,
                 filtered_contours=filtered_contours,
@@ -418,14 +415,14 @@ class OCRPipeline:
 
         # Apply dewarping
         dewarped_img, dewarped_mask = apply_global_tps(rot_img, rot_mask, tps_line_data)
-        if len(dewarped_mask.shape) == 3:
+        if len(dewarped_mask.shape) == RGB_NDIM:
             dewarped_mask = cv2.cvtColor(dewarped_mask, cv2.COLOR_RGB2GRAY)
 
         # Rebuild line data from dewarped image
         dew_rot_img, dew_rot_mask, line_contours, new_page_angle = build_raw_line_data(dewarped_img, dewarped_mask)
         new_filtered_contours = filter_line_contours(dew_rot_mask, line_contours)
 
-        return OpStatus.SUCCESS, DewarpingResult(
+        return DewarpingResult(
             work_img=dew_rot_img,
             work_mask=dew_rot_mask,
             filtered_contours=new_filtered_contours,
@@ -440,39 +437,43 @@ class OCRPipeline:
         self,
         work_img: npt.NDArray,
         rot_mask: npt.NDArray,
-        filtered_contours: List,
-        merge_lines: bool = True,
+        filtered_contours: list,
         k_factor: float = 2.5,
         bbox_tolerance: float = 4.0,
-    ) -> Tuple[OpStatus, Tuple[List, List] | str]:
+        *,
+        merge_lines: bool = True,
+    ) -> tuple[list, list]:
         """Stage 4: Build line data, sort lines, and extract line images.
 
         Returns:
-            (OpStatus.SUCCESS, (sorted_lines, line_images)) or (OpStatus.FAILED, error_message)
+            (sorted_lines, line_images)
+
+        Raises:
+            LineExtractionError: If no valid line images are extracted.
         """
         line_data = [build_line_data(x) for x in filtered_contours]
         sorted_lines, _ = sort_lines_by_threshold2(rot_mask, line_data, group_lines=merge_lines)
         line_images = extract_line_images(work_img, sorted_lines, k_factor, bbox_tolerance)
 
         if not line_images:
-            return OpStatus.FAILED, "No valid line images extracted"
+            raise LineExtractionError("No valid line images extracted")
 
-        return OpStatus.SUCCESS, (sorted_lines, line_images)
+        return sorted_lines, line_images
 
     def run_text_recognition(
-        self, line_images: List, sorted_lines: List, target_encoding: Encoding = Encoding.UNICODE
-    ) -> Tuple[OpStatus, List[OCRLine] | str]:
+        self, line_images: list, sorted_lines: list, target_encoding: Encoding = Encoding.UNICODE
+    ) -> list[OCRLine]:
         """Stage 5: Run OCR inference on line images.
 
         Returns:
-            (OpStatus.SUCCESS, ocr_lines) or (OpStatus.FAILED, error_message)
+            ocr_lines: List of recognized OCR lines.
         """
         ocr_lines = []
-        for line_img, line_info in zip(line_images, sorted_lines):
+        for line_img, line_info in zip(line_images, sorted_lines, strict=True):
             if line_img.shape[0] == 0 or line_img.shape[1] == 0:
-                    continue
+                continue
 
-            pred = self.ocr_inference.run(line_img, self.use_line_prepadding).strip().replace("§", " ")
+            pred = self.ocr_inference.run(line_img, pre_pad=self.use_line_prepadding).strip().replace("§", " ")
 
             if self.encoder == CharsetEncoder.WYLIE and target_encoding == Encoding.UNICODE:
                 pred = self.converter.toUnicode(pred)
@@ -487,83 +488,58 @@ class OCRPipeline:
                 )
             )
 
-        return OpStatus.SUCCESS, ocr_lines
+        return ocr_lines
 
     # ==================== Main Pipeline Method ====================
 
-    # TODO: Generate specific meaningful error codes that can be returned inbetween the steps
     # TPS Mode is global-only at the moment
     def run_ocr(
         self,
         image: npt.NDArray,
         k_factor: float = 2.5,
         bbox_tolerance: float = 4.0,
+        target_encoding: Encoding = Encoding.UNICODE,
+        *,
         merge_lines: bool = True,
         use_tps: bool = False,
         tps_threshold: float = 0.25,
-        target_encoding: Encoding = Encoding.UNICODE,
-    ):
-        try:
-            if not self.ready:
-                return OpStatus.FAILED, "OCR pipeline not ready"
-            if image is None:
-                return OpStatus.FAILED, "Input image is None"
+    ) -> tuple[npt.NDArray, list, list[OCRLine], float]:
+        """Run the full OCR pipeline.
 
-            # Stage 1: Line detection
-            try:
-                status, result = self.detect_lines(image)
-                if status == OpStatus.FAILED:
-                    return status, result
-                line_mask = result
-            except Exception as e:
-                return OpStatus.FAILED, f"Line detection failed: {str(e)}"
+        Returns:
+            (rot_mask, sorted_lines, ocr_lines, page_angle)
 
-            # Stage 2: Build lines
-            try:
-                status, result = self.build_lines(image, line_mask)
-                if status == OpStatus.FAILED:
-                    return status, result
-                rot_img, rot_mask, _, filtered_contours, page_angle = result
-            except Exception as e:
-                return OpStatus.FAILED, f"Line data building failed: {str(e)}"
+        Raises:
+            OCRError: If the pipeline is not ready or image is None.
+            LineExtractionError: If line detection/extraction fails.
+        """
+        if not self.ready:
+            raise OCRError("OCR pipeline not ready")
+        if image is None:
+            raise OCRError("Input image is None")
 
-            # Stage 3: Dewarping
-            try:
-                status, result = self.apply_dewarping(
-                    rot_img, rot_mask, filtered_contours, page_angle, use_tps=use_tps, tps_threshold=tps_threshold
-                )
-                if status == OpStatus.FAILED:
-                    return status, result
-                dewarp_result = result
-            except Exception as e:
-                return OpStatus.FAILED, f"Line processing failed: {str(e)}"
+        # Stage 1: Line detection
+        line_mask = self.detect_lines(image)
 
-            # Stage 4: Extract lines
-            try:
-                status, result = self.extract_lines(
-                    dewarp_result.work_img,
-                    rot_mask,
-                    dewarp_result.filtered_contours,
-                    merge_lines=merge_lines,
-                    k_factor=k_factor,
-                    bbox_tolerance=bbox_tolerance,
-                )
-                if status == OpStatus.FAILED:
-                    return status, result
-                sorted_lines, line_images = result
-            except Exception as e:
-                return OpStatus.FAILED, f"Line extraction failed: {str(e)}"
+        # Stage 2: Build lines
+        rot_img, rot_mask, _, filtered_contours, page_angle = self.build_lines(image, line_mask)
 
-            # Stage 5: OCR inference
-            try:
-                status, result = self.run_text_recognition(line_images, sorted_lines, target_encoding=target_encoding)
-                if status == OpStatus.FAILED:
-                    return status, result
-                ocr_lines = result
-            except Exception as e:
-                return OpStatus.FAILED, f"OCR processing failed: {str(e)}"
+        # Stage 3: Dewarping
+        dewarp_result = self.apply_dewarping(
+            rot_img, rot_mask, filtered_contours, page_angle, use_tps=use_tps, tps_threshold=tps_threshold
+        )
 
-            return OpStatus.SUCCESS, (rot_mask, sorted_lines, ocr_lines, page_angle)
+        # Stage 4: Extract lines
+        sorted_lines, line_images = self.extract_lines(
+            dewarp_result.work_img,
+            rot_mask,
+            dewarp_result.filtered_contours,
+            merge_lines=merge_lines,
+            k_factor=k_factor,
+            bbox_tolerance=bbox_tolerance,
+        )
 
-        except Exception as e:
-            return OpStatus.FAILED, f"OCR pipeline failed: {str(e)}"
+        # Stage 5: OCR inference
+        ocr_lines = self.run_text_recognition(line_images, sorted_lines, target_encoding=target_encoding)
+
+        return rot_mask, sorted_lines, ocr_lines, page_angle
