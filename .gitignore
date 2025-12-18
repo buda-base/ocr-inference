@@ -212,3 +212,4 @@ output
 ocr_models
 dev_cli.py
 test_data
+.vscode/

@@ -17,3 +17,4 @@ pyreadline3==3.5.4
 scipy==1.16.3
 sympy==1.14.0
 thin-plate-spline==1.2.0
+boto3==1.42.10

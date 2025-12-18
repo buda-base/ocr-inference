@@ -1,5 +1,3 @@
-"""OCR Pipeline wrapper with artifact management and audit logging."""
-
 import time
 
 import numpy.typing as npt
@@ -7,8 +5,9 @@ import numpy.typing as npt
 from bdrc.artifact_manager import ArtifactManager
 from bdrc.audit_logger import AuditLogger
 from bdrc.data import ArtifactConfig, Encoding, Line, OCRError
-from bdrc.exporter import PageXMLExporter, TextExporter
+from bdrc.exporter import PageXMLExporter
 from bdrc.inference import OCRPipeline
+from bdrc.utils import get_text_bbox
 
 
 def serialize_contours(contours: list[npt.NDArray]) -> list:
@@ -41,15 +40,6 @@ def run_ocr_with_artifacts(
     audit_logger: AuditLogger | None = None,
     artifact_config: ArtifactConfig | None = None,
 ) -> tuple[npt.NDArray, list, list, float]:
-    """Run OCR pipeline with artifact saving and audit logging.
-
-    Returns:
-        (rot_mask, sorted_lines, ocr_lines, page_angle)
-
-    Raises:
-        OCRError: If any stage of the pipeline fails.
-    """
-
     pipeline_start = time.perf_counter()
     save_det = artifact_manager and artifact_config and artifact_config.save_detection
     save_dew = artifact_manager and artifact_config and artifact_config.save_dewarping
@@ -58,9 +48,9 @@ def run_ocr_with_artifacts(
         if audit_logger:
             audit_logger.log_stage_start(stage, metadata=meta)
 
-    def log_end(stage: str, meta: dict | None = None) -> None:
+    def log_end(stage: str, meta: dict | None = None, status: str = "success") -> None:
         if audit_logger:
-            audit_logger.log_stage_end(stage, status="success", metadata=meta)
+            audit_logger.log_stage_end(stage, status=status, metadata=meta)
 
     def log_err(msg: object, stage: str) -> None:
         if audit_logger:
@@ -156,9 +146,16 @@ def run_ocr_with_artifacts(
 
         # STAGE 6: Save Results
         if artifact_manager:
-            results_dir = artifact_manager.get_results_dir()
-            TextExporter(str(results_dir)).export_lines(image_name, ocr_lines)
-            PageXMLExporter(str(results_dir)).export_lines(image, image_name, sorted_lines, ocr_lines, angle=page_angle)
+            artifact_manager.save_text(image_name, "\n".join(line.text for line in ocr_lines), "results", ext="txt")
+            xml_exporter = PageXMLExporter("")
+            xml_doc = xml_exporter.build_xml_document(
+                image,
+                image_name,
+                xml_exporter.get_bbox_points(get_text_bbox(sorted_lines)),
+                [xml_exporter.get_text_points(ln.contour) for ln in sorted_lines],
+                ocr_lines,
+            )
+            artifact_manager.save_text(image_name, xml_doc, "results", ext="xml")
 
         # Pipeline Complete
         pipeline_duration = (time.perf_counter() - pipeline_start) * 1000
@@ -177,13 +174,11 @@ def run_ocr_with_artifacts(
             )
 
     except OCRError:
-        if audit_logger:
-            audit_logger.log_stage_end("ocr_pipeline", status="failure")
+        log_end("ocr_pipeline", status="failure")
         raise
     except Exception as e:
         log_err(f"OCR pipeline failed: {e}", "ocr_pipeline")
-        if audit_logger:
-            audit_logger.log_stage_end("ocr_pipeline", status="failure")
+        log_end("ocr_pipeline", status="failure")
         raise OCRError(f"OCR pipeline failed: {e}") from e
     else:
         return rot_mask, sorted_lines, ocr_lines, page_angle
