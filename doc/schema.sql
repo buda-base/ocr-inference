@@ -7,12 +7,22 @@ CREATE TYPE job_status AS ENUM (
   'running',
   'completed',
   'failed',
-  'queued'
+  'canceled',
+  'created',
 );
 
-CREATE TYPE image_status AS ENUM (
-  'success',
-  'failed'
+CREATE TYPE task_status AS ENUM (
+  'pending',
+  'running',
+  'done',
+  'retryable_failed',
+  'terminal_failed'
+);
+
+CREATE TYPE shard_status AS ENUM (
+  'pending',
+  'leased',
+  'done'
 );
 
 CREATE TYPE image_type AS ENUM (
@@ -59,25 +69,73 @@ CREATE INDEX volumes_bdrc_w_id_idx ON volumes (bdrc_w_id);
 CREATE INDEX volumes_bdrc_i_id_idx ON volumes (bdrc_i_id);
 
 
-CREATE TABLE jobs (
-  id                        bigserial PRIMARY KEY,
-  volume_id                 integer    NOT NULL,
-  type_id                   integer    NOT NULL,
-  started_at                timestamp  NOT NULL,
-  status                    job_status NOT NULL,
-  total_pages               integer    NOT NULL,
-  successful_pages          integer,
-  total_duration_ms         integer,
-  avg_duration_per_page_ms  real,
-  config                    jsonb      -- was text; now jsonb as per comment
+CREATE TABLE IF NOT EXISTS jobs (
+  id                bigserial PRIMARY KEY,
+  -- external/job-id used in S3 paths and CLI output (e.g. "J123")
+  job_key           text NOT NULL,
+  type_id           integer NOT NULL REFERENCES job_types(id),
+  status            job_run_status NOT NULL DEFAULT 'created',
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  started_at        timestamptz,
+  finished_at       timestamptz,
+  config            jsonb,
+  last_progress_at  timestamptz
 );
 
-CREATE INDEX jobs_volume_id_idx       ON jobs (volume_id);
-CREATE INDEX jobs_type_id_idx         ON jobs (type_id);
-CREATE INDEX jobs_volume_type_idx     ON jobs (volume_id, type_id);
-CREATE INDEX jobs_status_idx          ON jobs (status);          -- optional
-CREATE INDEX jobs_status_type_idx     ON jobs (status, type_id); -- optional
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_job_key_uniq ON jobs(job_key);
+CREATE INDEX IF NOT EXISTS jobs_type_id_idx         ON jobs(type_id);
+CREATE INDEX IF NOT EXISTS jobs_status_idx          ON jobs(status);
+CREATE INDEX IF NOT EXISTS jobs_created_at_idx      ON jobs(created_at);
 
+CREATE TABLE IF NOT EXISTS tasks (
+  id               bigserial PRIMARY KEY,
+  job_id           bigint NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  volume_id        integer NOT NULL REFERENCES volumes(id),
+  status           task_status NOT NULL DEFAULT 'pending',
+  attempts         integer NOT NULL DEFAULT 0,
+  leased_by_worker_id uuid REFERENCES workers(worker_id),
+  lease_expires_at timestamptz,
+  started_at       timestamptz,
+  done_at          timestamptz,
+  -- simple execution stats (store more in stats_json if needed)
+  stats_json       jsonb,
+  -- last failure payload (string, stack trace, exit code, etc.)
+  last_error       jsonb
+);
+
+-- workers are ephemeral and entries can be deleted after they are stopped
+CREATE TABLE IF NOT EXISTS workers (
+  worker_id           uuid PRIMARY KEY,
+  instance_id         text,         -- e.g. EC2 i-0123...
+  hostname            text,
+  tags                jsonb,
+  started_at          timestamptz NOT NULL DEFAULT now(),
+  last_heartbeat_at   timestamptz NOT NULL DEFAULT now(),
+  stopped_at          timestamptz
+);
+
+-- quickly find "alive" workers (your app can define alive as heartbeat within N seconds)
+CREATE INDEX IF NOT EXISTS workers_last_heartbeat_idx ON workers(last_heartbeat_at);
+CREATE INDEX IF NOT EXISTS workers_instance_id_idx     ON workers(instance_id);
+
+CREATE TABLE IF NOT EXISTS shards (
+  id               bigserial PRIMARY KEY,
+  job_id           bigint NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  shard_name       text NOT NULL,
+  status           shard_status NOT NULL DEFAULT 'pending',
+  leased_by_worker_id uuid REFERENCES workers(worker_id),
+  leased_at        timestamptz,
+  lease_expires_at timestamptz,
+  done_at          timestamptz,
+  total_volumes    integer,
+  done_volumes     integer,
+  last_error       jsonb
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS shards_job_name_uniq   ON shards(job_id, shard_name);
+CREATE INDEX IF NOT EXISTS shards_job_status_idx         ON shards(job_id, status);
+CREATE INDEX IF NOT EXISTS shards_lease_exp_idx          ON shards(lease_expires_at);
+CREATE INDEX IF NOT EXISTS shards_leased_by_worker_idx   ON shards(leased_by_worker_id);
 
 CREATE TABLE image_files (
   id         serial PRIMARY KEY,
@@ -110,20 +168,6 @@ CREATE UNIQUE INDEX volume_results_job_volume_uniq
 
 CREATE INDEX volume_results_volume_id_idx
   ON volume_results (volume_id);
-
-
-CREATE TABLE image_results (
-  result_id        bigserial PRIMARY KEY,
-  job_id           bigint       NOT NULL,
-  image_id         integer      NOT NULL,
-  status           image_status NOT NULL,
-  lines_count      smallint,
-  needs_dewarp     boolean,
-  confidence_score real,
-  est_cer          real,
-  detected_script  smallint,
-  complex_layout   boolean
-);
 
 CREATE UNIQUE INDEX image_results_job_image_uniq
   ON image_results (job_id, image_id);
@@ -163,14 +207,6 @@ ALTER TABLE volume_results
 ALTER TABLE volume_results
   ADD CONSTRAINT volume_results_volume_fk
     FOREIGN KEY (volume_id) REFERENCES volumes (id);
-
-ALTER TABLE image_results
-  ADD CONSTRAINT image_results_job_fk
-    FOREIGN KEY (job_id) REFERENCES jobs (id);
-
-ALTER TABLE image_results
-  ADD CONSTRAINT image_results_image_fk
-    FOREIGN KEY (image_id) REFERENCES image_files (id);
 
 ALTER TABLE image_paths
   ADD CONSTRAINT image_paths_image_file_fk
