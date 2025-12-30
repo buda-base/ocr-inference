@@ -1,6 +1,6 @@
 ## Images on S3
 
-- About 30M files, including 25M Tibetan images, about 6TB.
+- About 30M files, including 25M Tibetan images, about 12TB.
 - on bucket archive.tbrc.org
 
 #### s3 Path format
@@ -53,3 +53,12 @@ with occasionally a `size` property indicating the size of the image in bytes, w
 Very rarely images for a volume can be updated. In that case files are replaced so the same file path can refer to different actual images at different times. In order to make the system strong, we need to add a checksum of the image we're operating on. 
 
 When images are replaced, the old images are preserved, but not on S3 (only on BDRC's internal servers).
+
+#### Checksums
+
+In order to make sure we know the version of the image that has been used for a task, a database will contain:
+- the SHA256 checksum of each image
+- the S3 ETag (mostly md5 but can be exceptionally different for multi-part uploads)
+- the S3 last modification timestamp
+
+Tasks should make sure they record at least the S3 ETags of the images they processed. The information is sent in the http request when GETting a file from the archive bucket.
