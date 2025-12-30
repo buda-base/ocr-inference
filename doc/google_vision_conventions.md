@@ -37,8 +37,8 @@ Each image is identified by:
 | `W_id` | Work ID |
 | `I_id` | Volume ID |
 | `img_fname` | Image file name (string, as-is) |
+| `img_sha256` | SHA-256 checksum of image bytes (**authoritative**) |
 | `source_path` | Full S3/GCS path |
-| `image_sha256` | SHA-256 checksum of image bytes (**authoritative**) |
 
 Checksum ensures correctness when images are replaced upstream.
 
