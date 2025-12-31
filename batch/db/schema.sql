@@ -68,10 +68,16 @@ VALUES ('woodblock-stacks-unicode', 'Woodblock-Stacks', 'unicode', 'Woodblock OC
 CREATE TABLE volumes (
   id        serial PRIMARY KEY,
   bdrc_w_id varchar(32) NOT NULL,
-  bdrc_i_id varchar(32) NOT NULL
+  bdrc_i_id varchar(32) NOT NULL,
+  -- the s3 etag of the dimensions.json, truncated if it's a multi-part upload
+  manifest_etag  bytea  NOT NULL CHECK (octet_length(manifest_etag) = 16),
+  -- the first 6 hex digits of the etag, or 6 random hex digits in case of collision
+  version_name  text  NOT NULL,
+  -- the last modification of the dimensions.json reported on s3
+  manifest_last_modified_at timestamptz
 );
 
-CREATE UNIQUE INDEX volumes_w_i_uniq ON volumes (bdrc_w_id, bdrc_i_id);
+CREATE UNIQUE INDEX volumes_w_i_uniq ON volumes (bdrc_w_id, bdrc_i_id, version_name);
 CREATE INDEX volumes_bdrc_w_id_idx ON volumes (bdrc_w_id);
 CREATE INDEX volumes_bdrc_i_id_idx ON volumes (bdrc_i_id);
 

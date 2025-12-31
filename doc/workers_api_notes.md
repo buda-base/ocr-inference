@@ -5,16 +5,16 @@ A worker uses the following API, most function are provided by the BEC ops libra
 - a **job** is an action that can be performed on many volumes (ex: "OCR using model X" or "line detection")
 - `job_id` is a string representing a job
 - a **task** is running a job on a volume (ex: "OCR using model X on volume V")
-- a **volume** is identified by the tuple `(w_id, i_id)`
+- a **volume** is identified by the tuple `(w_id, i_id, i_version)`
 - an **artefact** is any output the worker produces (ex: transcriptions from OCR)
 
 #### get_next_task(job_id)
 
-returns tuple `(w_id, i_id)` or `None` if not tasks available
+returns tuple `(w_id, i_id, i_version)` or `None` if not tasks available
 
-typically from SQS
+typically `(w_id, i_id)` only from SQS, `i_version` from SQL to get the latest volume version
 
-#### get_output_info(job_id, w_id, i_id)
+#### get_output_info(job_id, w_id, i_id, i_version)
 
 returns `(bucket_name, prefix)`. The worker writes its artefacts there, no output format is enforced except it should write a `success.json` once the task is executed and all the other files have been successfully written. The file should contain 
 
@@ -25,7 +25,7 @@ returns `(bucket_name, prefix)`. The worker writes its artefacts there, no outpu
 }
 ```
 
-typically (`bec.bdrc.io`, `artefacts/{job_id}/{w_id}-{i_id}/`)
+typically (`bec.bdrc.io`, `artefacts/{job_id}/{w_id}-{i_id}-{i_version}/`)
 
 #### is_successfully_done(job_id, w_id, i_id)
 
@@ -35,7 +35,7 @@ returns `True` if the job has already run successfully for a volume, `False` oth
 
 typically checking the presence of `s3://bec.bdrc.io/artefacts/{job_id}/{w_id}-{i_id}/success.json`
 
-#### task_done(job_id, w_id, i_id, status)
+#### task_done(job_id, w_id, i_id, i_version, status)
 
 called at the end of a task
 

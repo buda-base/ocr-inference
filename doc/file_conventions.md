@@ -48,11 +48,15 @@ A manifest named `dimensions.json` is present in the folder of each image group 
 
 with occasionally a `size` property indicating the size of the image in bytes, when superior to 2MB.
 
+In some extremely rare cases, files referenced in the manifest won't be present on s3, this should be considered a terminal error.
+
 #### Image updates
 
 Very rarely images for a volume can be updated. In that case files are replaced so the same file path can refer to different actual images at different times. In order to make the system strong, we need to add a checksum of the image we're operating on. 
 
 When images are replaced, the old images are preserved, but not on S3 (only on BDRC's internal servers).
+
+BDRC does not maintain explicit human version numbers for volumes. The project will use a deterministic volume_version derived from the `dimensions.json` manifest. The version of a volume is the first 6 hex digits of the ETag of the `dimensions.json` manifest, or 6 random hex digits in case of collision.
 
 #### Checksums
 
