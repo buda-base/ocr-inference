@@ -20,11 +20,12 @@ class StorageBackend(ABC):
     def write_image(self, path: str, image: npt.NDArray) -> str: ...
     @abstractmethod
     def ensure_dir(self, path: str) -> None: ...
-    @abstractmethod
-    def shutdown(self) -> None: ...
 
     def finalize(self) -> int:
         return 0
+
+    def shutdown(self) -> None:
+        return
 
 
 class LocalStorage(StorageBackend):

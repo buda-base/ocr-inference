@@ -75,28 +75,23 @@ class ArtifactManager:
             {"job_id": self.job_id, "created": datetime.now(tz=UTC).isoformat(), "artifacts": self.manifest},
         )
 
-    def save_metrics(self, metrics: dict[str, Any]) -> str:
+    def save_metrics(self, metrics: dict[str, Any]) -> None:
         if self.current_page:
             self.page_metrics[self.current_page] = metrics
-            return f"{self.job_dir}/metrics.json"
-        return self.storage.write_json("metrics.json", metrics)
 
-    def save_aggregate_metrics(self) -> str:
+    def get_aggregate_metrics(self) -> dict[str, Any]:
         pm = self.page_metrics
         total_duration = sum(m.get("total_duration_ms", 0) for m in pm.values())
-        return self.storage.write_json(
-            "metrics.json",
-            {
-                "job_summary": {
-                    "total_pages": len(pm),
-                    "successful_pages": sum(1 for m in pm.values() if m.get("status") != "failed"),
-                    "total_duration_ms": total_duration,
-                    "avg_duration_per_page_ms": total_duration / len(pm) if pm else 0,
-                    "total_lines_detected": sum(m.get("lines_detected", 0) for m in pm.values()),
-                },
-                "per_page_metrics": pm,
+        return {
+            "job_summary": {
+                "total_pages": len(pm),
+                "successful_pages": sum(1 for m in pm.values() if m.get("status") != "failed"),
+                "total_duration_ms": total_duration,
+                "avg_duration_per_page_ms": total_duration / len(pm) if pm else 0,
+                "total_lines_detected": sum(m.get("lines_detected", 0) for m in pm.values()),
             },
-        )
+            "per_page_metrics": pm,
+        }
 
     def finalize(self) -> int:
         return self.storage.finalize()

@@ -18,3 +18,5 @@ scipy==1.16.3
 sympy==1.14.0
 thin-plate-spline==1.2.0
 boto3==1.42.10
+asyncpg>=0.31.0
+python-dotenv>=1.0.0
