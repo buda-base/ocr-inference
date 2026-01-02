@@ -74,13 +74,16 @@ CREATE TABLE volumes (
   -- the first 6 hex digits of the etag, or 6 random hex digits in case of collision
   version_name  text  NOT NULL,
   -- the last modification of the dimensions.json reported on s3
-  manifest_last_modified_at timestamptz
+  manifest_last_modified_at timestamptz,
+  -- number of images in the volume, mostly informational, shouldn't be relied on
+  nb_images smallint NOT NULL,
+  -- number of "intro images", images to ignore at the beginning of the volumes, for all jobs
+  nb_images_intro smallint NOT NULL
 );
 
-CREATE UNIQUE INDEX volumes_w_i_uniq ON volumes (bdrc_w_id, bdrc_i_id, version_name);
+CREATE UNIQUE INDEX volumes_w_i_v_uniq ON volumes (bdrc_w_id, bdrc_i_id, version_name);
+CREATE INDEX volumes_w_i ON volumes (bdrc_w_id, bdrc_i_id);
 CREATE INDEX volumes_bdrc_w_id_idx ON volumes (bdrc_w_id);
-CREATE INDEX volumes_bdrc_i_id_idx ON volumes (bdrc_i_id);
-
 
 CREATE TABLE workers (
   worker_id         uuid PRIMARY KEY,
