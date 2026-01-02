@@ -66,6 +66,7 @@ class SQSWorkerLoop:
         config = ProcessingConfig.from_worker_and_job_type(
             worker_config=self.worker_config,
             model_name=job_type.model_name,
+            job_type_name=job_type.name,
             encoding=job_type.encoding,
             line_mode=job_type.line_mode,
             k_factor=job_type.k_factor,
@@ -129,7 +130,7 @@ class SQSWorkerLoop:
             return
 
         result = await asyncio.to_thread(
-            processor.process_volume, task_message.bdrc_w_id, task_message.bdrc_i_id, job.job_key
+            processor.process_volume, task_message.bdrc_w_id, task_message.bdrc_i_id, task_message.version_name
         )
 
         if result.success:
@@ -182,11 +183,10 @@ class SQSWorkerLoop:
         try:
             self._setup_signal_handlers()
             logger.info(
-                "SQS worker loop started (model_dir=%s, input_bucket=%s, output_bucket=%s, output_prefix=%s)",
+                "SQS worker loop started (model_dir=%s, input_bucket=%s, output_bucket=%s)",
                 self.worker_config.model_dir,
                 self.worker_config.input_bucket,
                 self.worker_config.output_bucket,
-                self.worker_config.output_prefix,
             )
 
             while not self._shutdown_event.is_set():

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from .connection import get_connection, get_transaction
-from .models import Job, JobStatus, JobType, Task, TaskStatus
+from .models import Job, JobStatus, JobType, Task, TaskStatus, VolumeInput
 
 if TYPE_CHECKING:
     from asyncpg import Connection, Record
@@ -59,7 +59,7 @@ async def list_job_types() -> list[JobType]:
 async def create_job_with_tasks(
     job_key: str,
     type_id: int,
-    volumes: list[tuple[str, str]],
+    volumes: list[VolumeInput],
 ) -> tuple[Job, int]:
     """Create a job and its tasks in a single transaction."""
     async with get_transaction() as conn:
@@ -75,15 +75,29 @@ async def create_job_with_tasks(
         job = _row_to_job(job_row)
 
         volume_ids = []
-        for w_id, i_id in volumes:
+        for vol in volumes:
+            last_modified = None
+            if vol.manifest_last_modified_at:
+                last_modified = datetime.fromisoformat(vol.manifest_last_modified_at)
             row = await conn.fetchrow(
                 """
-                INSERT INTO volumes (bdrc_w_id, bdrc_i_id) VALUES ($1, $2)
-                ON CONFLICT (bdrc_w_id, bdrc_i_id) DO UPDATE SET bdrc_w_id = EXCLUDED.bdrc_w_id
+                INSERT INTO volumes (
+                    bdrc_w_id, bdrc_i_id, manifest_etag, version_name,
+                    nb_images, nb_images_intro, manifest_last_modified_at
+                )
+                VALUES ($1, $2, $3, $4, $5, 0, $6)
+                ON CONFLICT (bdrc_w_id, bdrc_i_id, version_name) DO UPDATE SET
+                    manifest_etag = EXCLUDED.manifest_etag,
+                    nb_images = EXCLUDED.nb_images,
+                    manifest_last_modified_at = EXCLUDED.manifest_last_modified_at
                 RETURNING id
                 """,
-                w_id,
-                i_id,
+                vol.bdrc_w_id,
+                vol.bdrc_i_id,
+                vol.manifest_etag,
+                vol.version_name,
+                vol.nb_images,
+                last_modified,
             )
             volume_ids.append(row["id"])
 
@@ -223,7 +237,7 @@ async def get_pending_tasks_with_volumes(job_id: int) -> list[dict[str, Any]]:
     async with get_connection() as conn:
         rows = await conn.fetch(
             """
-            SELECT t.id, t.volume_id, t.attempts, v.bdrc_w_id, v.bdrc_i_id
+            SELECT t.id, t.attempts, v.bdrc_w_id, v.bdrc_i_id, v.version_name
             FROM tasks t JOIN volumes v ON t.volume_id = v.id
             WHERE t.job_id = $1 AND t.status = 'pending' ORDER BY t.id""",
             job_id,

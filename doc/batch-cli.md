@@ -38,6 +38,7 @@ Create a `.env` file in the project root:
 DATABASE_URL=postgresql://user:password@host:5432/ocr_batch
 SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789/ocr-tasks.fifo
 AWS_DEFAULT_REGION=us-east-1
+INPUT_BUCKET=archive.tbrc.org
 ```
 
 ## CLI Commands
@@ -70,15 +71,28 @@ Create a new batch job with one or more volumes.
 
 ```bash
 python -m batch.cli.create_job --type-id <ID> --volumes <VOLUMES> [--job-key <KEY>]
+python -m batch.cli.create_job --type-id <ID> --volume-file <FILE> [--job-key <KEY>]
 ```
 
 **Arguments:**
 
-| Argument    | Required | Description                                   |
-| ----------- | -------- | --------------------------------------------- |
-| `--type-id` | Yes      | Job type ID (from `list_job_types`)           |
-| `--volumes` | Yes      | Comma-separated volumes in `W_id-I_id` format |
-| `--job-key` | No       | Custom job key (auto-generated if omitted)    |
+| Argument        | Required | Description                                   |
+| --------------- | -------- | --------------------------------------------- |
+| `--type-id`     | Yes      | Job type ID (from `list_job_types`)           |
+| `--volumes`     | *        | Comma-separated volumes in `W_id-I_id` format |
+| `--volume-file` | *        | Path to file with volumes (one per line)      |
+| `--job-key`     | No       | Custom job key (auto-generated if omitted)    |
+
+\* Either `--volumes` or `--volume-file` is required (mutually exclusive).
+
+**Volume file format:**
+
+```
+# Comments start with #
+W22308-I1KG9611
+W22308-I1KG9612
+W22308-I1KG9613  # inline comments also work
+```
 
 **Examples:**
 
@@ -86,11 +100,14 @@ python -m batch.cli.create_job --type-id <ID> --volumes <VOLUMES> [--job-key <KE
 # Single volume
 python -m batch.cli.create_job --type-id 1 --volumes "W22308-I1KG9611"
 
-# Multiple volumes
+# Multiple volumes (inline)
 python -m batch.cli.create_job --type-id 1 --volumes "W22308-I1KG9611,W22308-I1KG9612,W22308-I1KG9613"
 
+# From file
+python -m batch.cli.create_job --type-id 1 --volume-file volumes.txt
+
 # With custom job key
-python -m batch.cli.create_job --type-id 1 --volumes "W22308-I1KG9611" --job-key "my-test-job"
+python -m batch.cli.create_job --type-id 1 --volume-file volumes.txt --job-key "my-test-job"
 ```
 
 **Output:**
@@ -117,19 +134,19 @@ Job ID: 42
 View status of jobs and their tasks.
 
 ```bash
-python -m batch.cli.job_status [--job-id <ID>] [--job-key <KEY>] [--status <STATUS>] [--exclude <STATUSES>] [--limit <N>]
+python -m batch.cli.job_status [--job-id <ID>] [--job-key <KEY>] [--include-status <STATUS>] [--exclude-status <STATUSES>] [--limit <N>]
 ```
 
 **Arguments:**
 
-| Argument    | Required | Description                                                      |
-| ----------- | -------- | ---------------------------------------------------------------- |
-| `--job-id`  | No       | Show specific job by ID                                          |
-| `--job-key` | No       | Show specific job by key                                         |
-| `--status`  | No       | Filter by status (created, running, completed, failed, canceled) |
-| `--exclude` | No       | Exclude statuses (default: canceled, failed)                     |
-| `--all`     | No       | Show all jobs without exclusions                                 |
-| `--limit`   | No       | Max jobs to show (default: 20)                                   |
+| Argument           | Required | Description                                                      |
+| ------------------ | -------- | ---------------------------------------------------------------- |
+| `--job-id`         | No       | Show specific job by ID                                          |
+| `--job-key`        | No       | Show specific job by key                                         |
+| `--include-status` | No       | Filter by status (created, running, completed, failed, canceled) |
+| `--exclude-status` | No       | Exclude statuses (default: canceled, failed)                     |
+| `--all`            | No       | Show all jobs without exclusions                                 |
+| `--limit`          | No       | Max jobs to show (default: 20)                                   |
 
 **Examples:**
 
@@ -144,13 +161,13 @@ python -m batch.cli.job_status --job-id 42
 python -m batch.cli.job_status --job-key "J20241231_a1b2c3d4"
 
 # Show only running jobs
-python -m batch.cli.job_status --status running
+python -m batch.cli.job_status --include-status running
 
 # Show all jobs including canceled/failed
 python -m batch.cli.job_status --all
 
 # Show failed jobs only
-python -m batch.cli.job_status --status failed
+python -m batch.cli.job_status --include-status failed
 ```
 
 **Output:**
@@ -218,31 +235,29 @@ Workers are separate processes that poll SQS and process tasks.
 ```bash
 python sqs_worker_main.py \
   --model-dir /path/to/ocr/models \
-  --input-bucket archive.tbrc.org \
-  --output-bucket tests-bec.bdrc.io \
-  [--output-prefix output] \
-  [--upload-workers 10] \
+  [--output-bucket bec.bdrc.io] \
   [--visibility-timeout 600]
 ```
 
 **Arguments:**
 
-| Argument               | Required | Description                                      |
-| ---------------------- | -------- | ------------------------------------------------ |
-| `--model-dir`          | Yes      | Directory containing OCR model folders           |
-| `--input-bucket`       | Yes      | S3 bucket for input images                       |
-| `--output-bucket`      | Yes      | S3 bucket for output files                       |
-| `--output-prefix`      | No       | S3 prefix for output (default: output)           |
-| `--upload-workers`     | No       | Parallel upload threads (default: 10)            |
-| `--visibility-timeout` | No       | SQS visibility timeout in seconds (default: 600) |
+| Argument               | Required | Description                                       |
+| ---------------------- | -------- | ------------------------------------------------- |
+| `--model-dir`          | Yes      | Directory containing OCR model folders            |
+| `--output-bucket`      | No       | S3 bucket for output files (default: bec.bdrc.io) |
+| `--visibility-timeout` | No       | SQS visibility timeout in seconds (default: 600)  |
+
+**Output path format:**
+
+Results are written to: `{job_type_name}/{w_id}-{i_id}-{version_name}/`
+
+For example: `woodblock-stacks-unicode/W22308-I1KG9611-a1b2c3/`
 
 **Example:**
 
 ```bash
 python sqs_worker_main.py \
-  --model-dir /home/ocr/models \
-  --input-bucket archive.tbrc.org \
-  --output-bucket tests-bec.bdrc.io
+  --model-dir /home/ocr/models
 ```
 
 **How it works:**

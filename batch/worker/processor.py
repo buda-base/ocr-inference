@@ -30,8 +30,6 @@ class WorkerConfig:
     model_dir: str
     input_bucket: str
     output_bucket: str
-    output_prefix: str = "output"
-    upload_workers: int = 10
 
 
 @dataclass
@@ -40,8 +38,8 @@ class ProcessingConfig:
 
     model_path: str
     output_bucket: str
-    output_prefix: str
     input_bucket: str
+    job_type_name: str
     encoding: str = "unicode"
     k_factor: float = 2.5
     bbox_tolerance: float = 4.0
@@ -49,13 +47,13 @@ class ProcessingConfig:
     use_tps: bool = False
     line_mode: str = "line"
     artifact_granularity: str = "standard"
-    upload_workers: int = 10
 
     @classmethod
     def from_worker_and_job_type(
         cls,
         worker_config: WorkerConfig,
         model_name: str,
+        job_type_name: str,
         *,
         encoding: str = "unicode",
         line_mode: str = "line",
@@ -69,8 +67,8 @@ class ProcessingConfig:
         return cls(
             model_path=str(model_path),
             output_bucket=worker_config.output_bucket,
-            output_prefix=worker_config.output_prefix,
             input_bucket=worker_config.input_bucket,
+            job_type_name=job_type_name,
             encoding=encoding,
             k_factor=k_factor,
             bbox_tolerance=bbox_tolerance,
@@ -78,7 +76,6 @@ class ProcessingConfig:
             use_tps=use_tps,
             line_mode=line_mode,
             artifact_granularity=artifact_granularity,
-            upload_workers=worker_config.upload_workers,
         )
 
 
@@ -105,8 +102,9 @@ class TaskProcessor:
             logger.info("Pipeline loaded from %s", self.config.model_path)
         return self._pipeline
 
-    def process_volume(self, work_id: str, image_group: str, job_key: str) -> ProcessingResult:
+    def process_volume(self, work_id: str, image_group: str, version_name: str) -> ProcessingResult:
         start_time = time.perf_counter()
+        output_prefix = f"{self.config.job_type_name}/{work_id}-{image_group}-{version_name}"
 
         try:
             pipeline = self._ensure_pipeline_loaded()
@@ -134,7 +132,6 @@ class TaskProcessor:
             )
 
         s3_prefix = get_s3_folder_prefix(work_id, image_group)
-        output_prefix = f"{self.config.output_prefix}/jobs/{job_key}/volumes/{work_id}-{image_group}"
 
         images: list[ImageInput] = []
         for img_info in image_list:
@@ -160,7 +157,6 @@ class TaskProcessor:
         storage = S3Storage(
             bucket=self.config.output_bucket,
             base_prefix=output_prefix,
-            max_workers=self.config.upload_workers,
         )
 
         config_dict: dict[str, Any] = {

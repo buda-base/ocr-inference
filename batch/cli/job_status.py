@@ -107,9 +107,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Get job status (lists all jobs if no ID provided)")
     parser.add_argument("--job-id", type=int, help="Job ID (shows single job)")
     parser.add_argument("--job-key", help="Job key (shows single job)")
-    parser.add_argument("--status", help="Filter by status (created, running, completed, failed, canceled)")
+    parser.add_argument("--include-status", help="Filter by status (created, running, completed, failed, canceled)")
     parser.add_argument(
-        "--exclude",
+        "--exclude-status",
         nargs="+",
         default=["canceled", "failed"],
         help="Exclude jobs with these statuses (default: canceled failed)",
@@ -119,13 +119,13 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    exclude = None if args.all or args.status else args.exclude
+    exclude = None if args.all or args.include_status else args.exclude_status
 
     asyncio.run(
         run_job_status(
             job_id=args.job_id,
             job_key=args.job_key,
-            status_filter=args.status,
+            status_filter=args.include_status,
             exclude_statuses=exclude,
             limit=args.limit,
         )
