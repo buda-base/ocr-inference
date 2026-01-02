@@ -1,0 +1,31 @@
+
+# Arrow schema builder (placeholders if pyarrow isn't installed)
+try:
+    import pyarrow as pa
+except Exception:  # pragma: no cover
+    pa = None
+
+def build_schema():
+    """Build a PyArrow schema for Parquet output.
+
+    - tps_points: list<list<float32>>
+    - lines_contours: list<list<struct<x:int16,y:int16>>>
+    Returns None if PyArrow is unavailable so the skeleton can run.
+    """
+    if pa is None:
+        return None
+    pt = pa.list_(pa.list_(pa.float32()))
+    point_struct = pa.struct([("x", pa.int16()), ("y", pa.int16())])
+    contour = pa.list_(point_struct)
+    contours = pa.list_(contour)
+    schema = pa.schema([
+        ("img_file_name", pa.string()),
+        ("img_s3_etag", pa.string()),
+        ("resized_w", pa.int32()),
+        ("resized_h", pa.int32()),
+        ("rotation_angle", pa.float32()),
+        ("tps_points", pt),
+        ("lines_contours", contours),
+        ("nb_lines", pa.int32()),
+    ])
+    return schema
