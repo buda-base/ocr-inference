@@ -1,9 +1,4 @@
-
-# Arrow schema builder (placeholders if pyarrow isn't installed)
-try:
-    import pyarrow as pa
-except Exception:  # pragma: no cover
-    pa = None
+import pyarrow as pa
 
 def ld_build_schema():
     """Build a PyArrow schema for Parquet output of lines detection.
@@ -27,6 +22,7 @@ def ld_build_schema():
         ("resized_h", pa.int32()),
         ("rotation_angle", pa.float32()),
         ("tps_points", pt),
+        ("tps_alpha", pa.float16()),
         ("contours", contours),
         ("nb_contours", pa.int32()),
         ("contours_bboxes", bboxes)
