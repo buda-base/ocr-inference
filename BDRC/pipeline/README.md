@@ -73,11 +73,12 @@ For InferredFrames with first_pass = true, it:
 - calculates contours on the line_mask
 - checks if a rotation is needed based on the contours, if so set rotation_angle and rotates the contours
 - checks if a tps operation is needed, if so sets tps_points
-- if rotation or tps is needed, apply it on frame, without re-binarization for originally binary images, and send it back as a DecodedFrame
+- if rotation or tps is needed, apply it on frame, without re-binarization for originally binary images, and send it back as a DecodedFrame. It makes sure the transformed frame is of exactly the same H, W.
 - else it creates a LDRecord and queues it
 
 For InferredFrames with first_pass = false, it:
-- creates a LDRecord and queues it
+- detects the contours of the line_mask
+- creates a LDRecord and queues it 
 
 ### S3ParquetWriter
 
@@ -123,7 +124,7 @@ async def main():
     tasks = [ImageTask(key=f"vol_A/img_{i:05d}.jpg", etag="etagA", size=None, volume_id="vol_A") for i in range(600)]
     global_sem = asyncio.Semaphore(cfg.s3_max_inflight_global)
     s3 = S3Context(cfg, global_sem)
-    worker = VolumeWorker(cfg, s3, "vol_A", tasks)
+    worker = LDVolumeWorker(cfg, s3, "vol_A", tasks)
     await worker.run()
 
 if __name__ == "__main__":

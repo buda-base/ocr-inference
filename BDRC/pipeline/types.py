@@ -1,46 +1,56 @@
-
 from dataclasses import dataclass
 from typing import Optional, Any, Tuple, List
 
 @dataclass
 class ImageTask:
     """Input descriptor for the prefetcher.
-
-    Attributes:
-      key: S3 object key to GET.
-      etag: Expected S3 ETag (used for idempotency/audit).
-      size: Size in bytes if known.
-      volume_id: Owning volume identifier.
     """
-    s3_key: str                 # s3 key
-    s3_img_etag: str                # from manifest if available
-    size: Optional[int]      # bytes if known
+    s3_key: str
+    img_filename: str
+
+@dataclass
+class FetchedBytes:
+    """Input descriptor for the decoder.
+    """
+    img_filename: str
+    s3_etag: str
+    file_bytes: bytes
 
 @dataclass
 class DecodedFrame:
-    """Output of the decode stage.
-
-    frame: Decoded image (e.g., np.ndarray HxW or HxWxC).
-    width/height: Dimensions of the decoded frame.
-    task: Original ImageTask (for metadata like key/etag).
+    """Output of the decode stage and transform stage
     """
-    task: ImageTask
-    frame: Any               # placeholder for np.ndarray
-    width: int
-    height: int
+    img_filename: str
+    s3_etag: str
+    frame: Any # grayscale H, W, uint8
+    is_binary: bool # if the value space is {0, 255}
+    first_pass: bool # if it's a first pass for an image
+    rotation_angle: Optional[float] # if in the second pass, value of the rotation angle in degrees that was applied after first pass, null if first pass
+    tps_data: Optional[Any] # (input_pts, output_pts, alpha), if in the second pass, tps data that was applied after first pass, null if first pass
+
+@dataclass
+class InferredFrame:
+    """Output of the inference stage.
+    """
+    img_filename: str
+    s3_etag: str
+    frame: Any
+    is_binary: bool
+    first_pass: bool
+    rotation_angle: Optional[float]
+    tps_data: Optional[Any]
+    line_mask: Any # result of inference, H, W, uint8, binary {0, 255}, same H, W as frame
 
 @dataclass
 class Record:
-    """Row destined for the Parquet writer.
-
-    Contains image identifiers, geometry outputs (angles/TPS),
-    and extracted line information to persist.
+    """input for the Parquet writer, output of the transform stage
     """
     img_file_name: str
-    img_s3_etag: str
-    resized_w: int
+    s3_etag: str
+    resized_w: int # from frame
     resized_h: int
     rotation_angle: float
-    tps_points: Any
-    lines_contours: Any
-    nb_lines: int
+    tps_data: Any
+    contours: Any
+    nb_contours: int
+    contours_bboxes: Any
