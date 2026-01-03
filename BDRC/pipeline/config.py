@@ -41,6 +41,8 @@ class PipelineConfig:
     parquet_dictionary_enabled: bool = True
     schema_version: str = "v1"
 
-    # Preprocessing
+    # Decoder
     frame_max_width = 4096
     frame_max_height = 2048
+    linearize = True
+    normalize_background = False

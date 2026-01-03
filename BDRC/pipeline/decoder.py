@@ -7,6 +7,7 @@ import os
 from typing import Tuple, Optional
 import numpy as np
 import cv2
+from functools import lru_cache
 
 class ImageDecodeError(RuntimeError):
     """Raised when an image cannot be decoded or processed safely."""
@@ -15,7 +16,7 @@ class Decoder:
     """Decode stage (thread pool).
 
     Input: (ImageTask, bytes)
-    Output: DecodedFrame (binarized uint8, resized) pushed to q_frames; sends sentinel at end.
+    Output: DecodedFrame (grayscale uint8, resized) pushed to q_frames; sends sentinel at end.
     """
     def __init__(self, cfg: PipelineConfig, q_bytes: asyncio.Queue, q_frames: asyncio.Queue):
         self.cfg = cfg
@@ -25,8 +26,8 @@ class Decoder:
 
     def _decode_one(self, task: ImageTask, body: bytes) -> DecodedFrame:
         # TODO: exception handling
-        frame = bytes_to_binary_frame(task.s3_key, body, max_width=self.cfg.max_width, max_height=self.cfg.max_height)
-        return DecodedFrame(task=task, frame=frame, width=frame.shape[1], height=frame.shape[0])
+        frame = bytes_to_frame(task.img_filename, body, max_width=self.cfg.max_width, max_height=self.cfg.max_height, linearize=self.cfg.linearize, normalize_background=self.cfg.normalize_background)
+        return DecodedFrame(task=task, frame=frame)
 
     async def run(self):
         loop = asyncio.get_running_loop()
@@ -95,25 +96,6 @@ def _to_gray_cv(img: np.ndarray) -> np.ndarray:
         return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
 
     raise ImageDecodeError(f"Unsupported channel count: {ch}")
-
-def _adaptive_binarize(gray: np.ndarray, block_size: int, c: int) -> np.ndarray:
-    if gray.ndim != 2 or gray.dtype != np.uint8:
-        raise ImageDecodeError("Adaptive binarization requires grayscale uint8")
-    # block_size must be odd and >= 3
-    if block_size < 3:
-        block_size = 3
-    if (block_size & 1) == 0:
-        block_size += 1
-
-    # adaptiveThreshold returns 0/255 uint8
-    return cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        block_size,
-        c,
-    )
 
 def _decode_via_cv2(image_bytes: bytes, likely_jpeg: bool) -> np.ndarray:
     """
@@ -189,22 +171,100 @@ def _decode_via_pil(filename: str, image_bytes: bytes) -> tuple[np.ndarray, bool
     except Exception as e:
         raise ImageDecodeError(f"PIL decode failed for '{filename}': {e}") from e
 
-def bytes_to_binary_frame(
+# Functions to go from sRGB to linear light values
+
+@lru_cache(maxsize=1)
+def _srgb_to_linear_u8_lut() -> np.ndarray:
+    """
+    Returns a 256x1 uint8 LUT suitable for cv2.LUT, mapping sRGB-encoded [0..255]
+    to linear-light [0..255].
+    """
+    x = np.arange(256, dtype=np.float32) / 255.0
+    lin = np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+    lut = (lin * 255.0 + 0.5).astype(np.uint8)
+    return lut.reshape(256, 1)  # OpenCV expects (256,1) or (1,256)
+
+def _srgb_u8_to_linear_u8(gray_u8: np.ndarray) -> np.ndarray:
+    """
+    Very fast sRGB->linear for uint8 grayscale (or uint8 multi-channel too).
+    Uses cv2.LUT with a precomputed 256-entry table.
+    """
+    if gray_u8.dtype != np.uint8:
+        raise ValueError("_srgb_u8_to_linear_u8 expects uint8 input")
+    lut = _srgb_to_linear_u8_lut()
+    # cv2.LUT supports 1-channel or multi-channel uint8; mapping is applied per channel.
+    return cv2.LUT(gray_u8, lut)
+
+# Function to normalize the background
+
+def _normalize_background_u8_fast(
+    gray_u8: np.ndarray,
+    *,
+    sigma: float | None = None,
+    border_type: int = cv2.BORDER_REPLICATE,
+) -> np.ndarray:
+    """
+    Fast document background/shading normalization.
+
+    Steps:
+      1) convert to float32 [0..1]
+      2) large Gaussian blur to estimate background (low-frequency shading)
+      3) subtract background (high-pass)
+      4) min/max normalize to uint8 [0..255] (in OpenCV, output dtype set to CV_8U)
+
+    Input:  2D uint8
+    Output: 2D uint8
+    """
+    if gray_u8.dtype != np.uint8 or gray_u8.ndim != 2:
+        raise ValueError("_normalize_background_u8_fast expects a 2D uint8 grayscale image")
+
+    h, w = gray_u8.shape
+
+    # Choose sigma based on image size (tuned for text documents)
+    # possibly good defaults for pechas
+    if sigma is None:
+        m = h if h < w else w
+        sigma = 0.03 * float(m)
+        if sigma < 10.0: sigma = 10.0
+        if sigma > 60.0: sigma = 60.0
+
+    # Convert once to float32 in [0..1]
+    # (Using numpy for scaling is typically faster than calling multiple cv2 ops.)
+    f = gray_u8.astype(np.float32) * (1.0 / 255.0)
+
+    # Background estimate (low-frequency shading)
+    bg = cv2.GaussianBlur(f, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=border_type)
+
+    # Division (flat-field). eps prevents blow-ups in dark regions.
+    #norm = cv2.divide(f, bg + 1e-6)
+    norm = cv2.subtract(f, bg)  # stays float32
+
+    # Normalize to uint8 directly (no extra astype)
+    return cv2.normalize(norm, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+
+def bytes_to_frame(
     filename: str,
     image_bytes: bytes,
     *,
     max_width: int = 4096,
     max_height: int = 2048,
-    block_size: int = 31,
-    c: int = 15,
+    linearize = True, # convert to linear rgb
+    normalize_background: False
 ) -> np.ndarray:
     """
-    Decode image bytes into a binary (0/255) uint8 OpenCV frame (2D array),
+    Decode image bytes into a uint8 OpenCV frame (2D array),
     downscaled to fit within (max_width, max_height).
+
+    Result is either linear light value or binary {0,255}.
 
     Optimized fast paths (99% of the data):
       - JPEG: OpenCV decode first; PIL fallback for CMYK/odd cases.
       - TIFF (Group4, already binary): PIL first (more reliable), OpenCV fallback.
+
+    Important notes:
+      - (approximately) linearizes channel for intensity math by default
+      - has an option to normalize the background, not active by default
+      - does not read / apply ICC profiles (apparently not a common practice for OCR)
 
     Raises ImageDecodeError on unrecoverable failures.
     """
@@ -266,11 +326,14 @@ def bytes_to_binary_frame(
             binary = (binary * 255).astype(np.uint8, copy=False)
         return np.ascontiguousarray(binary)
 
+    if linearize:
+        gray = _srgb_u8_to_linear_u8(gray)
+
     # Downscale before adaptive threshold (big speed win)
     gray = _downscale_gray(gray, max_width, max_height)
 
-    # Adaptive threshold to 0/255
-    binary = _adaptive_binarize(gray, block_size=block_size, c=c)
+    if normalize_background:
+        gray = _normalize_background_u8(gray)
 
     # Enforce contiguous uint8 frame
-    return np.ascontiguousarray(binary, dtype=np.uint8)
+    return np.ascontiguousarray(gray, dtype=np.uint8)

@@ -3,7 +3,7 @@ import asyncio, time
 from typing import List, Tuple
 from .types import DecodedFrame, Record
 
-class GpuBatcher:
+class LDGpuBatcher:
         """Two-lane GPU micro-batcher and inference runner.
 
         Inputs:

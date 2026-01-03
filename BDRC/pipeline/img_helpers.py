@@ -154,3 +154,24 @@ def apply_transform_3(
     out = _apply_rotation_3(img, rotation)
     out = _apply_tps_3(out, tps_input_pts, tps_output_pts, tps_alpha)
     return np.ascontiguousarray(out)
+
+
+def adaptive_binarize(gray: np.ndarray, block_size = 51, c = 15) -> np.ndarray:
+    # block_size = 51 and c = 15 are potential good candidates after linearization
+    if gray.ndim != 2 or gray.dtype != np.uint8:
+        raise ImageDecodeError("Adaptive binarization requires grayscale uint8")
+    # block_size must be odd and >= 3
+    if block_size < 3:
+        block_size = 3
+    if (block_size & 1) == 0:
+        block_size += 1
+
+    # adaptiveThreshold returns 0/255 uint8
+    return cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        block_size,
+        c,
+    )
