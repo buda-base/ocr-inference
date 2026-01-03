@@ -33,6 +33,18 @@ class Task:
 
 
 @dataclass
+class VolumeInput:
+    """Volume info with manifest data for job creation."""
+
+    bdrc_w_id: str
+    bdrc_i_id: str
+    manifest_etag: bytes
+    version_name: str
+    nb_images: int
+    manifest_last_modified_at: str | None
+
+
+@dataclass
 class JobType:
     id: int
     name: str
@@ -52,6 +64,11 @@ class Volume:
     id: int
     bdrc_w_id: str
     bdrc_i_id: str
+    manifest_etag: bytes
+    version_name: str
+    nb_images: int
+    nb_images_intro: int = 0
+    manifest_last_modified_at: datetime | None = None
 
     @property
     def volume_id(self) -> str:

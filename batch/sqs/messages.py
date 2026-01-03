@@ -9,9 +9,9 @@ class TaskMessage:
     job_id: int
     job_key: str
     task_id: int
-    volume_id: int
     bdrc_w_id: str
     bdrc_i_id: str
+    version_name: str
     attempt: int = 1
 
     def to_json(self) -> str:

@@ -24,6 +24,13 @@ class ImageInfo(TypedDict):
     pilmode: str
 
 
+class ManifestInfo(TypedDict):
+    images: list[ImageInfo]
+    etag: bytes
+    last_modified: str | None
+    nb_images: int
+
+
 @lru_cache(maxsize=1)
 def get_s3_client() -> BaseClient:
     return boto3.client("s3", config=Config(max_pool_connections=50, retries={"max_attempts": 3, "mode": "adaptive"}))
@@ -42,9 +49,31 @@ def gets3blob(bucket: str, key: str) -> io.BytesIO | None:
         return None
 
 
+def get_manifest_info(bucket: str, w_id: str, i_id: str) -> ManifestInfo | None:
+    """Get dimensions.json with S3 metadata (ETag, LastModified)."""
+    key = get_s3_folder_prefix(w_id, i_id) + "dimensions.json"
+    try:
+        response = get_s3_client().get_object(Bucket=bucket, Key=key)
+        blob = io.BytesIO(response["Body"].read())
+        images = json.loads(gzip.decompress(blob.getvalue()).decode("utf8"))
+        etag_str = response.get("ETag", "").strip('"')
+        etag_bytes = bytes.fromhex(etag_str.split("-")[0].ljust(32, "0")[:32])
+        last_modified = response.get("LastModified")
+        return ManifestInfo(
+            images=images,
+            etag=etag_bytes,
+            last_modified=last_modified.isoformat() if last_modified else None,
+            nb_images=len(images),
+        )
+    except Exception:
+        logger.exception("Failed to get manifest s3://%s/%s", bucket, key)
+        return None
+
+
 def get_image_list(bucket: str, w_id: str, i_id: str) -> list[ImageInfo] | None:
-    blob = gets3blob(bucket, get_s3_folder_prefix(w_id, i_id) + "dimensions.json")
-    return json.loads(gzip.decompress(blob.getvalue()).decode("utf8")) if blob else None
+    """Get list of images from dimensions.json manifest."""
+    manifest = get_manifest_info(bucket, w_id, i_id)
+    return manifest["images"] if manifest else None
 
 
 def download_image(bucket: str, key: str) -> npt.NDArray | None:
