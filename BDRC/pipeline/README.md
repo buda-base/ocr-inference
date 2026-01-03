@@ -1,14 +1,12 @@
-
-# Pipeline Overview
+# Volume Pipeline Overview
 
 This directory contains the runtime pieces that make a volume worker efficient, safe, and easy to reason about.
-If you are **not** a concurrency expert, start here — the most important concepts are the **coroutines**, **bounded queues**, and the **two‑lane GPU batcher**.
 
-## Big Picture
+## Components
 
 ```
-S3 → Prefetcher (async) → Decoder (thread pool) → GPU Batcher (async; two lanes)
-       │                                │                 └→ first-pass summary → TransformController
+S3 → Prefetcher (async) → Decoder (thread pool) → LD GPU Batcher (async; two lanes)
+       │                                │                 └→ first-pass summary → LD TransformController
        │                                │                                                     │
        └────────────────────────────────┴─────────────────────────────────────────────────────┘
                                                                                  ↘ (if needed) Reprocess lane
@@ -24,20 +22,73 @@ S3 → Prefetcher (async) → Decoder (thread pool) → GPU Batcher (async; two 
   - the **reprocess lane** with higher priority (second pass on transformed frames)
   A simple **weighted scheduler** favors the reprocess lane to keep second‑pass latency low without starving first‑pass work.
 
-## Components
+##### Prefetcher
 
-- `config.py` — **`PipelineConfig`** centralizes knobs (S3 concurrency caps, queue sizes, batch size/timeout, output prefixes).
-- `types.py` — data classes that flow between stages:
-  - **`ImageTask`** (what to fetch from S3),
-  - **`DecodedFrame`** (a decoded image with size),
-  - **`Record`** (a row for Parquet).
-- `s3ctx.py` — **`S3Context`** holds the global S3 semaphore and yields an async S3 client (via `aioboto3` in real code).
-- `prefetch.py` — **`Prefetcher`** lists/reads S3 keys **asynchronously** and pushes `(task, bytes)` into the first queue.
-- `decoder.py` — **`Decoder`** turns bytes into frames in a **thread pool** and pushes `DecodedFrame` objects onward.
-- `batcher.py` — **`GpuBatcher`** builds **micro‑batches** of 512×512 patches on GPU and runs the model; it emits first‑pass summaries to the `TransformController` or final `Record`s to the writer.
-- `transform.py` — **`TransformController`** inspects first‑pass summaries, computes **rotation/TPS** with OpenCV, and either writes a final `Record` or enqueues a **transformed** frame into the high‑priority **reprocess lane**.
-- `writer.py` — **`S3ParquetWriter`** streams rows to a **staging** Parquet on S3 and **publishes** atomically via server‑side copy + `_SUCCESS.json` marker.
-- `worker.py` — **`VolumeWorker`** wires everything together with bounded queues and runs all stages concurrently.
+- **input:** ImageTask(s3_key, img_filename)
+- **output:** FetchedBytes(img_filename, s3_etag, bytes)
+
+Fetches bytes on s3 asynchronously, keeps the ETag returned in the s3 GET.
+
+##### Decoder
+
+- **input:** FetchedBytes(img_filename, s3_etag, bytes)
+- **output:** DecodedFrame(img_filename, s3_etag, frame, is_binary, first_pass=true, rotation=0, tps_points=null)
+
+where:
+- `frame` is a grayscale uint8 cv2 image resized to max_width, max_height coming from the pipeline configuration
+- `is_binary` indicates if the original image was binary. In that case the values in the frame are {0,255}
+
+Decodes the bytes from s3 into a grayscale image in a thread pool.
+
+##### LDGpuBatcher
+
+- **input:** DecodedFrame(img_filename, s3_etag, frame, is_binary, first_pass=true, rotation_angle=null, tps_points=null)
+- **output:** InferredFrame(img_filename, s3_etag, frame, is_binary, line_mask, first_pass, rotation_angle, tps_points)
+
+where line_mask is a binarized ({0,255}) uint8 frame of the same size as frame.
+
+The GpuBatches uses pytorch to do data transformation:
+- binarization on {0,255} using algorithm similar to ADAPTIVE_THRESH_GAUSSIAN_C
+- tiling on 3,512,512,FP32
+- inference on tiles
+- merging inferred tiles into 3, H, W, FP32 (or maybe H, W, FP16? directly)
+- reshaping in H, W, uint8
+
+It builds micro‑batches of N (or less) 512×512 patches on GPU and runs the model on these.
+
+##### LDTransformController
+
+- **input:** InferredFrame(img_filename, s3_etag, frame, is_binary, line_mask, first_pass, rotation_angle, tps_points)
+- **output:** 2 options:
+   * LDRecord(img_filename, s3_etag, frame_w, frame_h, contours, nb_contours, contours_bboxes, rotation_angle=0, tps_points=null)
+   * DecodedFrame(img_filename, s3_etag, frame, is_binary, first_pass=false, rotation_angle, tps_points)
+
+depending if it sees the image requires another inference or not.
+
+In the first case the LDRecord is queued to the S3ParquetWriter.
+
+In the second, the DecodedFrame is queued to a priority lane of the LDGpuBatcher.
+
+For InferredFrames with first_pass = true, it:
+- calculates contours on the line_mask
+- checks if a rotation is needed based on the contours, if so set rotation_angle and rotates the contours
+- checks if a tps operation is needed, if so sets tps_points
+- if rotation or tps is needed, apply it on frame, without re-binarization for originally binary images, and send it back as a DecodedFrame
+- else it creates a LDRecord and queues it
+
+For InferredFrames with first_pass = false, it:
+- creates a LDRecord and queues it
+
+##### S3ParquetWriter
+
+- **input:** LDRecord(img_filename, s3_etag, frame_w, frame_h, contours, nb_contours, contours_bboxes, rotation_angle=0, tps_points=null)
+- **output:** none
+
+writes the LDRecord on s3.
+
+##### LDVolumeWorker
+
+Wires all the components together.
 
 ## Why Bounded Queues? (Backpressure 101)
 
@@ -78,5 +129,3 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
-
-> Replace the placeholders in `decoder.py`, `batcher.py`, and `transform.py` with your OpenCV / PyTorch / Kornia logic. Everything else (queues, scheduling, S3 finalize) is ready to go.
