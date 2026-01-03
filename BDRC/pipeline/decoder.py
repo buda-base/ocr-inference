@@ -182,7 +182,7 @@ def _srgb_to_linear_u8_lut() -> np.ndarray:
     x = np.arange(256, dtype=np.float32) / 255.0
     lin = np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
     lut = (lin * 255.0 + 0.5).astype(np.uint8)
-    return lut.reshape(256, 1)  # OpenCV expects (256,1) or (1,256)
+    return np.ascontiguousarray(lut.reshape(256, 1))  # OpenCV expects (256,1) or (1,256)
 
 def _srgb_u8_to_linear_u8(gray_u8: np.ndarray) -> np.ndarray:
     """
@@ -197,7 +197,7 @@ def _srgb_u8_to_linear_u8(gray_u8: np.ndarray) -> np.ndarray:
 
 # Function to normalize the background
 
-def _normalize_background_u8_fast(
+def _normalize_background_u8(
     gray_u8: np.ndarray,
     *,
     sigma: float | None = None,

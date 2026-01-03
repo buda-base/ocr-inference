@@ -21,8 +21,8 @@ def _apply_rotation_1(img: npt.NDArray[np.uint8], angle_deg: float) -> npt.NDArr
     """
     Grayscale rotation. No binarization assumptions.
     """
-    if abs(float(angle_deg)) < 1e-12:
-        return np.ascontiguousarray(img)
+    if angle_deg is None or abs(float(angle_deg)) < 1e-12:
+        return img
 
     h, w = img.shape
     M = _rotation_matrix(angle_deg, h, w)
@@ -37,8 +37,8 @@ def _apply_rotation_1(img: npt.NDArray[np.uint8], angle_deg: float) -> npt.NDArr
 
 
 def _apply_rotation_3(img: npt.NDArray[np.uint8], angle_deg: float) -> npt.NDArray[np.uint8]:
-    if abs(float(angle_deg)) < 1e-12:
-        return np.ascontiguousarray(img)
+    if angle_deg is None or abs(float(angle_deg)) < 1e-12:
+        return img
 
     h, w, _ = img.shape
     M = _rotation_matrix(angle_deg, h, w)
@@ -56,8 +56,8 @@ def _apply_tps_1(img: npt.NDArray[np.uint8], input_pts, output_pts, alpha=DEFAUL
     """
     Grayscale TPS (bilinear sampling).
     """
-    if tps_points is None:
-        return np.ascontiguousarray(img)
+    if input_pts is None:
+        return img
 
     h, w = img.shape
     input_pts = np.asarray(input_pts, dtype=np.float64)
@@ -89,8 +89,8 @@ def _apply_tps_1(img: npt.NDArray[np.uint8], input_pts, output_pts, alpha=DEFAUL
 
 
 def _apply_tps_3(img: npt.NDArray[np.uint8], input_pts, output_pts, alpha=DEFAULT_ALPHA) -> npt.NDArray[np.uint8]:
-    if tps_points is None:
-        return np.ascontiguousarray(img)
+    if input_pts is None:
+        return img
 
     h, w, c = img.shape
     if c != 3:
@@ -136,7 +136,7 @@ def apply_transform_1(
 
     out = _apply_rotation_1(img, rotation)
     out = _apply_tps_1(out, tps_input_pts, tps_output_pts, tps_alpha)
-    return np.ascontiguousarray(out)
+    return out
 
 
 def apply_transform_3(
@@ -153,11 +153,15 @@ def apply_transform_3(
 
     out = _apply_rotation_3(img, rotation)
     out = _apply_tps_3(out, tps_input_pts, tps_output_pts, tps_alpha)
-    return np.ascontiguousarray(out)
+    return out
 
 
-def adaptive_binarize(gray: np.ndarray, block_size = 51, c = 15) -> np.ndarray:
-    # block_size = 51 and c = 15 are potential good candidates after linearization
+def adaptive_binarize(gray: np.ndarray, block_size = 31, c = 15) -> np.ndarray:
+    # in app v1, block_size = 31, c = 15
+    # chatgpt says block_size = 61 and c = 7 are potential good candidates but only after background normalization
+    # says rule of thumb should be:
+    #   block_size ≈ 14–20 × stroke_width (must be odd)
+    #   c ≈ 1.5–2.5 × stroke_width (if background-normalized, use the low end)
     if gray.ndim != 2 or gray.dtype != np.uint8:
         raise ImageDecodeError("Adaptive binarization requires grayscale uint8")
     # block_size must be odd and >= 3

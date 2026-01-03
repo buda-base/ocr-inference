@@ -45,7 +45,7 @@ class InferredFrame:
 class Record:
     """input for the Parquet writer, output of the transform stage
     """
-    img_file_name: str
+    img_filename: str
     s3_etag: str
     resized_w: int # from frame
     resized_h: int

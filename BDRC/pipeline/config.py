@@ -46,3 +46,10 @@ class PipelineConfig:
     frame_max_height = 2048
     linearize = True
     normalize_background = False
+
+    # LDTransform
+    max_angle_deg: float = 5.0
+    min_angle_deg: float = 0.3
+    tps_add_corners: bool = True
+    tps_alpha: float = 0.5
+    legacy_tps_detect: bool = False

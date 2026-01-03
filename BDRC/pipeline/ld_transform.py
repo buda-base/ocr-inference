@@ -1,18 +1,20 @@
 
 import asyncio
-from .types import DecodedFrame, Record
+from .types import DecodedFrame, Record, InferredFrame
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from .img_helpers import apply_transform_1
 
 import cv2
 import numpy as np
 import numpy.typing as npt
 
 class TransformController:
-        """Consumes first-pass summaries, decides rotation/TPS, and routes.
+        """Consumes InferredFrame, decides and apply rotation/TPS, and routes.
 
         Input: InferredFrame from GPU first pass.
-        Output: Either a final Record to the writer, or a transformed
-        DecodedFrame enqueued to the **reprocess** lane.
+        Output: Either
+           - a final Record to the writer, or 
+           - a transformed (rotated + TPS) DecodedFrame enqueued to the reprocess lane.
         """
     def __init__(self, cfg, q_first_results: asyncio.Queue, q_reprocess_frames: asyncio.Queue, q_records: asyncio.Queue):
         self.cfg = cfg
@@ -23,27 +25,54 @@ class TransformController:
     async def run(self):
         """Main loop: read summaries, decide, write or re-enqueue; propagate sentinel."""
         while True:
-            item = await self.q_first_results.get()
+            frame: InferredFrame = await self.q_first_results.get()
             if item is None:
                 await self.q_reprocess_frames.put(None)
                 break
-            frame, summary = item
-            need = False  # TODO: real criterion based on summary
-            if not need:
+            # 1. detect contours
+            contours = get_filtered_contours(frame.line_mask)
+            # 2. get rotation angle, if non-0, rotate contours
+            h, w = frame.line_mask.shape
+            rotation_angle = get_rotation_angle(contours, h, w, max_angle_deg=self.cfg.max_angle_deg, min_angle_deg=self.cfg.min_angle_deg)
+            if rotation_angle != 0.0:
+                contours = rotate_contours(contours, rotation_angle, h, w)
+            # 3. get tps data
+            tps_data = get_tps_points(contours, h, w, legacy_tps_detect=self.cfg.legacy_tps_detect, alpha=self.cfg.tps_alpha, tps_add_corners=self.cfg.add_corners)
+            input_pts, output_pts, alpha = None
+            if tps_data is not None:
+                input_pts, output_pts = tps_data
+                alpha = self.cfg.tps_alpha
+            # 4. if no second pass required, send record
+            if tps_data is None and rotation_angle == 0.0:
+                # save contour bboxes (?)
+                contours_bboxes = get_contour_bboxes(contours)
                 rec = Record(
-                    img_file_name=frame.task.key,
-                    img_s3_etag=frame.task.etag,
-                    resized_w=frame.width,
-                    resized_h=frame.height,
-                    rotation_angle=0.0,
-                    tps_points=None,
-                    lines_contours=None,
-                    nb_lines=0,
+                    img_filename=frame.img_filename,
+                    s3_etag=frame.s3_etag,
+                    resized_w=w,
+                    resized_h=h,
+                    rotation_angle=None,
+                    tps_data=None,
+                    contours=contours,
+                    nb_contours=len(contours),
+                    contours_bboxes=contours_bboxes
                 )
+                frame = None # gc
                 await self.q_records.put(rec)
             else:
-                # TODO: apply transform here and enqueue transformed frame
-                await self.q_reprocess_frames.put(frame)
+                # or if a second pass is required, create a new decodedframe by transforming the initial frame
+                transformed_frame = apply_transform_1(frame.frame, rotation_angle, input_pts, output_pts, alpha)
+                new_decoded_frame = DecodedFrame(
+                    img_filename=frame.img_filename,
+                    s3_etag=frame.s3_etag,
+                    frame=transformed_frame,
+                    first_pass=False,
+                    is_binary=False,
+                    rotation_angle=rotation_angle,
+                    tps_data=(input_pts, output_pts, alpha),
+                )
+                frame = None # gc
+                await self.q_reprocess_frames.put(new_decoded_frame)
 
 # -----------------------------
 # Defaults (tweakable)
@@ -79,6 +108,26 @@ def _assert_mask_uint8_binary_0_255(line_mask: npt.NDArray[np.uint8]) -> None:
     u = np.unique(line_mask)
     if not (u.size <= 2 and set(map(int, u)).issubset({0, 255})):
         raise ValueError(f"line_mask must be binarized in {{0,255}}, got unique={u[:10]}")
+
+def get_contour_bboxes(contours):
+    """
+    Returns axis-aligned (x, y, w, h) bboxes,
+    computed from minAreaRect for robustness.
+    """
+    bboxes = []
+
+    for cnt in contours:
+        if cnt is None or len(cnt) < 3:
+            continue
+
+        rect = cv2.minAreaRect(cnt)
+        box = cv2.boxPoints(rect)      # 4x2
+        box = np.int32(np.round(box))
+
+        x, y, w, h = cv2.boundingRect(box)
+        bboxes.append((x, y, w, h))
+
+    return bboxes
 
 # -----------------------------
 # Public API 1: contours
@@ -470,12 +519,12 @@ def get_tps_points(
     add_corners: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
-    Returns TPS control points dict or None if no TPS correction needed.
+    Returns TPS control points (input_pts, output_pts) in float64 or None if no TPS correction needed.
 
     IMPORTANT:
       - Points are in [y, x] order
       - If add_corners=True (default), image corners are INCLUDED
-        in input_pts / output_pts. Returned points are authoritative.
+        in input_pts / output_pts
     """
     if not contours:
         return None
@@ -535,4 +584,4 @@ def get_tps_points(
         output_pts = np.concatenate([output_pts, corners], axis=0)
 
     # points are [y,x], corners already included
-    return (input_pts, output_pts, float(alpha))
+    return (input_pts, output_pts)
