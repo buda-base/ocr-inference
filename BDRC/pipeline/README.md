@@ -22,14 +22,14 @@ S3 → Prefetcher (async) → Decoder (thread pool) → LD GPU Batcher (async; t
   - the **reprocess lane** with higher priority (second pass on transformed frames)
   A simple **weighted scheduler** favors the reprocess lane to keep second‑pass latency low without starving first‑pass work.
 
-##### Prefetcher
+### Prefetcher
 
 - **input:** ImageTask(s3_key, img_filename)
 - **output:** FetchedBytes(img_filename, s3_etag, bytes)
 
 Fetches bytes on s3 asynchronously, keeps the ETag returned in the s3 GET.
 
-##### Decoder
+### Decoder
 
 - **input:** FetchedBytes(img_filename, s3_etag, bytes)
 - **output:** DecodedFrame(img_filename, s3_etag, frame, is_binary, first_pass=true, rotation=0, tps_points=null)
@@ -40,7 +40,7 @@ where:
 
 Decodes the bytes from s3 into a grayscale image in a thread pool.
 
-##### LDGpuBatcher
+### LDGpuBatcher
 
 - **input:** DecodedFrame(img_filename, s3_etag, frame, is_binary, first_pass=true, rotation_angle=null, tps_points=null)
 - **output:** InferredFrame(img_filename, s3_etag, frame, is_binary, line_mask, first_pass, rotation_angle, tps_points)
@@ -56,7 +56,7 @@ The GpuBatches uses pytorch to do data transformation:
 
 It builds micro‑batches of N (or less) 512×512 patches on GPU and runs the model on these.
 
-##### LDTransformController
+### LDTransformController
 
 - **input:** InferredFrame(img_filename, s3_etag, frame, is_binary, line_mask, first_pass, rotation_angle, tps_points)
 - **output:** 2 options:
@@ -79,14 +79,14 @@ For InferredFrames with first_pass = true, it:
 For InferredFrames with first_pass = false, it:
 - creates a LDRecord and queues it
 
-##### S3ParquetWriter
+### S3ParquetWriter
 
 - **input:** LDRecord(img_filename, s3_etag, frame_w, frame_h, contours, nb_contours, contours_bboxes, rotation_angle=0, tps_points=null)
 - **output:** none
 
 writes the LDRecord on s3.
 
-##### LDVolumeWorker
+### LDVolumeWorker
 
 Wires all the components together.
 
