@@ -26,7 +26,7 @@ class Decoder:
     def _decode_one(self, task: ImageTask, body: bytes) -> DecodedFrame:
         # TODO: exception handling
         frame = bytes_to_binary_frame(task.s3_key, body, max_width=self.cfg.max_width, max_height=self.cfg.max_height)
-        return DecodedFrame(task=task, frame=None, width=frame.shape[1], height=frame.shape[0])
+        return DecodedFrame(task=task, frame=frame, width=frame.shape[1], height=frame.shape[0])
 
     async def run(self):
         loop = asyncio.get_running_loop()

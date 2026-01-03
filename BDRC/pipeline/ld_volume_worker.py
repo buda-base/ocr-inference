@@ -9,7 +9,7 @@ from .transform import TransformController
 from .batcher import GpuBatcher
 from .writer import S3ParquetWriter
 
-class VolumeWorker:
+class LineDetectionVolumeWorker:
         """Owns a single volume and runs all stages concurrently.
 
         Wires the queues, starts:

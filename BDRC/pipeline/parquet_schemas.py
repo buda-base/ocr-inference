@@ -5,8 +5,8 @@ try:
 except Exception:  # pragma: no cover
     pa = None
 
-def build_schema():
-    """Build a PyArrow schema for Parquet output.
+def ld_build_schema():
+    """Build a PyArrow schema for Parquet output of lines detection.
 
     - tps_points: list<list<float32>>
     - lines_contours: list<list<struct<x:int16,y:int16>>>
@@ -16,8 +16,10 @@ def build_schema():
         return None
     pt = pa.list_(pa.list_(pa.float32()))
     point_struct = pa.struct([("x", pa.int16()), ("y", pa.int16())])
+    bbox_struct = pa.struct([("x", pa.int16()), ("y", pa.int16()), ("w", pa.int16()), ("h", pa.int16())])
     contour = pa.list_(point_struct)
     contours = pa.list_(contour)
+    bboxes = pa.list_(bbox_struct)
     schema = pa.schema([
         ("img_file_name", pa.string()),
         ("img_s3_etag", pa.string()),
@@ -25,7 +27,8 @@ def build_schema():
         ("resized_h", pa.int32()),
         ("rotation_angle", pa.float32()),
         ("tps_points", pt),
-        ("lines_contours", contours),
-        ("nb_lines", pa.int32()),
+        ("contours", contours),
+        ("nb_contours", pa.int32()),
+        ("contours_bboxes", bboxes)
     ])
     return schema
