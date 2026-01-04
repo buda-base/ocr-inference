@@ -1,6 +1,5 @@
 import asyncio
 import concurrent.futures as futures
-from .types import ImageTask, DecodedFrame
 from .config import PipelineConfig
 import io
 import os
@@ -9,7 +8,7 @@ import numpy as np
 import cv2
 from functools import lru_cache
 
-from .types import FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, DecodedFrame, PipelineError, EndOfStream
+from .types_common import ImageTask, DecodedFrame, FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, DecodedFrame, PipelineError, EndOfStream
 
 
 class ImageDecodeError(RuntimeError):
@@ -35,7 +34,7 @@ class Decoder:
     def _decode_one(self, item: FetchedBytes) -> DecodedFrame:
         frame, is_binary = bytes_to_frame(
             item.task.img_filename,
-            item.body,
+            item.file_bytes,
             max_width=self.cfg.frame_max_width,
             max_height=self.cfg.frame_max_height,
             linearize=self.cfg.linearize,
@@ -146,7 +145,6 @@ def _decode_via_cv2(image_bytes: bytes, likely_jpeg: bool) -> np.ndarray:
     Returns the frame
     """
     buf = np.frombuffer(image_bytes, dtype=np.uint8)
-    ext = os.path.splitext(filename)[1].lower()
 
     if likely_jpeg:
         # Fast path: grayscale at decode time

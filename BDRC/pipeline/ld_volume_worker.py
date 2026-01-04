@@ -1,7 +1,7 @@
 
 import asyncio, os
 from .config import PipelineConfig
-from .types import ImageTask
+from .types_common import ImageTask
 from .s3ctx import S3Context
 from .prefetch import Prefetcher
 from .decoder import Decoder
@@ -9,13 +9,13 @@ from .transform import TransformController
 from .batcher import GpuBatcher
 from .writer import S3ParquetWriter
 
-class LineDetectionVolumeWorker:
-        """Owns a single volume and runs all stages concurrently.
+class LDVolumeWorker:
+    """Owns a single volume and runs all stages concurrently.
 
-        Wires the queues, starts:
-          - Prefetcher → Decoder → GpuBatcher → TransformController → S3ParquetWriter
-        All queues are bounded to enforce backpressure.
-        """
+    Wires the queues, starts:
+      - Prefetcher → Decoder → GpuBatcher → TransformController → S3ParquetWriter
+    All queues are bounded to enforce backpressure.
+    """
     def __init__(self, cfg: PipelineConfig, s3: S3Context, volume_id: str, tasks):
         self.cfg = cfg
         self.s3 = s3

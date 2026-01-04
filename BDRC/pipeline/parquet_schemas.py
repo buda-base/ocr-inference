@@ -1,6 +1,5 @@
 import pyarrow as pa
 
-
 def ld_build_schema():
     """Build a PyArrow schema for Parquet output of lines detection.
 

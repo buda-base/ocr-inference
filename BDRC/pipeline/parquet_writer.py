@@ -5,7 +5,7 @@ import os
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 
-from .types import Record, PipelineError, EndOfStream
+from .types_common import Record, PipelineError, EndOfStream
 from . import parquet_schemas as schema_mod
 
 import pyarrow as pa

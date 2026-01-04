@@ -1,9 +1,8 @@
 
 import asyncio
-from pipeline.config import PipelineConfig
-from pipeline.types import ImageTask
-from pipeline.s3ctx import S3Context
-from pipeline.worker import VolumeWorker
+from .config import PipelineConfig
+from .types_common import ImageTask
+from .ld_volume_worker import LDVolumeWorker
 
 async def main():
     cfg = PipelineConfig(
@@ -16,8 +15,7 @@ async def main():
         batch_size=16,
         batch_timeout_ms=25,
         out_prefix="s3://YOUR_BUCKET/out",
-        staging_prefix="s3://YOUR_BUCKET/staging",
-    )
+        staging_prefix="s3://YOUR_BUCKET/staging" )
 
     # Dummy manifest with two volumes of ~600 each
     volumes = {

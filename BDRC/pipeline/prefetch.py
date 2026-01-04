@@ -2,7 +2,7 @@ import asyncio
 import traceback
 from typing import Iterable, Optional
 
-from .types import ImageTask, FetchedBytes, PipelineError, FetchedBytesMsg, EndOfStream, normalize_etag
+from .types_common import ImageTask, FetchedBytes, PipelineError, FetchedBytesMsg, EndOfStream
 
 
 class Prefetcher:
@@ -13,13 +13,13 @@ class Prefetcher:
     Respects both global and per-worker concurrency caps.
     """
 
-    def __init__(self, cfg, s3ctx, keys: Iterable[ImageTask], q_bytes: asyncio.Queue[BytesMsg]):
+    def __init__(self, cfg, s3ctx, keys: Iterable[ImageTask], q_bytes: asyncio.Queue[FetchedBytesMsg]):
         self.cfg = cfg
         self.s3 = s3ctx
         self.keys = list(keys)
         self.q_bytes = q_bytes
 
-    async def _fetch_one(self, s3c, task: ImageTask) -> BytesMsg:
+    async def _fetch_one(self, s3c, task: ImageTask) -> FetchedBytesMsg:
         attempt = 1
         max_attempts = 3
 
@@ -29,7 +29,7 @@ class Prefetcher:
                     obj = await s3c.get_object(Bucket=self.cfg.s3_bucket, Key=task.s3_key)
                     etag = normalize_etag(obj.get("ETag", ""))
                     body: bytes = await obj["Body"].read()
-                return FetchedBytes(task=task, s3_etag=etag, body=body)
+                return FetchedBytes(task=task, s3_etag=etag, file_bytes=body)
 
             except Exception as e:
                 tb = traceback.format_exc()

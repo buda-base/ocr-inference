@@ -1,10 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Any, Tuple, List
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union, Tuple, List
 
 # --- Sentinel ---------------------------------------------------------------
 

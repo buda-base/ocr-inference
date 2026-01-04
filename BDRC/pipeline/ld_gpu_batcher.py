@@ -1,7 +1,7 @@
 import asyncio
 from typing import Optional, Tuple
 
-from .types import DecodedFrame, PipelineError, EndOfStream, InferredFrame
+from .types_common import DecodedFrame, PipelineError, EndOfStream, InferredFrame
 
 class LDGpuBatcher:
     """

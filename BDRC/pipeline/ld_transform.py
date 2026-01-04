@@ -1,6 +1,6 @@
 
 import asyncio
-from .types import DecodedFrame, Record, InferredFrame
+from .types_common import DecodedFrame, Record, InferredFrame
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .img_helpers import apply_transform_1
 
