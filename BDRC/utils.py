@@ -218,21 +218,18 @@ def build_ocr_data(id_val, file_path: str, target_width: int = None):
         guid = generate_guid(id_val)
     else:
         guid = id_val
-
+    
     # Load and scale the image
+    image = cv2.imread(file_path)
+    
     if target_width is not None:
-        #q_image = QImage(file_path).scaledToWidth(target_width, Qt.TransformationMode.SmoothTransformation)
-        image = cv2.imread(file_path)
         image, _ = resize_to_width(image, target_width)
-
-    else:
-        image = read_image(file_path)
 
     ocr_data = OCRData(
         guid=guid,
         image_path=file_path,
         image_name=file_name,
-        qimage=image,
+        image=image,
         ocr_lines=None,
         lines=None,
         preview=None,

@@ -209,7 +209,7 @@ def build_line_data(contour: np.array, optimize: bool = True) -> Line:
     return Line(guid, contour, bbox, (x_center, y_center))
 
 
-def build_raw_line_data(image: npt.NDArray, line_mask: npt.NDArray):
+def build_raw_line_data(image: npt.NDArray, line_mask: npt.NDArray, rot_threshold: float = 0.5):
     """
     Process raw line detection data by rotating and extracting contours.
     
@@ -224,15 +224,24 @@ def build_raw_line_data(image: npt.NDArray, line_mask: npt.NDArray):
         line_mask = cv2.cvtColor(line_mask, cv2.COLOR_BGR2GRAY)
 
     angle = get_rotation_angle_from_lines(line_mask)
-    rot_mask = rotate_from_angle(line_mask, angle)
-    rot_img = rotate_from_angle(image, angle)
 
-    line_contours = get_contours(rot_mask)
-    line_contours = [x for x in line_contours if cv2.contourArea(x) > 10]
+    if angle > rot_threshold:
+        out_mask = rotate_from_angle(line_mask, angle)
+        out_img = rotate_from_angle(image, angle)
 
-    rot_mask = cv2.cvtColor(rot_mask, cv2.COLOR_GRAY2RGB)
+        line_contours = get_contours(out_mask)
+        line_contours = [x for x in line_contours if cv2.contourArea(x) > 10]
 
-    return rot_img, rot_mask, line_contours, angle
+        out_mask = cv2.cvtColor(out_mask, cv2.COLOR_GRAY2RGB)
+
+    else:
+        line_contours = get_contours(line_mask)
+        line_contours = [x for x in line_contours if cv2.contourArea(x) > 10]
+
+        out_mask = cv2.cvtColor(line_mask, cv2.COLOR_GRAY2RGB)
+        out_img = image
+
+    return out_img, out_mask, line_contours, angle
 
 
 def filter_line_contours(image: npt.NDArray, line_contours, threshold: float = 0.01) -> List:
