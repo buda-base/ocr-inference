@@ -8,8 +8,13 @@ from typing import Any, Literal, Optional, Union
 
 # --- Sentinel ---------------------------------------------------------------
 
-SENTINEL: object = object()
-Sentinel = type(SENTINEL)  # for type checkers (identity-based sentinel)
+@dataclass(frozen=True)
+class EndOfStream:
+    """
+    Explicit end-of-stream marker for multi-lane pipelines.
+    """
+    stream: Literal["prefetched", "decoded", "gpu_pass_1", "transformed_pass_1", "gpu_pass_2", "transformed_pass_2", "record"]
+    producer: Optional[str] = None
 
 
 # --- Core tasks / payloads --------------------------------------------------
@@ -74,7 +79,7 @@ class Record:
 @dataclass(frozen=True)
 class PipelineError:
     """Error message that can flow through queues."""
-    stage: Literal["Prefetcher", "decode", "GPU", ]
+    stage: Literal["Prefetcher", "Decoder", "LDGpuBatcher", "LDTransformController", "S3ParquetWriter"]
     task: ImageTask
     s3_etag: Optional[str]
     error_type: str
@@ -86,7 +91,7 @@ class PipelineError:
 
 # --- Queue message unions ---------------------------------------------------
 
-FetchedBytesMsg = Union[FetchedBytes, PipelineError, Sentinel]
-DecodedFrameMsg = Union[DecodedFrame, PipelineError, Sentinel]
-InferredFrameMsg = Union[InferredFrame, PipelineError, Sentinel]
-RecordMsg = Union[Record, PipelineError, Sentinel]
+FetchedBytesMsg = Union[FetchedBytes, PipelineError, EndOfStream]
+DecodedFrameMsg = Union[DecodedFrame, PipelineError, EndOfStream]
+InferredFrameMsg = Union[InferredFrame, PipelineError, EndOfStream]
+RecordMsg = Union[Record, PipelineError, EndOfStream]

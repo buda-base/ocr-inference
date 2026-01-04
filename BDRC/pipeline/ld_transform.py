@@ -8,71 +8,181 @@ import cv2
 import numpy as np
 import numpy.typing as npt
 
-class TransformController:
-        """Consumes InferredFrame, decides and apply rotation/TPS, and routes.
+class LDTransformController:
+    """
+    Consumes InferredFrame from GPU pass 1 and pass 2, decides rotation/TPS, routes.
 
-        Input: InferredFrame from GPU first pass.
-        Output: Either
-           - a final Record to the writer, or 
-           - a transformed (rotated + TPS) DecodedFrame enqueued to the reprocess lane.
-        """
-    def __init__(self, cfg, q_first_results: asyncio.Queue, q_reprocess_frames: asyncio.Queue, q_records: asyncio.Queue):
+    Inputs:
+      - q_first_results:  InferredFrameMsg (gpu_pass_1)
+      - q_second_results: InferredFrameMsg (gpu_pass_2)
+    Outputs:
+      - q_reprocess_frames: DecodedFrameMsg (decoded stream)
+      - q_records: RecordMsg (record stream)
+
+    Records are produced ONLY here (per your note).
+    """
+
+    def __init__(
+        self,
+        cfg,
+        q_first_results: asyncio.Queue,
+        q_second_results: asyncio.Queue,
+        q_reprocess_frames: asyncio.Queue,
+        q_records: asyncio.Queue,
+    ):
         self.cfg = cfg
-        self.q_first_results = q_first_results
+        self.q_first = q_first_results # results of the first GPU pass
+        self.q_second = q_second_results # results of the second GPU pass
         self.q_reprocess_frames = q_reprocess_frames
         self.q_records = q_records
 
+        self._p1_done = False
+        self._p2_done = False
+
+    async def _pop_one(self, q: asyncio.Queue, timeout_s: float):
+        try:
+            return await asyncio.wait_for(q.get(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return None  # no item right now
+
     async def run(self):
-        """Main loop: read summaries, decide, write or re-enqueue; propagate sentinel."""
+        # Pass2 is cheap; prioritize it, but don't starve pass1 entirely.
+        p2_budget = getattr(self.cfg, "reprocess_budget", 3)
+        p1_budget = 1
+        timeout_s = getattr(self.cfg, "controller_poll_ms", 5) / 1000.0
+
         while True:
-            frame: InferredFrame = await self.q_first_results.get()
-            if item is None:
-                await self.q_reprocess_frames.put(None)
-                break
-            # 1. detect contours
-            contours = get_filtered_contours(frame.line_mask)
-            # 2. get rotation angle, if non-0, rotate contours
-            h, w = frame.line_mask.shape
-            rotation_angle = get_rotation_angle(contours, h, w, max_angle_deg=self.cfg.max_angle_deg, min_angle_deg=self.cfg.min_angle_deg)
-            if rotation_angle != 0.0:
-                contours = rotate_contours(contours, rotation_angle, h, w)
-            # 3. get tps data
-            tps_data = get_tps_points(contours, h, w, legacy_tps_detect=self.cfg.legacy_tps_detect, alpha=self.cfg.tps_alpha, tps_add_corners=self.cfg.add_corners)
-            input_pts, output_pts, alpha = None
-            if tps_data is not None:
-                input_pts, output_pts = tps_data
-                alpha = self.cfg.tps_alpha
-            # 4. if no second pass required, send record
-            if tps_data is None and rotation_angle == 0.0:
-                # save contour bboxes (?)
-                contours_bboxes = get_contour_bboxes(contours)
-                rec = Record(
-                    img_filename=frame.img_filename,
-                    s3_etag=frame.s3_etag,
-                    resized_w=w,
-                    resized_h=h,
-                    rotation_angle=None,
-                    tps_data=None,
-                    contours=contours,
-                    nb_contours=len(contours),
-                    contours_bboxes=contours_bboxes
-                )
-                frame = None # gc
-                await self.q_records.put(rec)
-            else:
-                # or if a second pass is required, create a new decodedframe by transforming the initial frame
-                transformed_frame = apply_transform_1(frame.frame, rotation_angle, input_pts, output_pts, alpha)
-                new_decoded_frame = DecodedFrame(
-                    img_filename=frame.img_filename,
-                    s3_etag=frame.s3_etag,
-                    frame=transformed_frame,
-                    first_pass=False,
-                    is_binary=False,
-                    rotation_angle=rotation_angle,
-                    tps_data=(input_pts, output_pts, alpha),
-                )
-                frame = None # gc
-                await self.q_reprocess_frames.put(new_decoded_frame)
+            # Terminate only after both GPU streams have ended.
+            if self._p1_done and self._p2_done:
+                await self.q_records.put(EndOfStream(stream="record", producer="LDTransformController"))
+                return
+
+            took = False
+
+            # --- Prefer gpu_pass_2 results (much faster to process) ---
+            if not self._p2_done:
+                for _ in range(p2_budget):
+                    msg = await self._pop_one(self.q_second, timeout_s)
+                    if msg is None:
+                        break
+                    took = True
+
+                    if isinstance(msg, EndOfStream) and msg.stream == "gpu_pass_2":
+                        self._p2_done = True
+                        break
+
+                    if isinstance(msg, PipelineError):
+                        await self.q_records.put(msg)
+                        continue
+
+                    frame: InferredFrame = msg
+                    await self._finalize_record(frame)  # cheap path
+
+            if took:
+                continue
+
+            # --- Then gpu_pass_1 results ---
+            if not self._p1_done:
+                for _ in range(p1_budget):
+                    msg = await self._pop_one(self.q_first, timeout_s)
+                    if msg is None:
+                        break
+                    took = True
+
+                    if isinstance(msg, EndOfStream) and msg.stream == "gpu_pass_1":
+                        self._p1_done = True
+                        # No more pass1 frames => no more reprocess frames will be generated.
+                        await self.q_reprocess_frames.put(
+                            EndOfStream(stream="transformed_pass_1", producer="LDTransformController")
+                        )
+                        break
+
+                    if isinstance(msg, PipelineError):
+                        await self.q_records.put(msg)
+                        continue
+
+                    frame: InferredFrame = msg
+                    await self._handle_pass1(frame)
+
+            if not took:
+                await asyncio.sleep(0)
+
+    async def _handle_pass1(self, frame: InferredFrame) -> None:
+        # 1. detect contours
+        contours = get_filtered_contours(frame.line_mask)
+
+        # 2. rotation angle
+        h, w = frame.line_mask.shape
+        rotation_angle = get_rotation_angle(
+            contours, h, w,
+            max_angle_deg=self.cfg.max_angle_deg,
+            min_angle_deg=self.cfg.min_angle_deg,
+        )
+        if rotation_angle != 0.0:
+            contours = rotate_contours(contours, rotation_angle, h, w)
+
+        # 3. TPS points (may be None)
+        tps_data = get_tps_points(
+            contours, h, w,
+            legacy_tps_detect=self.cfg.legacy_tps_detect,
+            alpha=self.cfg.tps_alpha,
+            add_corners=self.cfg.add_corners,
+        )
+
+        # 4. either finalize or enqueue reprocess decoded frame
+        if tps_data is None and rotation_angle == 0.0:
+            contours_bboxes = get_contour_bboxes(contours)
+            rec = Record(
+                task=frame.task,
+                s3_etag=frame.s3_etag,
+                resized_w=w,
+                resized_h=h,
+                rotation_angle=None,
+                tps_data=None,
+                contours=contours,
+                nb_contours=len(contours),
+                contours_bboxes=contours_bboxes,
+            )
+            await self.q_records.put(rec)
+            return
+
+        input_pts = output_pts = None
+        alpha = None
+        if tps_data is not None:
+            input_pts, output_pts = tps_data
+            alpha = self.cfg.tps_alpha
+
+        transformed_frame = apply_transform_1(frame.frame, rotation_angle, input_pts, output_pts, alpha)
+        await self.q_reprocess_frames.put(
+            DecodedFrame(
+                task=frame.task,
+                s3_etag=frame.s3_etag,
+                frame=transformed_frame,
+                is_binary=False,
+                first_pass=False,
+                rotation_angle=rotation_angle,
+                tps_data=(input_pts, output_pts, alpha),
+            )
+        )
+
+    async def _finalize_record(self, frame: InferredFrame) -> None:
+        # Cheap pass2 finalization: just contours
+        contours = get_filtered_contours(frame.line_mask)
+        contours_bboxes = get_contour_bboxes(contours)
+        h, w = frame.line_mask.shape
+        rec = Record(
+            task=frame.task,
+            s3_etag=frame.s3_etag,
+            resized_w=w,
+            resized_h=h,
+            rotation_angle=rotation_angle,
+            tps_data=tps_data,
+            contours=contours,
+            nb_contours=len(contours),
+            contours_bboxes=contours_bboxes,
+        )
+        await self.q_records.put(rec)
+
 
 # -----------------------------
 # Defaults (tweakable)

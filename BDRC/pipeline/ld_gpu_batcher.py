@@ -1,74 +1,117 @@
+import asyncio
+from typing import Optional, Tuple
 
-import asyncio, time
-from typing import List, Tuple
-from .types import DecodedFrame, Record
+from .types import DecodedFrame, PipelineError, EndOfStream, InferredFrame
 
 class LDGpuBatcher:
-        """Two-lane GPU micro-batcher and inference runner.
+    """
+    Two-lane GPU micro-batcher and inference runner.
 
-        Inputs:
-          - q_frames_initial: DecodedFrame (first pass)
-          - q_frames_reprocess: DecodedFrame (second pass; higher priority)
-        Outputs:
-          - First-pass: (DecodedFrame, summary) to q_firstpass_summaries
-          - Second-pass: Record to q_records
+    Inputs:
+      - q_init: DecodedFrameMsg (first pass)
+      - q_re:   DecodedFrameMsg (second pass; higher priority)
+    Outputs:
+      - q_first and q_second: InferredFrameMsg
+    """
 
-        Policy: weighted fair scheduling favoring reprocess lane; batches built
-        with (batch_size, batch_timeout_ms) to keep GPU utilized.
-        """
-    def __init__(self, cfg, q_frames_initial: asyncio.Queue, q_frames_reprocess: asyncio.Queue, q_firstpass_summaries: asyncio.Queue, q_records: asyncio.Queue):
+    def __init__(
+        self,
+        cfg,
+        q_frames_initial: asyncio.Queue,
+        q_frames_reprocess: asyncio.Queue,
+        q_first: asyncio.Queue,
+        q_second: asyncio.Queue,
+    ):
         self.cfg = cfg
         self.q_init = q_frames_initial
         self.q_re = q_frames_reprocess
-        self.q_first = q_firstpass_summaries
-        self.q_records = q_records
-        self.re_weight = 3
+        self.q_first = q_first
+        self.q_second = q_second
 
-    async def _infer_and_summarize(self, frame: DecodedFrame, second_pass: bool = False):
-            """Run tiling→model→stitch and emit either a summary (first pass) or a final Record (second pass)."""
-        # TODO: implement GPU tiling -> model -> stitch
-        if second_pass:
-            rec = Record(
-                img_file_name=frame.task.key,
-                img_s3_etag=frame.task.etag,
-                resized_w=frame.width,
-                resized_h=frame.height,
-                rotation_angle=0.0,
-                tps_points=None,
-                lines_contours=None,
-                nb_lines=0,
-            )
-            await self.q_records.put(rec)
-        else:
-            summary = {"placeholder": True}
-            await self.q_first.put((frame, summary))
+        self._init_done = False
+        self._re_done = False
 
-    async def _pop_with_timeout(self, q: asyncio.Queue, timeout: float):
+    async def _pop_one(
+        self, q: asyncio.Queue, timeout_s: float
+    ):
         try:
-            return await asyncio.wait_for(q.get(), timeout=timeout)
+            return await asyncio.wait_for(q.get(), timeout=timeout_s)
         except asyncio.TimeoutError:
-            return None
+            return None  # means "no item right now", NOT end-of-stream
 
     async def run(self):
-        """Scheduler loop: prefer reprocess items by weight; propagate sentinels when idle."""
-        empty_ticks = 0
+        # You can tune these weights; goal: prioritize reprocess, but don't starve init
+        reprocess_budget = getattr(self.cfg, "reprocess_budget", 3)
+        init_budget = 1
+
         while True:
+            # termination condition: both lanes ended (and any internal buffers flushed)
+            if self._init_done and self._re_done:
+                await self._flush()
+                await self.q_first.put(EndOfStream(stream="gpu_pass_1", producer="LDGpuBatcher"))
+                await self.q_second.put(EndOfStream(stream="gpu_pass_2", producer="LDGpuBatcher"))
+                return
+
             took = False
-            for _ in range(self.re_weight):
-                item = await self._pop_with_timeout(self.q_re, self.cfg.batch_timeout_ms/1000.0)
-                if item is not None:
-                    await self._infer_and_summarize(item, second_pass=True)
+
+            # --- prefer reprocess lane (from LDTransformController) ---
+            if not self._re_done:
+                for _ in range(reprocess_budget):
+                    msg = await self._pop_one(self.q_re, self.cfg.batch_timeout_ms / 1000.0)
+                    if msg is None:
+                        break  # just empty right now
+                    if isinstance(msg, EndOfStream) and msg.stream == "transformed_pass_1":
+                        self._re_done = True
+                        took = True
+                        break
+                    if isinstance(msg, PipelineError):
+                        # forward errors (policy decision)
+                        await self.q_second.put(msg)
+                        took = True
+                        continue
+
+                    await self._infer_and_summarize(msg, second_pass=True)
                     took = True
+
             if took:
-                empty_ticks = 0
                 continue
-            item = await self._pop_with_timeout(self.q_init, self.cfg.batch_timeout_ms/1000.0)
-            if item is None:
-                empty_ticks += 1
-            else:
-                await self._infer_and_summarize(item, second_pass=False)
-                empty_ticks = 0
-            if empty_ticks > 4:
-                await self.q_first.put(None)
-                await self.q_records.put(None)
-                break
+
+            # --- then init lane (from Decoder) ---
+            if not self._init_done:
+                for _ in range(init_budget):
+                    msg = await self._pop_one(self.q_init, self.cfg.batch_timeout_ms / 1000.0)
+                    if msg is None:
+                        break
+                    if isinstance(msg, EndOfStream) and msg.stream == "decoded":
+                        self._init_done = True
+                        took = True
+                        break
+                    if isinstance(msg, PipelineError):
+                        await self.q_first.put(msg)
+                        took = True
+                        continue
+
+                    await self._infer_and_summarize(msg, second_pass=False)
+                    took = True
+
+            # If neither lane had work, loop again (don’t “idle shutdown”)
+            # You can add a tiny sleep to reduce spin if desired:
+            if not took:
+                await asyncio.sleep(0)
+
+    async def _flush(self):
+        # in case there's some tiles left in the batch, execute the batch
+        pass
+
+    async def _infer_and_summarize(self, msg: DecodedFrame, second_pass=False) -> InferredFrame:
+        # GPU stuff goes here
+        # transfer on GPU
+        # binarize if not binarized yet
+        # tile in 3, 512, 512 patches
+        # put patches in constant size tile batch (configurable, 8, 16, 32?)
+        # wait for batch to fill
+        # execute batch
+        # untile results
+        # get line mask
+        # package line mask in InferredFrame
+        pass

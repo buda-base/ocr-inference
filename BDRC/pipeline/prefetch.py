@@ -2,14 +2,14 @@ import asyncio
 import traceback
 from typing import Iterable, Optional
 
-from .types import ImageTask, FetchedBytes, PipelineError, FetchedBytesMsg, SENTINEL, normalize_etag
+from .types import ImageTask, FetchedBytes, PipelineError, FetchedBytesMsg, EndOfStream, normalize_etag
 
 
 class Prefetcher:
     """Async S3 reader.
 
     Input: iterable of ImageTask
-    Output: puts FetchedBytesMsg onto q_bytes (FetchedBytes | PipelineError | SENTINEL)
+    Output: puts FetchedBytesMsg onto q_bytes
     Respects both global and per-worker concurrency caps.
     """
 
@@ -84,7 +84,7 @@ class Prefetcher:
                 await w
 
         # End-of-stream marker for the (single) decoder consumer coroutine
-        await self.q_bytes.put(SENTINEL)
+        await self.q_bytes.put(EndOfStream(stream="prefetched", producer="Prefetcher"))
 
 
 def normalize_etag(etag: str) -> str:

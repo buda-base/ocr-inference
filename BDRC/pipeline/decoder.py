@@ -9,7 +9,7 @@ import numpy as np
 import cv2
 from functools import lru_cache
 
-from .types import FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, DecodedFrame, PipelineError, SENTINEL
+from .types import FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, DecodedFrame, PipelineError, EndOfStream
 
 
 class ImageDecodeError(RuntimeError):
@@ -19,8 +19,8 @@ class ImageDecodeError(RuntimeError):
 class Decoder:
     """Decode stage (thread pool).
 
-    Input: FetchedBytesMsg (FetchedBytes | PipelineError | SENTINEL)
-    Output: DecodedFrameMsg (DecodedFrame | PipelineError | SENTINEL) pushed to q_frames.
+    Input: FetchedBytesMsg
+    Output: DecodedFrameMsg pushed to q_frames.
     """
 
     def __init__(self, cfg, q_bytes: asyncio.Queue[FetchedBytesMsg], q_frames: asyncio.Queue[DecodedFrameMsg]):
@@ -49,9 +49,9 @@ class Decoder:
         while True:
             msg = await self.q_bytes.get()
 
-            if msg is SENTINEL:
+            if isinstance(msg, EndOfStream):
                 # Forward sentinel downstream and stop
-                await self.q_frames.put(SENTINEL)
+                await self.q_frames.put(EndOfStream(stream="decoded", producer="Decoder"))
                 return
 
             if isinstance(msg, PipelineError):

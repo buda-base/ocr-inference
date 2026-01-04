@@ -5,7 +5,7 @@ import os
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 
-from .types import Record, PipelineError, SENTINEL  # expected from your updated types.py
+from .types import Record, PipelineError, EndOfStream
 from . import parquet_schemas as schema_mod
 
 import pyarrow as pa
@@ -45,10 +45,10 @@ class S3ParquetWriter:
     """
     Writes a *single* Parquet file and a JSONL error sidecar.
 
-    Input queue: Record | PipelineError | SENTINEL
+    Input queue: RecordMsg
       - Record rows become ok=True rows in Parquet.
       - PipelineError rows become ok=False rows in Parquet + full JSONL entry.
-      - SENTINEL triggers flush/close.
+      - EndOfStream triggers flush/close.
 
     Notes:
       - No tmp file, no atomic finalize. For small volumes this is usually acceptable.
@@ -202,14 +202,14 @@ class S3ParquetWriter:
 
     async def run(self) -> None:
         """
-        Consume messages until SENTINEL, then flush and close.
+        Consume messages until EndOfStream, then flush and close.
         """
         # If pyarrow is absent, we still drain the queue to keep pipeline behavior consistent.
         # (Useful for unit tests / environments without optional deps.)
         while True:
             msg = await self.q_in.get()
 
-            if msg is SENTINEL:
+            if isinstance(msg, EndOfStream):
                 break
 
             if isinstance(msg, PipelineError):
