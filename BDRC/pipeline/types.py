@@ -1,26 +1,40 @@
 from dataclasses import dataclass
 from typing import Optional, Any, Tuple, List
 
-@dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Literal, Optional, Union
+
+# --- Sentinel ---------------------------------------------------------------
+
+SENTINEL: object = object()
+Sentinel = type(SENTINEL)  # for type checkers (identity-based sentinel)
+
+
+# --- Core tasks / payloads --------------------------------------------------
+
+
+@dataclass(frozen=True)
 class ImageTask:
     """Input descriptor for the prefetcher.
     """
     s3_key: str
     img_filename: str
 
-@dataclass
+@dataclass(frozen=True)
 class FetchedBytes:
     """Input descriptor for the decoder.
     """
-    img_filename: str
+    task: ImageTask
     s3_etag: str
     file_bytes: bytes
 
-@dataclass
+@dataclass(frozen=True)
 class DecodedFrame:
     """Output of the decode stage and transform stage
     """
-    img_filename: str
+    task: ImageTask
     s3_etag: str
     frame: Any # grayscale H, W, uint8
     is_binary: bool # if the value space is {0, 255}
@@ -28,11 +42,11 @@ class DecodedFrame:
     rotation_angle: Optional[float] # if in the second pass, value of the rotation angle in degrees that was applied after first pass, null if first pass
     tps_data: Optional[Any] # (input_pts, output_pts, alpha), if in the second pass, tps data that was applied after first pass, null if first pass
 
-@dataclass
+@dataclass(frozen=True)
 class InferredFrame:
     """Output of the inference stage.
     """
-    img_filename: str
+    task: ImageTask
     s3_etag: str
     frame: Any
     is_binary: bool
@@ -41,11 +55,11 @@ class InferredFrame:
     tps_data: Optional[Any]
     line_mask: Any # result of inference, H, W, uint8, binary {0, 255}, same H, W as frame
 
-@dataclass
+@dataclass(frozen=True)
 class Record:
     """input for the Parquet writer, output of the transform stage
     """
-    img_filename: str
+    task: ImageTask
     s3_etag: str
     resized_w: int # from frame
     resized_h: int
@@ -54,3 +68,25 @@ class Record:
     contours: Any
     nb_contours: int
     contours_bboxes: Any
+
+# --- Error envelope ---------------------------------------------------------
+
+@dataclass(frozen=True)
+class PipelineError:
+    """Error message that can flow through queues."""
+    stage: Literal["Prefetcher", "decode", "GPU", ]
+    task: ImageTask
+    s3_etag: Optional[str]
+    error_type: str
+    message: str
+    traceback: Optional[str] = None
+    retryable: bool = False
+    attempt: int = 1
+
+
+# --- Queue message unions ---------------------------------------------------
+
+FetchedBytesMsg = Union[FetchedBytes, PipelineError, Sentinel]
+DecodedFrameMsg = Union[DecodedFrame, PipelineError, Sentinel]
+InferredFrameMsg = Union[InferredFrame, PipelineError, Sentinel]
+RecordMsg = Union[Record, PipelineError, Sentinel]

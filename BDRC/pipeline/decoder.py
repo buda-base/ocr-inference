@@ -9,36 +9,76 @@ import numpy as np
 import cv2
 from functools import lru_cache
 
+from .types import FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, DecodedFrame, PipelineError, SENTINEL
+
+
 class ImageDecodeError(RuntimeError):
     """Raised when an image cannot be decoded or processed safely."""
+
 
 class Decoder:
     """Decode stage (thread pool).
 
-    Input: (ImageTask, bytes)
-    Output: DecodedFrame (grayscale uint8, resized) pushed to q_frames; sends sentinel at end.
+    Input: FetchedBytesMsg (FetchedBytes | PipelineError | SENTINEL)
+    Output: DecodedFrameMsg (DecodedFrame | PipelineError | SENTINEL) pushed to q_frames.
     """
-    def __init__(self, cfg: PipelineConfig, q_bytes: asyncio.Queue, q_frames: asyncio.Queue):
+
+    def __init__(self, cfg, q_bytes: asyncio.Queue[FetchedBytesMsg], q_frames: asyncio.Queue[DecodedFrameMsg]):
         self.cfg = cfg
         self.q_bytes = q_bytes
         self.q_frames = q_frames
-        self.pool = futures.ThreadPoolExecutor(max_workers=cfg.decode_threads, thread_name_prefix="decode")
+        self.pool = futures.ThreadPoolExecutor(
+            max_workers=cfg.decode_threads,
+            thread_name_prefix="decode",
+        )
 
-    def _decode_one(self, task: ImageTask, body: bytes) -> DecodedFrame:
-        # TODO: exception handling
-        frame = bytes_to_frame(task.img_filename, body, max_width=self.cfg.max_width, max_height=self.cfg.max_height, linearize=self.cfg.linearize, normalize_background=self.cfg.normalize_background)
-        return DecodedFrame(task=task, frame=frame)
+    def _decode_one(self, item: FetchedBytes) -> DecodedFrame:
+        frame, is_binary = bytes_to_frame(
+            item.task.img_filename,
+            item.body,
+            max_width=self.cfg.frame_max_width,
+            max_height=self.cfg.frame_max_height,
+            linearize=self.cfg.linearize,
+            normalize_background=self.cfg.normalize_background,
+        )
+        return DecodedFrame(task=item.task, s3_etag=item.s3_etag, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
 
-    async def run(self):
+    async def run(self) -> None:
         loop = asyncio.get_running_loop()
+
         while True:
-            task, body = await self.q_bytes.get()
-            if task is None:
-                break
-            fut = loop.run_in_executor(self.pool, self._decode_one, task, body)
-            decoded = await fut
-            await self.q_frames.put(decoded)
-        await self.q_frames.put(None)
+            msg = await self.q_bytes.get()
+
+            if msg is SENTINEL:
+                # Forward sentinel downstream and stop
+                await self.q_frames.put(SENTINEL)
+                return
+
+            if isinstance(msg, PipelineError):
+                # Pass-through errors unchanged
+                await self.q_frames.put(msg)
+                continue
+
+            # Otherwise it must be FetchedBytes
+            try:
+                fut = loop.run_in_executor(self.pool, self._decode_one, msg)
+                decoded = await fut
+                await self.q_frames.put(decoded)
+            except Exception as e:
+                import traceback
+                await self.q_frames.put(
+                    PipelineError(
+                        stage="Decoder",
+                        task=msg.task,
+                        s3_etag=msg.s3_etag,
+                        error_type=type(e).__name__,
+                        message=str(e),
+                        traceback=traceback.format_exc(),
+                        retryable=False,
+                        attempt=1,
+                    )
+                )
+
 
 
 def _ext_lower(filename: str) -> str:
@@ -324,7 +364,7 @@ def bytes_to_frame(
         # Enforce exactly {0,255}
         if binary.max() == 1:
             binary = (binary * 255).astype(np.uint8, copy=False)
-        return np.ascontiguousarray(binary)
+        return np.ascontiguousarray(binary), True
 
     if linearize:
         gray = _srgb_u8_to_linear_u8(gray)
@@ -336,4 +376,4 @@ def bytes_to_frame(
         gray = _normalize_background_u8(gray)
 
     # Enforce contiguous uint8 frame
-    return np.ascontiguousarray(gray, dtype=np.uint8)
+    return np.ascontiguousarray(gray, dtype=np.uint8), False

@@ -1,105 +1,230 @@
+import asyncio
+import hashlib
+import json
+import os
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional, Union
 
-import os, json, time, asyncio
-from typing import List, Optional
-from .types import Record
-from . import schema as schema_mod
+from .types import Record, PipelineError, SENTINEL  # expected from your updated types.py
+from . import parquet_schemas as schema_mod
 
-# Optional imports guarded for environments without pyarrow/s3fs
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    import pyarrow.fs as pafs
-except Exception:  # pragma: no cover
-    pa = None
-    pq = None
-    pafs = None
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.fs as pafs
+
+
+def _truncate(s: Optional[str], max_len: int) -> Optional[str]:
+    if s is None:
+        return None
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+def _open_filesystem_and_path(uri: str, cfg) -> tuple[Any, str]:
+    """
+    Returns (filesystem, path_within_fs) for a given uri.
+    Supports s3://... and local paths.
+    """
+    if pafs is None:
+        return None, uri
+
+    if uri.startswith("s3://"):
+        # Parse s3://bucket/key...
+        # Use pyarrow's S3FileSystem (credentials from env/instance role/profile depending on setup).
+        fs = pafs.S3FileSystem(region=getattr(cfg, "s3_region", None))
+        path = uri[len("s3://") :]
+        return fs, path
+
+    # Local filesystem path
+    fs = pafs.LocalFileSystem()
+    return fs, uri
+
 
 class S3ParquetWriter:
-        """Single-file Parquet writer with robust S3 staging→finalize flow.
+    """
+    Writes a *single* Parquet file and a JSONL error sidecar.
 
-        Input: Records from q_records.
-        Behavior: buffers into row groups, writes to staging key, then server-side
-        copies to final key and writes a _SUCCESS.json marker.
-        """
-    def __init__(self, cfg, q_records: asyncio.Queue, volume_id: str):
+    Input queue: Record | PipelineError | SENTINEL
+      - Record rows become ok=True rows in Parquet.
+      - PipelineError rows become ok=False rows in Parquet + full JSONL entry.
+      - SENTINEL triggers flush/close.
+
+    Notes:
+      - No tmp file, no atomic finalize. For small volumes this is usually acceptable.
+      - No per-writer success marker. The pipeline can write a run-level success marker separately.
+    """
+
+    def __init__(
+        self,
+        cfg,
+        q_in: asyncio.Queue,
+        parquet_uri: str,
+        errors_jsonl_uri: Optional[str] = None,
+        flush_every: int = 4096,
+        max_error_message_len: int = 128,
+    ):
         self.cfg = cfg
-        self.q_records = q_records
-        self.volume_id = volume_id
-        self.schema = schema_mod.build_schema()
-        self.writer = None
-        self.buffer: List[Record] = []
-        self.flush_every = 4096  # rows per flush
-        self.count_rows = 0
+        self.q_in = q_in
+        self.parquet_uri = parquet_uri
+        self.errors_jsonl_uri = errors_jsonl_uri or (parquet_uri + ".errors.jsonl")
+        self.flush_every = flush_every
+        self.max_error_message_len = max_error_message_len
 
-        # Paths
-        self.staging_key = f"{self.cfg.staging_prefix.rstrip('/')}/{self.volume_id}.parquet.tmp"
-        self.final_key   = f"{self.cfg.out_prefix.rstrip('/')}/{self.volume_id}.parquet"
-        self.success_key = f"{self.cfg.out_prefix.rstrip('/')}/{self.volume_id}._SUCCESS.json"
+        self._schema = schema_mod.ld_build_schema()
+        self._writer: Optional[Any] = None
+        self._buffer: List[Dict[str, Any]] = []
+        self._error_fh = None
 
-    def _ensure_writer(self):
-        if pq is None or self.schema is None:
+        self._fs = None
+        self._parquet_path = None
+        self._err_fs = None
+        self._errors_path = None
+
+    def _ensure_open(self) -> None:
+        """Open Parquet writer + error sidecar output stream."""
+        if self._writer is not None:
             return
-        if self.writer is None:
-            fs = pafs.FileSystem.from_uri(self.staging_key)[0]  # resolves filesystem
-            # Parquet write options
-            props = pq.ParquetWriter(
-                where=self.staging_key,
-                schema=self.schema,
-                filesystem=fs,
-                compression=self.cfg.parquet_compression,
-            )
-            # We keep the writer object simple: recreate using pq.ParquetWriter directly
-            self.writer = props
 
-    def _records_to_table(self, rows: List[Record]):
-        if pa is None:
-            return None
-        data = {
-            "img_file_name": [r.img_file_name for r in rows],
-            "img_s3_etag":  [r.img_s3_etag  for r in rows],
-            "resized_w":    [r.resized_w    for r in rows],
-            "resized_h":    [r.resized_h    for r in rows],
-            "rotation_angle":[r.rotation_angle for r in rows],
-            "tps_points":   [r.tps_points   for r in rows],
-            "lines_contours":[r.lines_contours for r in rows],
-            "nb_lines":     [r.nb_lines     for r in rows],
+        self._fs, self._parquet_path = _open_filesystem_and_path(self.parquet_uri, self.cfg)
+        self._err_fs, self._errors_path = _open_filesystem_and_path(self.errors_jsonl_uri, self.cfg)
+
+        # Open output streams (direct write; no tmp)
+        parquet_sink = self._fs.open_output_stream(self._parquet_path)
+        self._writer = pq.ParquetWriter(
+            parquet_sink,
+            schema=self._schema,
+            compression=getattr(self.cfg, "parquet_compression", "zstd"),
+            use_dictionary=getattr(self.cfg, "parquet_dictionary_enabled", True),
+            data_page_size=getattr(self.cfg, "parquet_data_page_size", 65536),
+        )
+
+        # Error sidecar (JSONL)
+        self._error_fh = self._err_fs.open_output_stream(self._errors_path)
+
+    def _row_from_record(self, rec: Record) -> Dict[str, Any]:
+        # Identity + ok/error summary
+        row = {
+            "img_file_name": rec.task.img_filename,
+            "img_s3_etag": rec.s3_etag,
+            "ok": True,
+            "error_stage": None,
+            "error_type": None,
+            "error_message": None,
+            "error_id": None,
+            # Record fields
+            "resized_w": rec.resized_w,
+            "resized_h": rec.resized_h,
+            "rotation_angle": rec.rotation_angle,
+            "tps_data": rec.tps_data,
+            "contours": rec.contours,
+            "nb_contours": rec.nb_contours,
+            "contours_bboxes": rec.contours_bboxes,
         }
-        return pa.Table.from_pydict(data, schema=self.schema)
+        return row
 
-    def _finalize_atomic(self):
-        if pafs is None:
+    def _row_from_error(self, err: PipelineError) -> Dict[str, Any]:
+        img_file_name = None
+        if err.task is not None:
+            img_file_name = getattr(err.task, "img_filename", None)
+
+        row = {
+            "img_file_name": img_file_name,
+            "img_s3_etag": getattr(err, "s3_etag", None),
+            "ok": False,
+            "error_stage": err.stage,
+            "error_type": err.error_type,
+            "error_message": _truncate(err.message, self.max_error_message_len),
+            # Feature fields are null for error rows
+            "resized_w": None,
+            "resized_h": None,
+            "rotation_angle": None,
+            "tps_data": None,
+            "contours": None,
+            "nb_contours": None,
+            "contours_bboxes": None,
+        }
+        return row
+
+    def _write_error_jsonl(self, err: PipelineError) -> None:
+        """Write full error details as a JSONL line."""
+        img_file_name = None
+        if err.task is not None:
+            img_file_name = getattr(err.task, "img_filename", None)
+
+        # Prefer a stable schema: explicit keys + safe string fields.
+        payload = {
+            "img_s3_etag": getattr(err, "s3_etag", None),
+            "stage": err.stage,
+            "error_type": err.error_type,
+            "message": err.message,
+            "traceback": getattr(err, "traceback", None),
+            "retryable": getattr(err, "retryable", False),
+            "attempt": getattr(err, "attempt", 1),
+            "task": None,
+            "s3_etag": err.s3_etag,
+        }
+        if err.task is not None:
+            payload["task"] = {
+                "s3_key": getattr(err.task, "s3_key", None),
+                "img_filename": getattr(err.task, "img_filename", None),
+            }
+
+        line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        self._error_fh.write(line)
+
+    def _flush(self) -> None:
+        """Flush buffered rows to Parquet."""
+        if not self._buffer:
             return
-        fs, final_path = pafs.FileSystem.from_uri(self.final_key)
-        fs_stage, stage_path = pafs.FileSystem.from_uri(self.staging_key)
-        # S3 has no atomic rename: use server-side copy+delete
-        fs.copy_file(stage_path, final_path)
-        fs.delete_file(stage_path)
-        # write a small success marker with metadata
-        meta = {"volume_id": self.volume_id, "rows": self.count_rows, "schema_version": self.cfg.schema_version, "ts": int(time.time())}
-        with fs.open_output_stream(self.success_key) as out:
-            out.write(json.dumps(meta).encode("utf-8"))
+        if pq is None or pa is None:
+            self._buffer.clear()
+            return
 
-    async def run(self):
-            """Stream records to Parquet; flush periodically; finalize atomically on completion."""
-        # Best-effort streaming; on environments without pyarrow this becomes a no-op skeleton
+        self._ensure_open()
+        if self._writer is None:
+            # No-op environment
+            self._buffer.clear()
+            return
+
+        table = pa.Table.from_pylist(self._buffer, schema=self._schema)
+        self._writer.write_table(table)
+        self._buffer.clear()
+
+    def _close(self) -> None:
+        """Close outputs."""
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+        if self._error_fh is not None:
+            self._error_fh.close()
+            self._error_fh = None
+
+    async def run(self) -> None:
+        """
+        Consume messages until SENTINEL, then flush and close.
+        """
+        # If pyarrow is absent, we still drain the queue to keep pipeline behavior consistent.
+        # (Useful for unit tests / environments without optional deps.)
         while True:
-            rec = await self.q_records.get()
-            if rec is None:
-                if self.buffer and pq is not None:
-                    self._ensure_writer()
-                    tbl = self._records_to_table(self.buffer)
-                    if tbl is not None:
-                        self.writer.write_table(tbl)
-                    self.buffer.clear()
-                if self.writer is not None:
-                    self.writer.close()
-                    self._finalize_atomic()
+            msg = await self.q_in.get()
+
+            if msg is SENTINEL:
                 break
-            self.buffer.append(rec)
-            self.count_rows += 1
-            if len(self.buffer) >= self.flush_every and pq is not None:
-                self._ensure_writer()
-                tbl = self._records_to_table(self.buffer)
-                if tbl is not None:
-                    self.writer.write_table(tbl)
-                self.buffer.clear()
+
+            if isinstance(msg, PipelineError):
+                # Write error summary row to Parquet + full JSONL record
+                self._ensure_open()
+                self._buffer.append(self._row_from_error(msg))
+                self._write_error_jsonl(msg)
+            else:
+                # Record
+                self._buffer.append(self._row_from_record(msg))
+
+            # For small volumes, you can increase flush_every or set it very high.
+            if len(self._buffer) >= self.flush_every:
+                self._flush()
+
+        # Final flush & close
+        self._flush()
+        self._close()

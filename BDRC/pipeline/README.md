@@ -91,6 +91,54 @@ writes the LDRecord on s3.
 
 Wires all the components together.
 
+## Error handling and end-of-stream signaling
+
+This pipeline uses **explicit messages** to handle errors and termination in a composable and backpressure-friendly way.
+
+### Sentinel (end-of-stream)
+
+Each stage communicates completion by sending a **sentinel** value through its output queue.
+
+* The sentinel is a unique object (not `None`) that cannot be confused with valid data.
+* It means: **no more messages will ever be produced on this queue**.
+* Each consumer coroutine exits its processing loop when it receives the sentinel, then forwards it downstream.
+
+This approach avoids relying on queue emptiness (which is transient) and ensures clean shutdown without extra coordination primitives.
+
+### Error messages
+
+Errors are represented as **first-class messages** that flow through the same queues as data.
+
+Instead of raising exceptions across async boundaries, a stage emits a `PipelineError` message containing:
+
+* the pipeline stage where the error occurred (e.g. `"prefetch"`, `"decode"`),
+* the associated task (when available),
+* error type and message,
+* optional traceback,
+* retry metadata (attempt count, retryable flag).
+
+Downstream stages typically:
+
+* **pass error messages through unchanged**, and
+* continue processing other items unless a fail-fast policy is explicitly desired.
+
+This design allows the pipeline to:
+
+* continue processing valid inputs when possible,
+* collect and report partial failures,
+* make error handling explicit, observable, and testable.
+
+### Summary
+
+At each stage boundary, queue messages are one of:
+
+* a **data message** (stage output),
+* a **`PipelineError`** (non-fatal error signal),
+* the **sentinel** (end-of-stream).
+
+This pattern is widely used in async pipelines and stream processors, and provides clear semantics for shutdown, backpressure, and error propagation.
+
+
 ## Why Bounded Queues? (Backpressure 101)
 
 A bounded queue has a **maximum size**. When a downstream stage is slow, the upstream `await q.put(...)` **blocks**, naturally slowing the pipeline. This keeps memory stable and avoids flooding any stage.
