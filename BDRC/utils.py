@@ -15,29 +15,49 @@ import json
 import logging
 import math
 import os
+import torch
+import torch.nn.functional as F
 
 from datetime import datetime
 from math import ceil
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-import numpy.typing as npt
+from numpy.typing import NDArray
 import onnxruntime as ort
 
-from BDRC.data import BBox, Line, OCRData, OCRModel, OCRModelConfig, LineDetectionConfig, LayoutDetectionConfig
+import segmentation_models_pytorch as sm
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from BDRC.data import (
+    BBox,
+    Line,
+    OCRData,
+    OCRModel,
+    OCRModelConfig,
+    LineDetectionConfig,
+    LayoutDetectionConfig,
+)
 
 # Import functions from specialized modules for backward compatibility
 # Import generate_guid from line_detection module for backward compatibility
-from BDRC.line_detection import calculate_rotation_angle_from_lines, generate_guid, mask_n_crop, rotate_from_angle
-from Config import CHARSETENCODER, OCRARCHITECTURE, COLOR_DICT
+from BDRC.line_detection import (
+    calculate_rotation_angle_from_lines,
+    generate_guid,
+    mask_n_crop,
+    rotate_from_angle,
+)
+from Config import CHARSETENCODER, OCRARCHITECTURE, COLOR_DICT, PARQUET_SCHEMA
 
 from huggingface_hub import snapshot_download
 
+
 def show_image(
-    image: npt.NDArray, cmap: str = "", axis="off", fig_x: int = 24, fix_y: int = 13
+    image: NDArray, cmap: str = "", axis="off", fig_x: int = 24, fix_y: int = 13
 ) -> None:
     plt.figure(figsize=(fig_x, fix_y))
     plt.axis(axis)
@@ -49,8 +69,8 @@ def show_image(
 
 
 def show_overlay(
-    image: npt.NDArray,
-    mask: npt.NDArray,
+    image: NDArray,
+    mask: NDArray,
     alpha=0.4,
     axis="off",
     fig_x: int = 24,
@@ -75,12 +95,12 @@ def get_utc_time():
     return utc_time
 
 
-def download_model(identifier: str) -> str:  
+def download_model(identifier: str) -> str:
     model_path = snapshot_download(
         repo_id=identifier,
         repo_type="model",
         local_dir=f"Models/{identifier}",
-        force_download=True
+        force_download=True,
     )
 
     model_config = f"{model_path}/model_config.json"
@@ -114,7 +134,7 @@ def read_ocr_model_config(config_file: str):
         output_layer,
         squeeze_channel_dim,
         swap_hw,
-        characters
+        characters,
     )
 
     return config
@@ -153,7 +173,7 @@ def get_charset(charset: str) -> List[str]:
 
     elif isinstance(charset, List):
         charset = charset
-    
+
     return [x for x in charset]
 
 
@@ -218,10 +238,10 @@ def build_ocr_data(id_val, file_path: str, target_width: int = None):
         guid = generate_guid(id_val)
     else:
         guid = id_val
-    
+
     # Load and scale the image
     image = cv2.imread(file_path)
-    
+
     if target_width is not None:
         image, _ = resize_to_width(image, target_width)
 
@@ -239,7 +259,7 @@ def build_ocr_data(id_val, file_path: str, target_width: int = None):
     return ocr_data
 
 
-def read_theme_file(file_path: str) -> dict | None:
+def read_theme_file(file_path: str) -> Dict | None:
     """
     Load theme configuration from a JSON file.
 
@@ -282,7 +302,12 @@ def import_local_models(model_path: str):
                     continue
 
                 _config = read_ocr_model_config(_config_file)
-                _model = OCRModel(guid=generate_guid(tick), name=sub_dir.name, path=str(sub_dir), config=_config)
+                _model = OCRModel(
+                    guid=generate_guid(tick),
+                    name=sub_dir.name,
+                    path=str(sub_dir),
+                    config=_config,
+                )
                 ocr_models.append(_model)
             tick += 1
 
@@ -306,7 +331,12 @@ def import_local_model(model_path: str):
             return None
 
         _config = read_ocr_model_config(_config_file)
-        _model = OCRModel(guid=generate_guid(1), name=Path(model_path).name, path=model_path, config=_config)
+        _model = OCRModel(
+            guid=generate_guid(1),
+            name=Path(model_path).name,
+            path=model_path,
+            config=_config,
+        )
 
     return _model
 
@@ -333,7 +363,9 @@ def read_ocr_model_config(config_file: str):
     input_layer = json_content["input_layer"]
     output_layer = json_content["output_layer"]
     encoder = json_content["encoder"]
-    squeeze_channel_dim = True if json_content["squeeze_channel_dim"] == "yes" else False
+    squeeze_channel_dim = (
+        True if json_content["squeeze_channel_dim"] == "yes" else False
+    )
     swap_hw = True if json_content["swap_hw"] == "yes" else False
     characters = json_content["charset"]
     add_blank = True if json_content["add_blank"] == "yes" else False
@@ -376,7 +408,7 @@ def resize_to_height(image, target_height: int):
     return image, scale_ratio
 
 
-def resize_to_width(image: npt.NDArray, target_width: int = 2048):
+def resize_to_width(image: NDArray, target_width: int = 2048):
     """
     Resize image to a specific width while maintaining aspect ratio.
 
@@ -396,7 +428,7 @@ def resize_to_width(image: npt.NDArray, target_width: int = 2048):
     return image, scale_ratio
 
 
-def calculate_steps(image: npt.NDArray, patch_size: int = 512) -> Tuple[int, int]:
+def calculate_steps(image: NDArray, patch_size: int = 512) -> Tuple[int, int]:
     """
     Calculate number of patches needed to tile an image.
 
@@ -416,7 +448,9 @@ def calculate_steps(image: npt.NDArray, patch_size: int = 512) -> Tuple[int, int
     return x_steps, y_steps
 
 
-def calculate_paddings(image: npt.NDArray, x_steps: int, y_steps: int, patch_size: int = 512) -> tuple[int, int]:
+def calculate_paddings(
+    image: NDArray, x_steps: int, y_steps: int, patch_size: int = 512
+) -> Tuple[int, int]:
     """
     Calculate padding needed to make image divisible into patches.
 
@@ -437,7 +471,7 @@ def calculate_paddings(image: npt.NDArray, x_steps: int, y_steps: int, patch_siz
     return pad_x, pad_y
 
 
-def pad_image(image: npt.NDArray, pad_x: int, pad_y: int, pad_value: int = 0) -> npt.NDArray:
+def pad_image(image: NDArray, pad_x: int, pad_y: int, pad_value: int = 0) -> NDArray:
     """
     Add padding to an image.
 
@@ -473,7 +507,9 @@ def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
-def get_text_area(image: np.array, prediction: npt.NDArray) -> Tuple[np.array, BBox] | Tuple[None, None, None]:
+def get_text_area(
+    image: NDArray, prediction: NDArray
+) -> Tuple[NDArray, BBox] | Tuple[None, None, None]:
     dil_kernel = np.ones((12, 2))
     dil_prediction = cv2.dilate(prediction, kernel=dil_kernel, iterations=10)
 
@@ -562,10 +598,12 @@ def is_inside_rectangle(point, rect):
     return xmin <= x <= xmax and ymin <= y <= ymax
 
 
-def filter_contours(prediction: np.array, textarea_contour: np.array) -> list[np.array]:
+def filter_contours(prediction: NDArray, textarea_contour: NDArray) -> List[NDArray]:
     filtered_contours = []
     x, y, w, h = cv2.boundingRect(textarea_contour)
-    line_contours, _ = cv2.findContours(prediction, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    line_contours, _ = cv2.findContours(
+        prediction, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+    )
 
     for cnt in line_contours:
         center, _, _ = cv2.minAreaRect(cnt)
@@ -577,7 +615,7 @@ def filter_contours(prediction: np.array, textarea_contour: np.array) -> list[np
     return filtered_contours
 
 
-def post_process_prediction(image: np.array, prediction: np.array):
+def post_process_prediction(image: NDArray, prediction: NDArray):
     prediction, text_area, textarea_contour = get_text_area(image, prediction)
 
     if prediction is not None:
@@ -597,7 +635,7 @@ def post_process_prediction(image: np.array, prediction: np.array):
         return None, None, None, None
 
 
-def generate_line_preview(prediction: np.array, filtered_contours: list[np.array]):
+def generate_line_preview(prediction: NDArray, filtered_contours: List[NDArray]):
     preview = np.zeros(shape=prediction.shape, dtype=np.uint8)
 
     for cnt in filtered_contours:
@@ -606,7 +644,7 @@ def generate_line_preview(prediction: np.array, filtered_contours: list[np.array
     return preview
 
 
-def tile_image(padded_img: npt.NDArray, patch_size: int = 512):
+def tile_image(padded_img: NDArray, patch_size: int = 512):
     x_steps = int(padded_img.shape[1] / patch_size)
     y_steps = int(padded_img.shape[0] / patch_size)
     y_splits = np.split(padded_img, y_steps, axis=0)
@@ -617,7 +655,7 @@ def tile_image(padded_img: npt.NDArray, patch_size: int = 512):
     return patches, y_steps
 
 
-def stitch_predictions(prediction: npt.NDArray, y_steps: int) -> npt.NDArray:
+def stitch_predictions(prediction: NDArray, y_steps: int) -> NDArray:
     pred_y_split = np.split(prediction, y_steps, axis=0)
     x_slices = [np.hstack(x) for x in pred_y_split]
     concat_img = np.vstack(x_slices)
@@ -625,7 +663,7 @@ def stitch_predictions(prediction: npt.NDArray, y_steps: int) -> npt.NDArray:
     return concat_img
 
 
-def get_paddings(image: npt.NDArray, patch_size: int = 512) -> Tuple[int, int]:
+def get_paddings(image: NDArray, patch_size: int = 512) -> Tuple[int, int]:
     max_x = ceil(image.shape[1] / patch_size) * patch_size
     max_y = ceil(image.shape[0] / patch_size) * patch_size
     pad_x = max_x - image.shape[1]
@@ -635,7 +673,7 @@ def get_paddings(image: npt.NDArray, patch_size: int = 512) -> Tuple[int, int]:
 
 
 def preprocess_image(
-    image: npt.NDArray,
+    image: NDArray,
     patch_size: int = 512,
     clamp_width: int = 4096,
     clamp_height: int = 2048,
@@ -660,7 +698,9 @@ def preprocess_image(
     if clamp_size and image.shape[1] > image.shape[0] and image.shape[1] > clamp_width:
         image, _ = resize_to_width(image, clamp_width)
 
-    elif clamp_size and image.shape[0] > image.shape[1] and image.shape[0] > clamp_height:
+    elif (
+        clamp_size and image.shape[0] > image.shape[1] and image.shape[0] > clamp_height
+    ):
         image, _ = resize_to_height(image, clamp_height)
 
     elif image.shape[0] < patch_size:
@@ -672,7 +712,7 @@ def preprocess_image(
     return padded_img, pad_x, pad_y
 
 
-def normalize(image: npt.NDArray) -> npt.NDArray:
+def normalize(image: NDArray) -> NDArray:
     """
     Normalize image pixel values to range [0, 1].
 
@@ -687,7 +727,9 @@ def normalize(image: npt.NDArray) -> npt.NDArray:
     return image
 
 
-def binarize(img: npt.NDArray, adaptive: bool = True, block_size: int = 51, c: int = 13) -> npt.NDArray:
+def binarize(
+    img: NDArray, adaptive: bool = True, block_size: int = 51, c: int = 13
+) -> NDArray:
     line_img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
     if adaptive:
@@ -707,7 +749,9 @@ def binarize(img: npt.NDArray, adaptive: bool = True, block_size: int = 51, c: i
     return bw
 
 
-def pad_to_width(img: np.array, target_width: int, target_height: int, padding: str) -> np.array:
+def pad_to_width(
+    img: NDArray, target_width: int, target_height: int, padding: str
+) -> NDArray:
     _, _, channels = img.shape
     tmp_img, _ = resize_to_width(img, target_width)
 
@@ -716,20 +760,28 @@ def pad_to_width(img: np.array, target_width: int, target_height: int, padding: 
 
     if padding == "white":
         upper_stack = np.ones(shape=(middle, target_width, channels), dtype=np.uint8)
-        lower_stack = np.ones(shape=(target_height - height - middle, target_width, channels), dtype=np.uint8)
+        lower_stack = np.ones(
+            shape=(target_height - height - middle, target_width, channels),
+            dtype=np.uint8,
+        )
 
         upper_stack *= 255
         lower_stack *= 255
     else:
         upper_stack = np.zeros(shape=(middle, target_width, channels), dtype=np.uint8)
-        lower_stack = np.zeros(shape=(target_height - height - middle, target_width, channels), dtype=np.uint8)
+        lower_stack = np.zeros(
+            shape=(target_height - height - middle, target_width, channels),
+            dtype=np.uint8,
+        )
 
     out_img = np.vstack([upper_stack, tmp_img, lower_stack])
 
     return out_img
 
 
-def pad_to_height(img: npt.NDArray, target_width: int, target_height: int, padding: str) -> npt.NDArray:
+def pad_to_height(
+    img: NDArray, target_width: int, target_height: int, padding: str
+) -> NDArray:
     _, _, channels = img.shape
     tmp_img, _ = resize_to_height(img, target_height)
 
@@ -738,14 +790,20 @@ def pad_to_height(img: npt.NDArray, target_width: int, target_height: int, paddi
 
     if padding == "white":
         left_stack = np.ones(shape=(target_height, middle, channels), dtype=np.uint8)
-        right_stack = np.ones(shape=(target_height, target_width - width - middle, channels), dtype=np.uint8)
+        right_stack = np.ones(
+            shape=(target_height, target_width - width - middle, channels),
+            dtype=np.uint8,
+        )
 
         left_stack *= 255
         right_stack *= 255
 
     else:
         left_stack = np.zeros(shape=(target_height, middle, channels), dtype=np.uint8)
-        right_stack = np.zeros(shape=(target_height, target_width - width - middle, channels), dtype=np.uint8)
+        right_stack = np.zeros(
+            shape=(target_height, target_width - width - middle, channels),
+            dtype=np.uint8,
+        )
 
     out_img = np.hstack([left_stack, tmp_img, right_stack])
 
@@ -753,8 +811,11 @@ def pad_to_height(img: npt.NDArray, target_width: int, target_height: int, paddi
 
 
 def pad_ocr_line(
-    img: npt.NDArray, target_width: int = 3000, target_height: int = 80, padding: str = "black"
-) -> npt.NDArray:
+    img: NDArray,
+    target_width: int = 3000,
+    target_height: int = 80,
+    padding: str = "black",
+) -> NDArray:
 
     width_ratio = target_width / img.shape[1]
     height_ratio = target_height / img.shape[0]
@@ -767,43 +828,311 @@ def pad_ocr_line(
     else:
         out_img = pad_to_width(img, target_width, target_height, padding)
 
-    return cv2.resize(out_img, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(
+        out_img, (target_width, target_height), interpolation=cv2.INTER_LINEAR
+    )
 
 
 def create_preview_image(
-    image: npt.NDArray,
+    image: NDArray,
     image_predictions: Optional[List],
     line_predictions: Optional[List],
     caption_predictions: Optional[List],
     margin_predictions: Optional[List],
     alpha: float = 0.4,
-) -> npt.NDArray:
+) -> NDArray:
     mask = np.zeros(image.shape, dtype=np.uint8)
 
     if image_predictions is not None and len(image_predictions) > 0:
         color = tuple([int(x) for x in COLOR_DICT["image"].split(",")])
 
         for idx, _ in enumerate(image_predictions):
-            cv2.drawContours(mask, image_predictions, contourIdx=idx, color=color, thickness=-1)
+            cv2.drawContours(
+                mask, image_predictions, contourIdx=idx, color=color, thickness=-1
+            )
 
     if line_predictions is not None:
         color = tuple([int(x) for x in COLOR_DICT["line"].split(",")])
 
         for idx, _ in enumerate(line_predictions):
-            cv2.drawContours(mask, line_predictions, contourIdx=idx, color=color, thickness=-1)
+            cv2.drawContours(
+                mask, line_predictions, contourIdx=idx, color=color, thickness=-1
+            )
 
     if len(caption_predictions) > 0:
         color = tuple([int(x) for x in COLOR_DICT["caption"].split(",")])
 
         for idx, _ in enumerate(caption_predictions):
-            cv2.drawContours(mask, caption_predictions, contourIdx=idx, color=color, thickness=-1)
+            cv2.drawContours(
+                mask, caption_predictions, contourIdx=idx, color=color, thickness=-1
+            )
 
     if len(margin_predictions) > 0:
         color = tuple([int(x) for x in COLOR_DICT["margin"].split(",")])
 
         for idx, _ in enumerate(margin_predictions):
-            cv2.drawContours(mask, margin_predictions, contourIdx=idx, color=color, thickness=-1)
+            cv2.drawContours(
+                mask, margin_predictions, contourIdx=idx, color=color, thickness=-1
+            )
 
     cv2.addWeighted(mask, alpha, image, 1 - alpha, 0, image)
 
     return image
+
+
+### Functions for PyTorch-based inference ###
+
+
+def resize_clamp(
+    img: torch.Tensor, patch_size: int = 512, max_w: int = 4096, max_h: int = 2048
+):
+    _, H, W = img.shape
+
+    scale_x = 1.0
+    scale_y = 1.0
+
+    if W > H and W > max_w:
+        scale = max_w / W
+    elif H > W and H > max_h:
+        scale = max_h / H
+    elif H < patch_size:
+        scale = patch_size / H
+    else:
+        return img, scale_x, scale_y
+
+    new_h = int(round(H * scale))
+    new_w = int(round(W * scale))
+
+    scale_x = new_w / W
+    scale_y = new_h / H
+
+    img = img.unsqueeze(0).float()
+    img = torch.nn.functional.interpolate(
+        img,
+        size=(new_h, new_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    img = img.squeeze(0)
+
+    return img, scale_x, scale_y
+
+
+def pad_to_multiple(img: torch.Tensor, patch_size=512, value=255):
+    _, H, W = img.shape
+
+    pad_h = (patch_size - H % patch_size) % patch_size
+    pad_w = (patch_size - W % patch_size) % patch_size
+
+    # pad = (left, right, top, bottom)
+    img = F.pad(img, (0, pad_w, 0, pad_h), value=value)
+    return img, pad_w, pad_h
+
+
+def tile_image(img: torch.Tensor, patch_size=512):
+    C, H, W = img.shape
+    y_steps = H // patch_size
+    x_steps = W // patch_size
+
+    tiles = img.unfold(1, patch_size, patch_size).unfold(2, patch_size, patch_size)
+
+    tiles = tiles.permute(1, 2, 0, 3, 4).contiguous()
+    tiles = tiles.view(-1, C, patch_size, patch_size)
+
+    return tiles, x_steps, y_steps
+
+
+def stitch_tiles(
+    preds: torch.Tensor,
+    x_steps: int,
+    y_steps: int,
+    patch_size: int = 512,
+):
+    """
+    preds: [N, C, H, W]
+    returns: [C, H_full, W_full]
+    """
+    N, C, H, W = preds.shape
+    assert H == patch_size and W == patch_size
+    assert N == x_steps * y_steps
+
+    # [N, C, H, W] → [y, x, C, H, W]
+    tiles = preds.view(y_steps, x_steps, C, H, W)
+
+    # stitch width
+    rows = []
+    for y in range(y_steps):
+        rows.append(torch.cat(list(tiles[y]), dim=-1))  # concat W
+
+    # stitch height
+    full = torch.cat(rows, dim=-2)  # concat H
+
+    return full
+
+
+def contour_to_cv(contour):
+    """
+    contour: list[(x, y)]
+    returns: np.ndarray [N, 1, 2] int32
+    """
+    return np.array(contour, dtype=np.int32).reshape(-1, 1, 2)
+
+
+def contour_to_original(contour, scale_x: float, scale_y: float):
+    return [
+        (
+            int(round(x / scale_x)),
+            int(round(y / scale_y)),
+        )
+        for x, y in contour
+    ]
+
+
+def bbox_to_original(bbox, scale_x: float, scale_y: float):
+    x, y, w, h = bbox
+    return (
+        int(round(x / scale_x)),
+        int(round(y / scale_y)),
+        int(round(w / scale_x)),
+        int(round(h / scale_y)),
+    )
+
+
+def crop_padding(mask: torch.Tensor, pad_x: int, pad_y: int):
+    """
+    mask: [C, H, W]
+    """
+    if pad_y > 0:
+        mask = mask[:, :-pad_y, :]
+    if pad_x > 0:
+        mask = mask[:, :, :-pad_x]
+    return mask
+
+
+def bboxes_to_pyarrow(bboxes):
+    return [{"x": x, "y": y, "w": w, "h": h} for (x, y, w, h) in bboxes]
+
+
+def contours_to_arrow(contours):
+    return [[{"x": x, "y": y} for x, y in contour] for contour in contours]
+
+
+def write_result_parquet(result, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    base_name, _ = os.path.splitext(result["image_name"])
+
+    table = pa.Table.from_pylist(
+        [
+            {
+                "image_name": result["image_name"],
+                "image_width": result["image_width"],
+                "image_height": result["image_height"],
+                "num_contours": result["num_contours"],
+                "contours": contours_to_arrow(result["contours"]),
+                "bboxes": bboxes_to_pyarrow(result["bboxes"]),
+            }
+        ],
+        schema=PARQUET_SCHEMA,
+    )
+
+    out_path = os.path.join(out_dir, f"{base_name}.parquet")
+
+    pq.write_table(table, out_path, compression="zstd")
+
+
+def multi_image_collate_fn(batch):
+    all_tiles = []
+    tile_ranges = []
+    metas = []
+
+    offset = 0
+
+    for img, meta in batch:
+        img, sx, sy = resize_clamp(img)
+        img, pad_x, pad_y = pad_to_multiple(img)
+
+        tiles, x_steps, y_steps = tile_image(img)
+        tiles = tiles.float().div_(255.0)
+
+        n_tiles = tiles.shape[0]
+        tile_ranges.append((offset, offset + n_tiles))
+        all_tiles.append(tiles)
+
+        meta["scale_x"] = sx
+        meta["scale_y"] = sy
+        meta["pad_x"] = pad_x
+        meta["pad_y"] = pad_y
+        meta["x_steps"] = x_steps
+        meta["y_steps"] = y_steps
+
+        metas.append(meta)
+        offset += n_tiles
+
+    all_tiles = torch.cat(all_tiles, dim=0)
+
+    return all_tiles, tile_ranges, metas
+
+
+def load_model(checkpoint_path: str, num_classes: int, device: str = "cuda"):
+    checkpoint = torch.load(checkpoint_path)
+
+    model = sm.DeepLabV3Plus(classes=num_classes).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
+
+    """model = models.segmentation.deeplabv3_resnet50(
+        weights=None,
+        num_classes=2
+    )"""
+    model.to(device)
+    model.eval()
+    return model
+
+
+def infer_batch(
+    model,
+    all_tiles,
+    tile_ranges,
+    metas,
+    class_threshold: float = 0.9,
+    device: str = "cuda",
+):
+    all_tiles = all_tiles.to(device, non_blocking=True)
+    preds = model(all_tiles)
+
+    soft = torch.sigmoid(preds)
+
+    for (start, end), meta in zip(tile_ranges, metas):
+        preds_img = soft[start:end]
+
+        stitched = stitch_tiles(preds_img, meta["x_steps"], meta["y_steps"])
+        stitched = crop_padding(stitched, meta["pad_x"], meta["pad_y"])
+
+        binary = (stitched > class_threshold).to(torch.uint8) * 255
+        mask_np = binary.squeeze(0).cpu().numpy()
+
+        contours, _ = cv2.findContours(mask_np, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+        result = {
+            "image_name": meta["image_name"],
+            "image_width": meta["orig_shape"][1],
+            "image_height": meta["orig_shape"][0],
+            "num_contours": len(contours),
+            "contours": [
+                contour_to_original(
+                    [(int(x), int(y)) for [[x, y]] in cnt],
+                    meta["scale_x"],
+                    meta["scale_y"],
+                )
+                for cnt in contours
+            ],
+            "bboxes": [
+                bbox_to_original(
+                    cv2.boundingRect(cnt),
+                    meta["scale_x"],
+                    meta["scale_y"],
+                )
+                for cnt in contours
+            ],
+        }
+
+        return result

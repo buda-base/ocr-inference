@@ -1,9 +1,9 @@
 """OCR Pipeline wrapper with artifact management and audit logging."""
 
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
-import numpy.typing as npt
+from numpy.typing import NDArray
 
 from BDRC.artifact_manager import ArtifactManager
 from BDRC.audit_logger import AuditLogger
@@ -12,11 +12,11 @@ from BDRC.exporter import PageXMLExporter, TextExporter
 from BDRC.inference import OCRPipeline
 
 
-def serialize_contours(contours) -> list:
+def serialize_contours(contours) -> List:
     return [c.tolist() for c in contours]
 
 
-def serialize_lines(lines: list[Line]) -> list:
+def serialize_lines(lines: List[Line]) -> List:
     return [
         {
             "guid": str(ln.guid),
@@ -29,7 +29,7 @@ def serialize_lines(lines: list[Line]) -> list:
 
 def run_ocr_with_artifacts(
     pipeline: OCRPipeline,
-    image: npt.NDArray,
+    image: NDArray,
     image_name: str,
     k_factor: float = 2.5,
     bbox_tolerance: float = 4.0,

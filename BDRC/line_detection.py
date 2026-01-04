@@ -10,7 +10,7 @@ This module contains functions for:
 
 import cv2
 import numpy as np
-import numpy.typing as npt
+from numpy.typing import NDArray
 from typing import List, Tuple, Sequence
 
 from BDRC.data import BBox, Line
@@ -30,7 +30,7 @@ def generate_guid(clock_seq: int):
     return uuid1(clock_seq=clock_seq)
 
 
-def get_contours(image: npt.NDArray) -> Sequence:
+def get_contours(image: NDArray) -> Sequence:
     """
     Find contours in a binary image.
     
@@ -59,7 +59,7 @@ def optimize_countour(cnt, e=0.001):
     return cv2.approxPolyDP(cnt, epsilon, True)
 
 
-def rotate_from_angle(image: np.array, angle: float) -> np.array:
+def rotate_from_angle(image: NDArray, angle: float) -> NDArray:
     """
     Rotate image by a specified angle.
     
@@ -76,7 +76,7 @@ def rotate_from_angle(image: np.array, angle: float) -> np.array:
     return rotated_img
 
 
-def mask_n_crop(image: np.array, mask: np.array) -> np.array:
+def mask_n_crop(image: NDArray, mask: NDArray) -> NDArray:
     """
     Apply mask to image and crop to non-zero regions.
     
@@ -105,7 +105,7 @@ def mask_n_crop(image: np.array, mask: np.array) -> np.array:
 
 
 def get_rotation_angle_from_lines(
-    line_mask: npt.NDArray,
+    line_mask: NDArray,
     max_angle: float = 5.0,
     debug_angles: bool = False,
 ) -> float:
@@ -143,7 +143,7 @@ def get_rotation_angle_from_lines(
 
 
 def calculate_rotation_angle_from_lines(
-    line_mask: npt.NDArray,
+    line_mask: NDArray,
     max_angle: float = 5.0,
     debug_angles: bool = False,
 ) -> float:
@@ -185,7 +185,7 @@ def calculate_rotation_angle_from_lines(
     return mean_angle
 
 
-def build_line_data(contour: np.array, optimize: bool = True) -> Line:
+def build_line_data(contour: NDArray, optimize: bool = True) -> Line:
     """
     Create a Line object from a contour with bounding box and center information.
     
@@ -209,7 +209,7 @@ def build_line_data(contour: np.array, optimize: bool = True) -> Line:
     return Line(guid, contour, bbox, (x_center, y_center))
 
 
-def build_raw_line_data(image: npt.NDArray, line_mask: npt.NDArray, rot_threshold: float = 0.5):
+def build_raw_line_data(image: NDArray, line_mask: NDArray, rot_threshold: float = 0.5):
     """
     Process raw line detection data by rotating and extracting contours.
     
@@ -244,7 +244,7 @@ def build_raw_line_data(image: npt.NDArray, line_mask: npt.NDArray, rot_threshol
     return out_img, out_mask, line_contours, angle
 
 
-def filter_line_contours(image: npt.NDArray, line_contours, threshold: float = 0.01) -> List:
+def filter_line_contours(image: NDArray, line_contours, threshold: float = 0.01) -> List:
     """
     Filter line contours based on size criteria.
     
@@ -264,7 +264,7 @@ def filter_line_contours(image: npt.NDArray, line_contours, threshold: float = 0
     return filtered_contours
 
 
-def extract_line(image: npt.NDArray, mask: npt.NDArray, bbox_h: int, k_factor: float = 1.2):
+def extract_line(image: NDArray, mask: NDArray, bbox_h: int, k_factor: float = 1.2):
     """
     Extract line region using morphological operations.
     
@@ -288,7 +288,7 @@ def extract_line(image: npt.NDArray, mask: npt.NDArray, bbox_h: int, k_factor: f
     return masked_line
 
 
-def get_line_image(image: npt.NDArray, mask: npt.NDArray, bbox_h: int, bbox_tolerance: float = 2.5, k_factor: float = 1.2):
+def get_line_image(image: NDArray, mask: NDArray, bbox_h: int, bbox_tolerance: float = 2.5, k_factor: float = 1.2) -> Tuple[NDArray, float]:
     """
     Extract line image with adaptive height tolerance.
     
@@ -318,6 +318,7 @@ def get_line_image(image: npt.NDArray, mask: npt.NDArray, bbox_h: int, bbox_tole
             attempts += 1
 
         return line_img, tmp_k
+    
     except Exception as e:
         # Return a minimal valid image and the original k_factor in case of error
         print(f"Error in get_line_image: {e}")
@@ -326,7 +327,7 @@ def get_line_image(image: npt.NDArray, mask: npt.NDArray, bbox_h: int, bbox_tole
         return fallback_img, k_factor
 
 
-def extract_line_images(image: npt.NDArray, line_data: List[Line], default_k: float = 1.7, bbox_tolerance: float = 3):
+def extract_line_images(image: NDArray, line_data: List[Line], default_k: float = 1.7, bbox_tolerance: float = 3) -> List[NDArray]:
     """
     Extract individual line images from detected line data.
     
@@ -358,7 +359,7 @@ def extract_line_images(image: npt.NDArray, line_data: List[Line], default_k: fl
     return line_images
 
 
-def get_line_threshold(line_prediction: npt.NDArray, slice_width: int = 20):
+def get_line_threshold(line_prediction: NDArray, slice_width: int = 20) -> float:
     """
     Calculate threshold for line sorting based on detected lines.
     
@@ -485,7 +486,7 @@ def sort_bbox_centers(bbox_centers: List[Tuple[int, int]], line_threshold: int =
     return sorted_bbox_centers
 
 
-def group_line_chunks(sorted_bbox_centers, lines: List[Line], adaptive_grouping: bool = True):
+def group_line_chunks(sorted_bbox_centers, lines: List[Line], adaptive_grouping: bool = True) -> List[Line]:
     """
     Group line chunks into unified line objects.
     
@@ -548,8 +549,8 @@ def group_line_chunks(sorted_bbox_centers, lines: List[Line], adaptive_grouping:
 
 
 def sort_lines_by_threshold(
-    line_mask: np.array,
-    lines: list[Line],
+    line_mask: NDArray,
+    lines: List[Line],
     threshold: int = 20,
     calculate_threshold: bool = True,
     group_lines: bool = True
@@ -591,12 +592,12 @@ def sort_lines_by_threshold(
 
 
 def sort_lines_by_threshold2(
-    line_mask: npt.NDArray,
+    line_mask: NDArray,
     lines: List[Line],
     threshold: int = 20,
     calculate_threshold: bool = True,
     group_lines: bool = True
-):
+) -> Tuple[List[Line], float]:
     """
     Alternative implementation for sorting lines by threshold.
     

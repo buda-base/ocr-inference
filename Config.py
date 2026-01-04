@@ -1,3 +1,4 @@
+import pyarrow as pa
 from BDRC.data import (
     CharsetEncoder,
     Encoding,
@@ -77,3 +78,31 @@ LINE_MERGE = {"merge": LineMerge.MERGE, "stack": LineMerge.STACK}
 LINE_SORTING = {"threshold": LineSorting.THRESHOLD, "peaks": LineSorting.PEAKS}
 
 TPS_MODE = {"local": TPSMode.LOCAL, "global": TPSMode.GLOBAL}
+
+
+PARQUET_SCHEMA = pa.schema([
+    ("image_name", pa.string()),
+    ("image_width", pa.int32()),
+    ("image_height", pa.int32()),
+    ("num_contours", pa.int32()),
+
+    # contours: list of polygons, polygon = list of (x,y)
+    ("contours", pa.list_(
+        pa.list_(
+            pa.struct([
+                ("x", pa.int32()),
+                ("y", pa.int32()),
+            ])
+        )
+    )),
+
+    # bounding boxes: one per contour
+    ("bboxes", pa.list_(
+        pa.struct([
+            ("x", pa.int32()),
+            ("y", pa.int32()),
+            ("w", pa.int32()),
+            ("h", pa.int32()),
+        ])
+    )),
+])

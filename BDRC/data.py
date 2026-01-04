@@ -13,6 +13,7 @@ from uuid import UUID
 
 import numpy.typing as npt
 
+
 class OpStatus(Enum):
     """Operation status indicators for various OCR operations."""
 
