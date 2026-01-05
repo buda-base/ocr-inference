@@ -122,7 +122,7 @@ class LDPostProcessor:
             contours = rotate_contours(contours, rotation_angle, h, w)
 
         # 3. TPS points (may be None)
-        tps_data = get_tps_points(
+        tps_points = get_tps_points(
             contours, h, w,
             legacy_tps_detect=self.cfg.legacy_tps_detect,
             alpha=self.cfg.tps_alpha,
@@ -130,8 +130,9 @@ class LDPostProcessor:
         )
 
         # 4. either finalize or enqueue decoded frame to reprocess
-        if tps_data is None and rotation_angle == 0.0:
-            # TODO: scale contours to original image dimensions (inf_frame.orig_h, inf_frame.orig_w)
+        if tps_points is None and rotation_angle == 0.0:
+            # scale contours to original image dimensions (inf_frame.orig_h, inf_frame.orig_w)
+            contours = scale_contours(contours, inf_frame.line_mask.shape[0], inf_frame.line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
             contours_bboxes = get_contour_bboxes(contours)
             rec = Record(
                 task=inf_frame.task,
@@ -147,8 +148,8 @@ class LDPostProcessor:
 
         input_pts = output_pts = None
         alpha = None
-        if tps_data is not None:
-            input_pts, output_pts = tps_data
+        if tps_points is not None:
+            input_pts, output_pts = tps_points
             alpha = self.cfg.tps_alpha
 
         transformed_frame = apply_transform_1(inf_frame.frame, rotation_angle, input_pts, output_pts, alpha)
@@ -169,15 +170,20 @@ class LDPostProcessor:
     async def _finalize_record(self, inf_frame: InferredFrame) -> None:
         # Cheap pass2 finalization: just contours
         contours = get_filtered_contours(inf_frame.line_mask)
-        # TODO: scale contours to original image dimensions (frame.orig_h, frame.orig_w)
-        # TODO: scale tps_data to original image dimensions
+        # scale contours to original image dimensions (frame.orig_h, frame.orig_w)
+        contours = scale_contours(contours, inf_frame.line_mask.shape[0], inf_frame.line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
+        # scale tps_data to original image dimensions
+        tps_data = inf_frame.tps_data
+        if tps_data:
+            scaled_tps_points = scale_tps_points(tps_data[0], tps_data[1], inf_frame.line_mask.shape[0], inf_frame.line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
+            tps_data = (scaled_tps_points[0], scaled_tps_points[1], tps_data[2])
         contours_bboxes = get_contour_bboxes(contours)
         h, w = inf_frame.line_mask.shape[:2]
         rec = Record(
             task=inf_frame.task,
             s3_etag=inf_frame.s3_etag,
             rotation_angle=inf_frame.rotation_angle,
-            tps_data=inf_frame.tps_data,
+            tps_data=tps_data,
             contours=contours,
             nb_contours=len(contours),
             contours_bboxes=contours_bboxes,
@@ -204,6 +210,117 @@ TPS_Y_HI_PCT_DEFAULT = 90.0
 TPS_MAX_MISSING_WINDOWS_DEFAULT = 2
 TPS_ALPHA_DEFAULT = 0.5
 TPS_ADD_CORNERS_DEFAULT = True
+
+def scale_contours(
+    contours: Iterable[np.ndarray],
+    src_h: int,
+    src_w: int,
+    dst_h: int,
+    dst_w: int,
+) -> List[np.ndarray]:
+    """
+    Scales contours produced by cv2.findContours from a (src_h, src_w) frame
+    into a (dst_h, dst_w) frame.
+
+    Expected contour formats:
+      - (N, 1, 2)  [OpenCV standard]
+      - (N, 2)
+
+    Coordinates are assumed to be (x, y).
+
+    Returns:
+        A list of scaled contours with the same shape as the input contours,
+        dtype float32.
+    """
+    if src_h == dst_h and src_w == dst_w:
+        return contours
+
+    if src_h <= 0 or src_w <= 0 or dst_h <= 0 or dst_w <= 0:
+        raise ValueError(
+            f"Invalid dimensions: src=({src_h},{src_w}) dst=({dst_h},{dst_w})"
+        )
+
+    sx = dst_w / float(src_w)
+    sy = dst_h / float(src_h)
+
+    scaled_contours: List[np.ndarray] = []
+
+    for contour in contours:
+        if not isinstance(contour, np.ndarray):
+            raise TypeError("Each contour must be a numpy array")
+
+        # Work on a float copy to avoid integer truncation during scaling
+        pts = contour.astype(np.float64, copy=True)
+
+        if pts.ndim == 3 and pts.shape[1:] == (1, 2):
+            # (N, 1, 2)
+            pts[:, 0, 0] *= sx  # x
+            pts[:, 0, 1] *= sy  # y
+
+        elif pts.ndim == 2 and pts.shape[1] == 2:
+            # (N, 2)
+            pts[:, 0] *= sx  # x
+            pts[:, 1] *= sy  # y
+
+        else:
+            raise ValueError(
+                f"Unsupported contour shape {contour.shape}; "
+                "expected (N,1,2) or (N,2)"
+            )
+
+        # Round and cast back to int32
+        pts = np.round(pts).astype(np.int32)
+
+        scaled_contours.append(pts)
+
+    return scaled_contours
+
+def scale_tps_points(
+    tps_input_points: np.ndarray,
+    tps_output_points: np.ndarray,
+    src_h: int,
+    src_w: int,
+    dst_h: int,
+    dst_w: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Same scaling as scale_contours, but for TPS point arrays.
+
+    Assumptions:
+      - tps_input_points and tps_output_points are float64 numpy arrays.
+      - Shape is (N, 2) where each row is (x, y).
+      - Returns new arrays (does not modify inputs).
+
+    Returns:
+        (scaled_input_points, scaled_output_points) as float64 arrays.
+    """
+    if src_h == dst_h and src_w == dst_w:
+        return tps_input_points, tps_output_points
+
+    if src_h <= 0 or src_w <= 0 or dst_h <= 0 or dst_w <= 0:
+        raise ValueError(
+            f"Invalid dimensions: src=({src_h},{src_w}) dst=({dst_h},{dst_w})"
+        )
+
+    if not isinstance(tps_input_points, np.ndarray) or not isinstance(
+        tps_output_points, np.ndarray
+    ):
+        raise TypeError("tps_input_points and tps_output_points must be numpy arrays")
+
+    sx = dst_w / float(src_w)
+    sy = dst_h / float(src_h)
+
+    scaled_in = tps_input_points.copy()
+    scaled_out = tps_output_points.copy()
+
+    scaled_in[:, 0] *= sx
+    scaled_in[:, 1] *= sy
+
+    scaled_out[:, 0] *= sx
+    scaled_out[:, 1] *= sy
+
+    return scaled_in, scaled_out
+
 
 
 # -----------------------------
