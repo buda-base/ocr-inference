@@ -40,7 +40,10 @@ class Decoder:
             max_height=self.cfg.frame_max_height,
             linearize=self.cfg.linearize,
             normalize_background=self.cfg.normalize_background,
-            patch_size=self.cfg.patch_size
+            patch_size=self.cfg.patch_size,
+            patch_vertical_overlap_px=self.cfg.patch_vertical_overlap_px,
+            snap_extra_patch_row_threshold_px=self.cfg.snap_extra_patch_row_threshold_px,
+            max_patch_rows=self.cfg.max_patch_rows
         )
         return DecodedFrame(task=item.task, s3_etag=item.s3_etag, orig_h=orig_h, orig_w=orig_w, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
 
@@ -90,59 +93,90 @@ def _compute_downscale(
     h: int,
     max_w: int,
     max_h: int,
-    patch_wh: int,
-    snap_extra_row_threshold: float = 0.1,
+    patch_size: int,
+    patch_vertical_overlap_px: int = 78,
+    snap_extra_patch_row_threshold_px: int = 78,
+    max_patch_rows: int = 2
 ) -> float:
     """
-    Compute a scale factor for resizing an image for patch-based inference.
+    Compute a resize scale factor for patch-based inference of line detection.
 
-    Rules:
-    1) Prefer downscaling so the image fits in (max_w, max_h). No upscaling here.
-    2) If the resulting height would be < patch_wh, upscale so height == patch_wh
-       (ensures at least one full patch row).
-    3) If the scaled height is just slightly above an integer multiple of patch_wh,
-       snap down to that multiple to avoid creating a mostly-empty extra patch row.
+    Pipeline logic:
+      1) Downscale to fit within (max_w, max_h) (never upscale in this step).
+      2) Ensure at least one full patch in height (may upscale).
+      3) Snap height *down* if it barely crosses a patch-row boundary (works for any row count).
+      4) Optionally cap the number of patch rows by shrinking height to the maximum allowed.
 
-    Returns:
-        scale factor s (multiply original w/h by s to get resized dimensions)
+    Definitions (vertical tiling with overlap):
+      stride_y = patch_size - patch_vertical_overlap_px
+      Row boundaries happen at: patch_size + k * stride_y   (k >= 0)
     """
     if w <= 0 or h <= 0:
         raise ImageDecodeError(f"Invalid image dimensions: {w}x{h}")
-    if patch_wh <= 0:
-        raise ValueError(f"Invalid patch size: {patch_wh}")
 
-    # --- Step 1: Fit within the max rectangle, but do not upscale. ---
+    if patch_size <= 0:
+        raise ValueError(f"Invalid patch_size: {patch_size}")
+
+    if patch_vertical_overlap_px < 0 or patch_vertical_overlap_px >= patch_size:
+        raise ValueError(
+            f"patch_vertical_overlap_px must be in [0, patch_size-1], got {patch_vertical_overlap_px}"
+        )
+
+    stride_y = patch_size - patch_vertical_overlap_px  # vertical step between rows
+
+    # -----------------------------
+    # Step 1) Fit within max box (no upscaling)
+    # -----------------------------
     scale_to_max_w = max_w / float(w)
     scale_to_max_h = max_h / float(h)
     s = min(scale_to_max_w, scale_to_max_h, 1.0)
 
     scaled_h = h * s
 
-    # --- Step 2: Ensure at least one patch in height. ---
-    if scaled_h < patch_wh:
-        s = patch_wh / float(h)
-        scaled_h = patch_wh  # by construction
+    # -----------------------------
+    # Step 2) Ensure at least one patch in height
+    # -----------------------------
+    if scaled_h < patch_size:
+        s = patch_size / float(h)
+        scaled_h = patch_size
 
-    # --- Step 3: Optional snapping to avoid a nearly-empty extra patch row. ---
-    # If scaled_h is between N*patch and (N + threshold)*patch, snap down to N*patch.
-    # We only do this for N >= 1 (already guaranteed by Step 2).
-    n_patches_h = int(math.floor(scaled_h / patch_wh))
-    if n_patches_h >= 1:
-        base_h = n_patches_h * patch_wh
-        extra = scaled_h - base_h  # in pixels
+    # -----------------------------
+    # Step 3) Snap down if we're just barely above ANY row boundary
+    #
+    # Boundaries: H = patch_size + k * stride_y
+    # If scaled_h is in (boundary, boundary + threshold], snap down to boundary.
+    # -----------------------------
+    if snap_extra_patch_row_threshold_px > 0:
+        if scaled_h > patch_size:
+            excess = scaled_h - patch_size
 
-        if extra > 0:
-            extra_fraction = extra / float(patch_wh)
-            if extra_fraction <= snap_extra_row_threshold:
-                target_h = base_h
-                s = target_h / float(h)
-                scaled_h = target_h
+            # k is the largest integer such that boundary(k) <= scaled_h
+            k = int(math.floor(excess / float(stride_y)))
+            boundary_h = patch_size + k * stride_y
+
+            extra_px = scaled_h - boundary_h
+            if 0.0 < extra_px <= float(snap_extra_patch_row_threshold_px):
+                scaled_h = boundary_h
+                s = scaled_h / float(h)
+
+    # -----------------------------
+    # Step 4) Cap patch rows (soft cap)
+    #
+    # Max height allowed for R rows: patch_size + (R - 1) * stride_y
+    # -----------------------------
+    if max_patch_rows is not None and max_patch_rows > 0:
+        max_allowed_h = patch_size + (max_patch_rows - 1) * stride_y
+        if scaled_h > max_allowed_h:
+            scaled_h = max_allowed_h
+            s = scaled_h / float(h)
 
     return s
 
-def _downscale_gray(gray: np.ndarray, max_w: int, max_h: int, patch_wh: int) -> np.ndarray:
+
+
+def _downscale_gray(gray: np.ndarray, max_w: int, max_h: int, patch_wh: int, patch_vertical_overlap_px: int, snap_extra_patch_row_threshold_px: int, max_patch_rows: int) -> np.ndarray:
     h, w = gray.shape[:2]
-    s = _compute_downscale(w, h, max_w, max_h, patch_wh)
+    s = _compute_downscale(w, h, max_w, max_h, patch_wh, patch_vertical_overlap_px, snap_extra_patch_row_threshold_px, max_patch_rows)
     if s >= 1.0:
         return gray
     new_w = max(1, int(w * s))
@@ -150,9 +184,9 @@ def _downscale_gray(gray: np.ndarray, max_w: int, max_h: int, patch_wh: int) -> 
     # INTER_AREA is best for downscaling continuous-tone grayscale
     return cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-def _downscale_binary(binary: np.ndarray, max_w: int, max_h: int, patch_wh: int) -> np.ndarray:
+def _downscale_binary(binary: np.ndarray, max_w: int, max_h: int, patch_wh: int, patch_vertical_overlap_px: int, snap_extra_patch_row_threshold_px: int, max_patch_rows: int) -> np.ndarray:
     h, w = binary.shape[:2]
-    s = _compute_downscale(w, h, max_w, max_h, patch_wh)
+    s = _compute_downscale(w, h, max_w, max_h, patch_wh, patch_vertical_overlap_px, snap_extra_patch_row_threshold_px, max_patch_rows)
     if s >= 1.0:
         return binary
     new_w = max(1, int(w * s))
@@ -340,7 +374,10 @@ def bytes_to_frame(
     max_height: int = 2048,
     patch_size: int = 512,
     linearize = True, # convert to linear rgb
-    normalize_background: bool = False
+    normalize_background: bool = False,
+    patch_vertical_overlap_px: int = 78,
+    snap_extra_patch_row_threshold_px: int = 78,
+    max_patch_rows: int = 2
 ) -> Tuple[np.ndarray, bool, int, int]:
     """
     Decode image bytes into a uint8 OpenCV frame (2D array),
@@ -413,7 +450,7 @@ def bytes_to_frame(
 
     # If already binary, preserve it and just downscale with nearest-neighbor
     if likely_binary:
-        binary = _downscale_binary(gray, max_width, max_height, patch_size)
+        binary = _downscale_binary(gray, max_width, max_height, patch_size, patch_vertical_overlap_px, snap_extra_patch_row_threshold_px, max_patch_rows)
         # Enforce exactly {0,255}
         if binary.max() == 1:
             binary = (binary * 255).astype(np.uint8, copy=False)
@@ -423,7 +460,7 @@ def bytes_to_frame(
         gray = _srgb_u8_to_linear_u8(gray)
 
     # Downscale before adaptive threshold (big speed win)
-    gray = _downscale_gray(gray, max_width, max_height, patch_size)
+    gray = _downscale_gray(gray, max_width, max_height, patch_size, patch_vertical_overlap_px, snap_extra_patch_row_threshold_px, max_patch_rows)
 
     if normalize_background:
         gray = _normalize_background_u8(gray)

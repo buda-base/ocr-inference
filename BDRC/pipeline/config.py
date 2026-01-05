@@ -27,6 +27,7 @@ class PipelineConfig:
     max_q_gpu_pass_2_to_post_processor: int = 128
     max_q_post_processor_to_writer: int = 256
 
+
     # CPU decode threads
     decode_threads: int = 8
 
@@ -45,7 +46,11 @@ class PipelineConfig:
     # Decoder
     frame_max_width = 4096
     frame_max_height = 2048
-    linearize = True
+    patch_size = 512
+    patch_vertical_overlap_px = 78 # about 15%
+    snap_extra_patch_row_threshold_px = 78 # if a patch row would only have h=78px, downscale to remove the patch row
+    max_patch_rows = 2 # resize so it fits into two patch rows (considering vertical overlap)
+    linearize = True # remove gamma from jpeg encoding, should improve binarization
     normalize_background = False
 
     # LDTransform
