@@ -58,14 +58,14 @@ class S3ParquetWriter:
     def __init__(
         self,
         cfg,
-        q_in: asyncio.Queue,
+        q_post_processor_to_writer: asyncio.Queue,
         parquet_uri: str,
         errors_jsonl_uri: Optional[str] = None,
         flush_every: int = 4096,
         max_error_message_len: int = 128,
     ):
         self.cfg = cfg
-        self.q_in = q_in
+        self.q_post_processor_to_writer = q_post_processor_to_writer
         self.parquet_uri = parquet_uri
         self.errors_jsonl_uri = errors_jsonl_uri or (parquet_uri + ".errors.jsonl")
         self.flush_every = flush_every
@@ -207,7 +207,7 @@ class S3ParquetWriter:
         # If pyarrow is absent, we still drain the queue to keep pipeline behavior consistent.
         # (Useful for unit tests / environments without optional deps.)
         while True:
-            msg = await self.q_in.get()
+            msg = await self.q_post_processor_to_writer.get()
 
             if isinstance(msg, EndOfStream):
                 break

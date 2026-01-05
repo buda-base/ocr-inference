@@ -56,7 +56,7 @@ The GpuBatches uses pytorch to do data transformation:
 
 It builds micro‑batches of N (or less) 512×512 patches on GPU and runs the model on these.
 
-### LDTransformController
+### LDPostProcessor
 
 - **input:** InferredFrame(img_filename, s3_etag, frame, is_binary, line_mask, first_pass, rotation_angle, tps_points)
 - **output:** 2 options:

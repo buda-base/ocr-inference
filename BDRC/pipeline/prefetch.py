@@ -9,15 +9,15 @@ class Prefetcher:
     """Async S3 reader.
 
     Input: iterable of ImageTask
-    Output: puts FetchedBytesMsg onto q_bytes
+    Output: puts FetchedBytesMsg onto q_prefetcher_to_decoder
     Respects both global and per-worker concurrency caps.
     """
 
-    def __init__(self, cfg, s3ctx, keys: Iterable[ImageTask], q_bytes: asyncio.Queue[FetchedBytesMsg]):
+    def __init__(self, cfg, s3ctx, keys: Iterable[ImageTask], q_prefetcher_to_decoder: asyncio.Queue[FetchedBytesMsg]):
         self.cfg = cfg
         self.s3 = s3ctx
         self.keys = list(keys)
-        self.q_bytes = q_bytes
+        self.q_prefetcher_to_decoder = q_prefetcher_to_decoder
 
     async def _fetch_one(self, s3c, task: ImageTask) -> FetchedBytesMsg:
         attempt = 1
@@ -72,7 +72,7 @@ class Prefetcher:
                         work_q.task_done()
                         return
                     msg = await self._fetch_one(s3c, task)
-                    await self.q_bytes.put(msg)
+                    await self.q_prefetcher_to_decoder.put(msg)
                     work_q.task_done()
 
             workers = [asyncio.create_task(worker()) for _ in range(n_workers)]
@@ -84,7 +84,7 @@ class Prefetcher:
                 await w
 
         # End-of-stream marker for the (single) decoder consumer coroutine
-        await self.q_bytes.put(EndOfStream(stream="prefetched", producer="Prefetcher"))
+        await self.q_prefetcher_to_decoder.put(EndOfStream(stream="prefetched", producer="Prefetcher"))
 
 
 def normalize_etag(etag: str) -> str:

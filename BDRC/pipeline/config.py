@@ -20,11 +20,12 @@ class PipelineConfig:
     s3_get_timeout_s: int = 60
 
     # Queues (bounded)
-    max_q_bytes: int = 256
-    max_q_frames: int = 128
-    max_q_firstpass: int = 256
-    max_q_reprocess: int = 64
-    max_q_records: int = 256
+    max_q_prefetcher_to_decoder: int = 256
+    max_q_decoder_to_gpu_pass_1: int = 128
+    max_q_gpu_pass_1_to_post_processor: int = 256
+    max_q_post_processor_to_gpu_pass_2: int = 64
+    max_q_gpu_pass_2_to_post_processor: int = 128
+    max_q_post_processor_to_writer: int = 256
 
     # CPU decode threads
     decode_threads: int = 8

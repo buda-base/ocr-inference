@@ -17,14 +17,14 @@ class LDGpuBatcher:
     def __init__(
         self,
         cfg,
-        q_frames_initial: asyncio.Queue,
-        q_frames_reprocess: asyncio.Queue,
+        q_decoder_to_gpu_pass_1: asyncio.Queue,
+        q_post_processor_to_gpu_pass_2: asyncio.Queue,
         q_first: asyncio.Queue,
         q_second: asyncio.Queue,
     ):
         self.cfg = cfg
-        self.q_init = q_frames_initial
-        self.q_re = q_frames_reprocess
+        self.q_init = q_decoder_to_gpu_pass_1
+        self.q_re = q_post_processor_to_gpu_pass_2
         self.q_first = q_first
         self.q_second = q_second
 
@@ -54,7 +54,7 @@ class LDGpuBatcher:
 
             took = False
 
-            # --- prefer reprocess lane (from LDTransformController) ---
+            # --- prefer reprocess lane (from LDPostProcessor) ---
             if not self._re_done:
                 for _ in range(reprocess_budget):
                     msg = await self._pop_one(self.q_re, self.cfg.batch_timeout_ms / 1000.0)

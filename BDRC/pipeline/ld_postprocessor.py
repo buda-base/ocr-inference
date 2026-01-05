@@ -8,16 +8,16 @@ import cv2
 import numpy as np
 import numpy.typing as npt
 
-class LDTransformController:
+class LDPostProcessor:
     """
     Consumes InferredFrame from GPU pass 1 and pass 2, decides rotation/TPS, routes.
 
     Inputs:
-      - q_first_results:  InferredFrameMsg (gpu_pass_1)
-      - q_second_results: InferredFrameMsg (gpu_pass_2)
+      - q_gpu_pass_1_to_post_processor:  InferredFrameMsg (gpu_pass_1)
+      - q_gpu_pass_2_to_post_processor: InferredFrameMsg (gpu_pass_2)
     Outputs:
-      - q_reprocess_frames: DecodedFrameMsg (decoded stream)
-      - q_records: RecordMsg (record stream)
+      - q_post_processor_to_gpu_pass_2: DecodedFrameMsg (decoded stream)
+      - q_post_processor_to_writer: RecordMsg (record stream)
 
     Records are produced ONLY here (per your note).
     """
@@ -25,16 +25,16 @@ class LDTransformController:
     def __init__(
         self,
         cfg,
-        q_first_results: asyncio.Queue,
-        q_second_results: asyncio.Queue,
-        q_reprocess_frames: asyncio.Queue,
-        q_records: asyncio.Queue,
+        q_gpu_pass_1_to_post_processor: asyncio.Queue,
+        q_gpu_pass_2_to_post_processor: asyncio.Queue,
+        q_post_processor_to_gpu_pass_2: asyncio.Queue,
+        q_post_processor_to_writer: asyncio.Queue,
     ):
         self.cfg = cfg
-        self.q_first = q_first_results # results of the first GPU pass
-        self.q_second = q_second_results # results of the second GPU pass
-        self.q_reprocess_frames = q_reprocess_frames
-        self.q_records = q_records
+        self.q_first = q_gpu_pass_1_to_post_processor
+        self.q_second = q_gpu_pass_2_to_post_processor
+        self.q_post_processor_to_gpu_pass_2 = q_post_processor_to_gpu_pass_2
+        self.q_post_processor_to_writer = q_post_processor_to_writer
 
         self._p1_done = False
         self._p2_done = False
@@ -54,7 +54,7 @@ class LDTransformController:
         while True:
             # Terminate only after both GPU streams have ended.
             if self._p1_done and self._p2_done:
-                await self.q_records.put(EndOfStream(stream="record", producer="LDTransformController"))
+                await self.q_post_processor_to_writer.put(EndOfStream(stream="record", producer="LDPostProcessor"))
                 return
 
             took = False
@@ -72,7 +72,7 @@ class LDTransformController:
                         break
 
                     if isinstance(msg, PipelineError):
-                        await self.q_records.put(msg)
+                        await self.q_post_processor_to_writer.put(msg)
                         continue
 
                     frame: InferredFrame = msg
@@ -92,13 +92,13 @@ class LDTransformController:
                     if isinstance(msg, EndOfStream) and msg.stream == "gpu_pass_1":
                         self._p1_done = True
                         # No more pass1 frames => no more reprocess frames will be generated.
-                        await self.q_reprocess_frames.put(
-                            EndOfStream(stream="transformed_pass_1", producer="LDTransformController")
+                        await self.q_post_processor_to_gpu_pass_2.put(
+                            EndOfStream(stream="transformed_pass_1", producer="LDPostProcessor")
                         )
                         break
 
                     if isinstance(msg, PipelineError):
-                        await self.q_records.put(msg)
+                        await self.q_post_processor_to_writer.put(msg)
                         continue
 
                     frame: InferredFrame = msg
@@ -131,19 +131,18 @@ class LDTransformController:
 
         # 4. either finalize or enqueue reprocess decoded frame
         if tps_data is None and rotation_angle == 0.0:
+            # TODO: scale contours to original image dimensions (frame.orig_h, frame.orig_w)
             contours_bboxes = get_contour_bboxes(contours)
             rec = Record(
                 task=frame.task,
                 s3_etag=frame.s3_etag,
-                resized_w=w,
-                resized_h=h,
                 rotation_angle=None,
                 tps_data=None,
                 contours=contours,
                 nb_contours=len(contours),
                 contours_bboxes=contours_bboxes,
             )
-            await self.q_records.put(rec)
+            await self.q_post_processor_to_writer.put(rec)
             return
 
         input_pts = output_pts = None
@@ -153,11 +152,13 @@ class LDTransformController:
             alpha = self.cfg.tps_alpha
 
         transformed_frame = apply_transform_1(frame.frame, rotation_angle, input_pts, output_pts, alpha)
-        await self.q_reprocess_frames.put(
+        await self.q_post_processor_to_gpu_pass_2.put(
             DecodedFrame(
                 task=frame.task,
                 s3_etag=frame.s3_etag,
                 frame=transformed_frame,
+                orig_w=frame.orig_w,
+                orig_h=frame.orig_h,
                 is_binary=False,
                 first_pass=False,
                 rotation_angle=rotation_angle,
@@ -168,20 +169,20 @@ class LDTransformController:
     async def _finalize_record(self, frame: InferredFrame) -> None:
         # Cheap pass2 finalization: just contours
         contours = get_filtered_contours(frame.line_mask)
+        # TODO: scale contours to original image dimensions (frame.orig_h, frame.orig_w)
+        # TODO: scale tps_data to original image dimensions
         contours_bboxes = get_contour_bboxes(contours)
         h, w = frame.line_mask.shape
         rec = Record(
             task=frame.task,
             s3_etag=frame.s3_etag,
-            resized_w=w,
-            resized_h=h,
             rotation_angle=rotation_angle,
             tps_data=tps_data,
             contours=contours,
             nb_contours=len(contours),
             contours_bboxes=contours_bboxes,
         )
-        await self.q_records.put(rec)
+        await self.q_post_processor_to_writer.put(rec)
 
 
 # -----------------------------

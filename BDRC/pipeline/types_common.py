@@ -37,6 +37,8 @@ class DecodedFrame:
     task: ImageTask
     s3_etag: str
     frame: Any # grayscale H, W, uint8
+    orig_h: int
+    orig_w: int
     is_binary: bool # if the value space is {0, 255}
     first_pass: bool # if it's a first pass for an image
     rotation_angle: Optional[float] # if in the second pass, value of the rotation angle in degrees that was applied after first pass, null if first pass
@@ -49,6 +51,8 @@ class InferredFrame:
     task: ImageTask
     s3_etag: str
     frame: Any
+    orig_h: int
+    orig_w: int
     is_binary: bool
     first_pass: bool
     rotation_angle: Optional[float]
@@ -61,20 +65,18 @@ class Record:
     """
     task: ImageTask
     s3_etag: str
-    resized_w: int # from frame
-    resized_h: int
     rotation_angle: float
-    tps_data: Any
-    contours: Any
+    tps_data: Any # should be scaled to original image dimension
+    contours: Any # NDArray of (x,y) points, contours of line segments (not final merged lines), scaled to original image dimensions
     nb_contours: int
-    contours_bboxes: Any
+    contours_bboxes: Any # bboxes (x, y, w, h) of the contours, scaled to original image dimensions
 
 # --- Error envelope ---------------------------------------------------------
 
 @dataclass(frozen=True)
 class PipelineError:
     """Error message that can flow through queues."""
-    stage: Literal["Prefetcher", "Decoder", "LDGpuBatcher", "LDTransformController", "S3ParquetWriter"]
+    stage: Literal["Prefetcher", "Decoder", "LDGpuBatcher", "LDPostProcessor", "S3ParquetWriter"]
     task: ImageTask
     s3_etag: Optional[str]
     error_type: str
