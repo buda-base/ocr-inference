@@ -13,10 +13,10 @@ class Prefetcher:
     Respects both global and per-worker concurrency caps.
     """
 
-    def __init__(self, cfg, s3ctx, keys: Iterable[ImageTask], q_prefetcher_to_decoder: asyncio.Queue[FetchedBytesMsg]):
+    def __init__(self, cfg, s3ctx, tasks: Iterable[ImageTask], q_prefetcher_to_decoder: asyncio.Queue[FetchedBytesMsg]):
         self.cfg = cfg
         self.s3 = s3ctx
-        self.keys = list(keys)
+        self.tasks = list(tasks)
         self.q_prefetcher_to_decoder = q_prefetcher_to_decoder
 
     async def _fetch_one(self, s3c, task: ImageTask) -> FetchedBytesMsg:
@@ -58,11 +58,11 @@ class Prefetcher:
         self._per_worker_sem = asyncio.Semaphore(self.cfg.s3_inflight_per_worker)
 
         work_q: asyncio.Queue[Optional[ImageTask]] = asyncio.Queue()
-        for t in self.keys:
+        for t in self.tasks:
             work_q.put_nowait(t)
 
         # Number of async workers pulling tasks; derived for simplicity.
-        n_workers = min(len(self.keys), max(1, self.cfg.s3_inflight_per_worker))
+        n_workers = min(len(self.tasks), max(1, self.cfg.s3_inflight_per_worker))
 
         async with self.s3.client() as s3c:
             async def worker() -> None:

@@ -107,12 +107,12 @@ class LDPostProcessor:
             if not took:
                 await asyncio.sleep(0)
 
-    async def _handle_pass1(self, frame: InferredFrame) -> None:
+    async def _handle_pass1(self, inf_frame: InferredFrame) -> None:
         # 1. detect contours
-        contours = get_filtered_contours(frame.line_mask)
+        contours = get_filtered_contours(inf_frame.line_mask)
 
         # 2. rotation angle
-        h, w = frame.line_mask.shape
+        h, w = inf_frame.line_mask.shape
         rotation_angle = get_rotation_angle(
             contours, h, w,
             max_angle_deg=self.cfg.max_angle_deg,
@@ -129,13 +129,13 @@ class LDPostProcessor:
             add_corners=self.cfg.add_corners,
         )
 
-        # 4. either finalize or enqueue reprocess decoded frame
+        # 4. either finalize or enqueue decoded frame to reprocess
         if tps_data is None and rotation_angle == 0.0:
-            # TODO: scale contours to original image dimensions (frame.orig_h, frame.orig_w)
+            # TODO: scale contours to original image dimensions (inf_frame.orig_h, inf_frame.orig_w)
             contours_bboxes = get_contour_bboxes(contours)
             rec = Record(
-                task=frame.task,
-                s3_etag=frame.s3_etag,
+                task=inf_frame.task,
+                s3_etag=inf_frame.s3_etag,
                 rotation_angle=None,
                 tps_data=None,
                 contours=contours,
@@ -151,33 +151,33 @@ class LDPostProcessor:
             input_pts, output_pts = tps_data
             alpha = self.cfg.tps_alpha
 
-        transformed_frame = apply_transform_1(frame.frame, rotation_angle, input_pts, output_pts, alpha)
+        transformed_frame = apply_transform_1(inf_frame.frame, rotation_angle, input_pts, output_pts, alpha)
         await self.q_post_processor_to_gpu_pass_2.put(
             DecodedFrame(
-                task=frame.task,
-                s3_etag=frame.s3_etag,
+                task=inf_frame.task,
+                s3_etag=inf_frame.s3_etag,
                 frame=transformed_frame,
-                orig_w=frame.orig_w,
-                orig_h=frame.orig_h,
-                is_binary=False,
+                orig_w=inf_frame.orig_w,
+                orig_h=inf_frame.orig_h,
+                is_binary=False, # we don't map to binary after processing binary images
                 first_pass=False,
                 rotation_angle=rotation_angle,
                 tps_data=(input_pts, output_pts, alpha),
             )
         )
 
-    async def _finalize_record(self, frame: InferredFrame) -> None:
+    async def _finalize_record(self, inf_frame: InferredFrame) -> None:
         # Cheap pass2 finalization: just contours
-        contours = get_filtered_contours(frame.line_mask)
+        contours = get_filtered_contours(inf_frame.line_mask)
         # TODO: scale contours to original image dimensions (frame.orig_h, frame.orig_w)
         # TODO: scale tps_data to original image dimensions
         contours_bboxes = get_contour_bboxes(contours)
-        h, w = frame.line_mask.shape
+        h, w = inf_frame.line_mask.shape[:2]
         rec = Record(
-            task=frame.task,
-            s3_etag=frame.s3_etag,
-            rotation_angle=rotation_angle,
-            tps_data=tps_data,
+            task=inf_frame.task,
+            s3_etag=inf_frame.s3_etag,
+            rotation_angle=inf_frame.rotation_angle,
+            tps_data=inf_frame.tps_data,
             contours=contours,
             nb_contours=len(contours),
             contours_bboxes=contours_bboxes,
@@ -535,8 +535,8 @@ def _get_global_center_from_slice(slice_image_2d: npt.NDArray[np.uint8], start_x
     areas = [cv2.contourArea(c) for c in contours]
     biggest = contours[int(np.argmax(areas))]
     _, _, _, bh = cv2.boundingRect(biggest)
-    (cx, cy), _, _ = cv2.minAreaRect(biggest)
-    return start_x + int(cx), bbox_y + int(cy), int(bh)
+    (cx_f, cy_f), _, _ = cv2.minAreaRect(biggest)
+    return start_x + int(cx_f), bbox_y + int(cy_f), int(bh)
 
 
 def _check_line_tps_legacy(
@@ -628,7 +628,7 @@ def get_tps_points(
     max_missing_windows: int = TPS_MAX_MISSING_WINDOWS_DEFAULT,
     alpha: float = TPS_ALPHA_DEFAULT,
     add_corners: bool = True,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
     """
     Returns TPS control points (input_pts, output_pts) in float64 or None if no TPS correction needed.
 
@@ -678,8 +678,8 @@ def get_tps_points(
     if input_pts is None or output_pts is None:
         return None
 
-    input_pts = np.asarray(input_pts, dtype=np.float64)
-    output_pts = np.asarray(output_pts, dtype=np.float64)
+    input_pts_np = np.asarray(input_pts, dtype=np.float64)
+    output_pts_np = np.asarray(output_pts, dtype=np.float64)
 
     if add_corners:
         corners = np.array(
@@ -691,8 +691,8 @@ def get_tps_points(
             ],
             dtype=np.float64,
         )
-        input_pts = np.concatenate([input_pts, corners], axis=0)
-        output_pts = np.concatenate([output_pts, corners], axis=0)
+        input_pts_np = np.ascontiguousarray(np.concatenate([input_pts_np, corners], axis=0))
+        output_pts_np = np.ascontiguousarray(np.concatenate([output_pts_np, corners], axis=0))
 
     # points are [y,x], corners already included
-    return (input_pts, output_pts)
+    return (input_pts_np, output_pts_np)

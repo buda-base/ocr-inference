@@ -19,7 +19,7 @@ class EndOfStream:
 class ImageTask:
     """Input descriptor for the prefetcher.
     """
-    s3_key: str
+    s3_key: Optional[str]
     img_filename: str
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class FetchedBytes:
     """Input descriptor for the decoder.
     """
     task: ImageTask
-    s3_etag: str
+    s3_etag: Optional[str]
     file_bytes: bytes
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ class DecodedFrame:
     """Output of the decode stage and transform stage
     """
     task: ImageTask
-    s3_etag: str
+    s3_etag: Optional[str]
     frame: Any # grayscale H, W, uint8
     orig_h: int
     orig_w: int
@@ -49,7 +49,7 @@ class InferredFrame:
     """Output of the inference stage.
     """
     task: ImageTask
-    s3_etag: str
+    s3_etag: Optional[str]
     frame: Any
     orig_h: int
     orig_w: int
@@ -64,12 +64,12 @@ class Record:
     """input for the Parquet writer, output of the transform stage
     """
     task: ImageTask
-    s3_etag: str
-    rotation_angle: float
-    tps_data: Any # should be scaled to original image dimension
-    contours: Any # NDArray of (x,y) points, contours of line segments (not final merged lines), scaled to original image dimensions
+    s3_etag: Optional[str]
+    rotation_angle: Optional[float]
+    tps_data: Optional[Any] # should be scaled to original image dimension
+    contours: Optional[Any] # NDArray of (x,y) points, contours of line segments (not final merged lines), scaled to original image dimensions
     nb_contours: int
-    contours_bboxes: Any # bboxes (x, y, w, h) of the contours, scaled to original image dimensions
+    contours_bboxes: Optional[Any] # bboxes (x, y, w, h) of the contours, scaled to original image dimensions
 
 # --- Error envelope ---------------------------------------------------------
 

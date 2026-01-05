@@ -63,19 +63,6 @@ def _apply_tps_1(img: npt.NDArray[np.uint8], input_pts, output_pts, alpha=DEFAUL
     input_pts = np.asarray(input_pts, dtype=np.float64)
     output_pts = np.asarray(output_pts, dtype=np.float64)
 
-    if add_corners:
-        corners = np.array(
-            [
-                [0.0, 0.0],
-                [0.0, float(w - 1)],
-                [float(h - 1), 0.0],
-                [float(h - 1), float(w - 1)],
-            ],
-            dtype=np.float64,
-        )
-        input_pts = np.concatenate([input_pts, corners], axis=0)
-        output_pts = np.concatenate([output_pts, corners], axis=0)
-
     tps = ThinPlateSpline(alpha)
     tps.fit(input_pts, output_pts)
 
@@ -163,7 +150,7 @@ def adaptive_binarize(gray: np.ndarray, block_size = 31, c = 15) -> np.ndarray:
     #   block_size ≈ 14–20 × stroke_width (must be odd)
     #   c ≈ 1.5–2.5 × stroke_width (if background-normalized, use the low end)
     if gray.ndim != 2 or gray.dtype != np.uint8:
-        raise ImageDecodeError("Adaptive binarization requires grayscale uint8")
+        raise ValueError("Adaptive binarization requires grayscale uint8")
     # block_size must be odd and >= 3
     if block_size < 3:
         block_size = 3

@@ -328,8 +328,9 @@ def _normalize_background_u8(
     #norm = cv2.divide(f, bg + 1e-6)
     norm = cv2.subtract(f, bg)  # stays float32
 
-    # Normalize to uint8 directly (no extra astype)
-    return cv2.normalize(norm, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    # Normalize to uint8
+    dst = np.empty(norm.shape, dtype=np.uint8)
+    return cv2.normalize(norm, dst, 0, 255, cv2.NORM_MINMAX)
 
 def bytes_to_frame(
     filename: str,
@@ -339,8 +340,8 @@ def bytes_to_frame(
     max_height: int = 2048,
     patch_size: int = 512,
     linearize = True, # convert to linear rgb
-    normalize_background: False
-) -> np.ndarray:
+    normalize_background: bool = False
+) -> Tuple[np.ndarray, bool, int, int]:
     """
     Decode image bytes into a uint8 OpenCV frame (2D array),
     downscaled to fit within (max_width, max_height).

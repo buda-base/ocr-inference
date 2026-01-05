@@ -101,7 +101,7 @@ class LDGpuBatcher:
 
     async def _flush(self):
         # in case there's some tiles left in the batch, execute the batch
-        pass
+        return
 
     async def _infer_and_summarize(self, msg: DecodedFrame, second_pass=False) -> InferredFrame:
         # GPU stuff goes here
@@ -114,4 +114,4 @@ class LDGpuBatcher:
         # untile results
         # get line mask
         # package line mask in InferredFrame
-        pass
+        return

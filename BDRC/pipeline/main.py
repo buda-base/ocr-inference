@@ -26,9 +26,9 @@ async def main():
     global_sem = asyncio.Semaphore(cfg.s3_max_inflight_global)
     s3ctx = S3Context(cfg, global_sem)
 
-    workers = [VolumeWorker(cfg, s3ctx, vid, tasks) for vid, tasks in volumes.items()]
+    workers = [LDVolumeWorker(cfg, s3ctx, vid, tasks) for vid, tasks in volumes.items()]
 
-    async def run_worker(w: VolumeWorker):
+    async def run_worker(w: LDVolumeWorker):
         try:
             await w.run()
         except Exception as e:

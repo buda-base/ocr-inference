@@ -113,8 +113,6 @@ class S3ParquetWriter:
             "error_message": None,
             "error_id": None,
             # Record fields
-            "resized_w": rec.resized_w,
-            "resized_h": rec.resized_h,
             "rotation_angle": rec.rotation_angle,
             "tps_data": rec.tps_data,
             "contours": rec.contours,
@@ -136,8 +134,6 @@ class S3ParquetWriter:
             "error_type": err.error_type,
             "error_message": _truncate(err.message, self.max_error_message_len),
             # Feature fields are null for error rows
-            "resized_w": None,
-            "resized_h": None,
             "rotation_angle": None,
             "tps_data": None,
             "contours": None,
