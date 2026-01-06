@@ -929,7 +929,7 @@ def pad_to_multiple(img: torch.Tensor, patch_size=512, value=255):
     return img, pad_w, pad_h
 
 
-def tile_image(img: torch.Tensor, patch_size=512):
+def tile_timage(img: torch.Tensor, patch_size=512):
     C, H, W = img.shape
     y_steps = H // patch_size
     x_steps = W // patch_size
@@ -1051,7 +1051,7 @@ def multi_image_collate_fn(batch):
         img, sx, sy = resize_clamp(img)
         img, pad_x, pad_y = pad_to_multiple(img)
 
-        tiles, x_steps, y_steps = tile_image(img)
+        tiles, x_steps, y_steps = tile_timage(img)
         tiles = tiles.float().div_(255.0)
 
         n_tiles = tiles.shape[0]
