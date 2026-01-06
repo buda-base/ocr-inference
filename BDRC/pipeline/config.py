@@ -36,6 +36,12 @@ class PipelineConfig:
     batch_size: int = 16
     batch_timeout_ms: int = 25
     cuda_streams: int = 2
+    binarize_block_size: int = 31
+    binarize_c: int = 15
+    batch_type: str = "tiles" # "tiles" for batching tiles, "images" for batching on images
+    image_batch_n: int = 1 # number of images in an image batch (relevant only if batch_type == "images")
+    tiles_batch_n: int = 16 # number of tiles / patches in an tile batch (relevant only if batch_type == "tiles")
+    class_threshold: float = 0.9
 
     # Output
     parquet_compression: str = "zstd"
@@ -48,6 +54,7 @@ class PipelineConfig:
     frame_max_height = 2048
     patch_size = 512
     patch_vertical_overlap_px = 78 # about 15%
+    patch_horizontal_overlap_px = 0
     snap_extra_patch_row_threshold_px = 78 # if a patch row would only have h=78px, downscale to remove the patch row
     max_patch_rows = 2 # resize so it fits into two patch rows (considering vertical overlap)
     linearize = True # remove gamma from jpeg encoding, should improve binarization

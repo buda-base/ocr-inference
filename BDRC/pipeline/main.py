@@ -19,8 +19,8 @@ async def main():
 
     # Dummy manifest with two volumes of ~600 each
     volumes = {
-        "vol_A": [ImageTask(key=f"vol_A/img_{i:05d}.jpg", etag="etagA", size=None, volume_id="vol_A") for i in range(600)],
-        "vol_B": [ImageTask(key=f"vol_B/img_{i:05d}.jpg", etag="etagB", size=None, volume_id="vol_B") for i in range(600)],
+        "vol_A": [ImageTask(key=f"vol_A/img_{i:05d}.jpg", filename="") for i in range(600)],
+        "vol_B": [ImageTask(key=f"vol_B/img_{i:05d}.jpg", filename="") for i in range(600)],
     }
 
     global_sem = asyncio.Semaphore(cfg.s3_max_inflight_global)
