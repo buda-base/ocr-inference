@@ -136,7 +136,7 @@ class LDPostProcessor:
             contours_bboxes = get_contour_bboxes(contours)
             rec = Record(
                 task=inf_frame.task,
-                s3_etag=inf_frame.s3_etag,
+                source_etag=inf_frame.source_etag,
                 rotation_angle=None,
                 tps_data=None,
                 contours=contours,
@@ -156,7 +156,7 @@ class LDPostProcessor:
         await self.q_post_processor_to_gpu_pass_2.put(
             DecodedFrame(
                 task=inf_frame.task,
-                s3_etag=inf_frame.s3_etag,
+                source_etag=inf_frame.source_etag,
                 frame=transformed_frame,
                 orig_w=inf_frame.orig_w,
                 orig_h=inf_frame.orig_h,
@@ -181,7 +181,7 @@ class LDPostProcessor:
         h, w = inf_frame.line_mask.shape[:2]
         rec = Record(
             task=inf_frame.task,
-            s3_etag=inf_frame.s3_etag,
+            source_etag=inf_frame.source_etag,
             rotation_angle=inf_frame.rotation_angle,
             tps_data=tps_data,
             contours=contours,

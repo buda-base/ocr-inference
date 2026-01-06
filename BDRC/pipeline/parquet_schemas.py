@@ -18,9 +18,7 @@ def ld_build_schema():
     bboxes = pa.list_(bbox_struct)
     schema = pa.schema([
         ("img_file_name", pa.string()),
-        ("img_s3_etag", pa.string()),
-        ("resized_w", pa.int32()),
-        ("resized_h", pa.int32()),
+        ("source_etag", pa.string()),
         ("rotation_angle", pa.float32()),
         ("tps_points", pt),
         ("tps_alpha", pa.float16()),

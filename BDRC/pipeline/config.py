@@ -16,7 +16,7 @@ class PipelineConfig:
     s3_region: str = "us-east-1"
     aws_profile: str = "default"
     s3_max_inflight_global: int = 256   # GLOBAL cap across all workers
-    s3_inflight_per_worker: int = 32    # per-worker GET concurrency
+    inflight_per_worker: int = 32       # per-worker S3 GET concurrency or local concurrency
     s3_get_timeout_s: int = 60
 
     # Queues (bounded)

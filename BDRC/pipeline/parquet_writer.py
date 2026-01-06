@@ -12,6 +12,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.fs as pafs
 
+from urllib.parse import urlparse, unquote
+from pathlib import Path
+
 
 def _truncate(s: Optional[str], max_len: int) -> Optional[str]:
     if s is None:
@@ -24,24 +27,30 @@ def _truncate(s: Optional[str], max_len: int) -> Optional[str]:
 def _open_filesystem_and_path(uri: str, cfg) -> tuple[Any, str]:
     """
     Returns (filesystem, path_within_fs) for a given uri.
-    Supports s3://... and local paths.
+    Supports s3://..., file://..., and plain local paths.
     """
     if pafs is None:
         return None, uri
 
     if uri.startswith("s3://"):
-        # Parse s3://bucket/key...
-        # Use pyarrow's S3FileSystem (credentials from env/instance role/profile depending on setup).
         fs = pafs.S3FileSystem(region=getattr(cfg, "s3_region", None))
-        path = uri[len("s3://") :]
+        path = uri[len("s3://"):]
         return fs, path
 
-    # Local filesystem path
+    # file:// URI
+    if uri.startswith("file://"):
+        u = urlparse(uri)
+        # percent-decoding + normalize to local OS path
+        local_path = unquote(u.path)
+        fs = pafs.LocalFileSystem()
+        return fs, local_path
+
+    # Plain local path
     fs = pafs.LocalFileSystem()
     return fs, uri
 
 
-class S3ParquetWriter:
+class ParquetWriter:
     """
     Writes a *single* Parquet file and a JSONL error sidecar.
 
@@ -106,7 +115,7 @@ class S3ParquetWriter:
         # Identity + ok/error summary
         row = {
             "img_file_name": rec.task.img_filename,
-            "img_s3_etag": rec.s3_etag,
+            "source_etag": rec.source_etag,
             "ok": True,
             "error_stage": None,
             "error_type": None,
@@ -128,7 +137,7 @@ class S3ParquetWriter:
 
         row = {
             "img_file_name": img_file_name,
-            "img_s3_etag": getattr(err, "s3_etag", None),
+            "img_source_etag": getattr(err, "source_etag", None),
             "ok": False,
             "error_stage": err.stage,
             "error_type": err.error_type,
@@ -150,22 +159,16 @@ class S3ParquetWriter:
 
         # Prefer a stable schema: explicit keys + safe string fields.
         payload = {
-            "img_s3_etag": getattr(err, "s3_etag", None),
+            "source_uri": err.task.source_uri,
+            "img_filename": err.task.img_filename,
+            "source_etag": err.source_etag,
             "stage": err.stage,
             "error_type": err.error_type,
             "message": err.message,
             "traceback": getattr(err, "traceback", None),
             "retryable": getattr(err, "retryable", False),
             "attempt": getattr(err, "attempt", 1),
-            "task": None,
-            "s3_etag": err.s3_etag,
         }
-        if err.task is not None:
-            payload["task"] = {
-                "s3_key": getattr(err.task, "s3_key", None),
-                "img_filename": getattr(err.task, "img_filename", None),
-            }
-
         line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         self._error_fh.write(line)
 

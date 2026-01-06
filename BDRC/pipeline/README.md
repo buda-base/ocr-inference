@@ -25,14 +25,14 @@ S3 → Prefetcher (async) → Decoder (thread pool) → LD GPU Batcher (async; t
 ### Prefetcher
 
 - **input:** ImageTask(s3_key, img_filename)
-- **output:** FetchedBytes(img_filename, s3_etag, bytes)
+- **output:** FetchedBytes(img_filename, source_etag, bytes)
 
 Fetches bytes on s3 asynchronously, keeps the ETag returned in the s3 GET.
 
 ### Decoder
 
-- **input:** FetchedBytes(img_filename, s3_etag, bytes)
-- **output:** DecodedFrame(img_filename, s3_etag, frame, is_binary, first_pass=true, rotation=0, tps_points=null)
+- **input:** FetchedBytes(img_filename, source_etag, bytes)
+- **output:** DecodedFrame(img_filename, source_etag, frame, is_binary, first_pass=true, rotation=0, tps_points=null)
 
 where:
 - `frame` is a grayscale uint8 cv2 image resized to max_width, max_height coming from the pipeline configuration
@@ -42,8 +42,8 @@ Decodes the bytes from s3 into a grayscale image in a thread pool.
 
 ### LDGpuBatcher
 
-- **input:** DecodedFrame(img_filename, s3_etag, frame, is_binary, first_pass=true, rotation_angle=null, tps_points=null)
-- **output:** InferredFrame(img_filename, s3_etag, frame, is_binary, line_mask, first_pass, rotation_angle, tps_points)
+- **input:** DecodedFrame(img_filename, source_etag, frame, is_binary, first_pass=true, rotation_angle=null, tps_points=null)
+- **output:** InferredFrame(img_filename, source_etag, frame, is_binary, line_mask, first_pass, rotation_angle, tps_points)
 
 where line_mask is a binarized ({0,255}) uint8 frame of the same size as frame.
 
@@ -58,10 +58,10 @@ It builds micro‑batches of N (or less) 512×512 patches on GPU and runs the mo
 
 ### LDPostProcessor
 
-- **input:** InferredFrame(img_filename, s3_etag, frame, is_binary, line_mask, first_pass, rotation_angle, tps_points)
+- **input:** InferredFrame(img_filename, source_etag, frame, is_binary, line_mask, first_pass, rotation_angle, tps_points)
 - **output:** 2 options:
-   * LDRecord(img_filename, s3_etag, frame_w, frame_h, contours, nb_contours, contours_bboxes, rotation_angle=0, tps_points=null)
-   * DecodedFrame(img_filename, s3_etag, frame, is_binary, first_pass=false, rotation_angle, tps_points)
+   * LDRecord(img_filename, source_etag, frame_w, frame_h, contours, nb_contours, contours_bboxes, rotation_angle=0, tps_points=null)
+   * DecodedFrame(img_filename, source_etag, frame, is_binary, first_pass=false, rotation_angle, tps_points)
 
 depending if it sees the image requires another inference or not.
 
@@ -82,7 +82,7 @@ For InferredFrames with first_pass = false, it:
 
 ### S3ParquetWriter
 
-- **input:** LDRecord(img_filename, s3_etag, frame_w, frame_h, contours, nb_contours, contours_bboxes, rotation_angle=0, tps_points=null)
+- **input:** LDRecord(img_filename, source_etag, frame_w, frame_h, contours, nb_contours, contours_bboxes, rotation_angle=0, tps_points=null)
 - **output:** none
 
 writes the LDRecord on s3.

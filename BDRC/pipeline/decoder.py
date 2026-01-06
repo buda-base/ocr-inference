@@ -45,7 +45,7 @@ class Decoder:
             snap_extra_patch_row_threshold_px=self.cfg.snap_extra_patch_row_threshold_px,
             max_patch_rows=self.cfg.max_patch_rows
         )
-        return DecodedFrame(task=item.task, s3_etag=item.s3_etag, orig_h=orig_h, orig_w=orig_w, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
+        return DecodedFrame(task=item.task, source_etag=item.source_etag, orig_h=orig_h, orig_w=orig_w, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -74,7 +74,7 @@ class Decoder:
                     PipelineError(
                         stage="Decoder",
                         task=msg.task,
-                        s3_etag=msg.s3_etag,
+                        source_etag=msg.source_etag,
                         error_type=type(e).__name__,
                         message=str(e),
                         traceback=traceback.format_exc(),

@@ -14,12 +14,24 @@ class EndOfStream:
 
 # --- Core tasks / payloads --------------------------------------------------
 
+@dataclass(frozen=True)
+class VolumeTask:
+    """Input descriptor for the prefetcher.
+    """
+    debug_folder_path: str # local folder for debugging output, never on s3 (for now)
+    output_parquet_uri: str
+    output_jsonldgz_uri: str
+    image_tasks: List[ImageTask]
 
 @dataclass(frozen=True)
 class ImageTask:
-    """Input descriptor for the prefetcher.
     """
-    s3_key: Optional[str]
+    A unit of work.
+
+    - source_uri: canonical location for the input bytes (s3://bucket/key or file:///abs/path)
+    - img_filename: your existing basename used elsewhere (e.g. output naming / debug)
+    """
+    source_uri: str
     img_filename: str
 
 @dataclass(frozen=True)
@@ -27,7 +39,7 @@ class FetchedBytes:
     """Input descriptor for the decoder.
     """
     task: ImageTask
-    s3_etag: Optional[str]
+    source_etag: Optional[str] # null for local pipeline
     file_bytes: bytes
 
 @dataclass(frozen=True)
@@ -35,7 +47,7 @@ class DecodedFrame:
     """Output of the decode stage and transform stage
     """
     task: ImageTask
-    s3_etag: Optional[str]
+    source_etag: Optional[str]
     frame: Any # grayscale H, W, uint8
     orig_h: int
     orig_w: int
@@ -49,7 +61,7 @@ class InferredFrame:
     """Output of the inference stage.
     """
     task: ImageTask
-    s3_etag: Optional[str]
+    source_etag: Optional[str]
     frame: Any
     orig_h: int
     orig_w: int
@@ -64,7 +76,7 @@ class Record:
     """input for the Parquet writer, output of the transform stage
     """
     task: ImageTask
-    s3_etag: Optional[str]
+    source_etag: Optional[str]
     rotation_angle: Optional[float]
     tps_data: Optional[Any] # should be scaled to original image dimension
     contours: Optional[Any] # NDArray of (x,y) points, contours of line segments (not final merged lines), scaled to original image dimensions
@@ -78,7 +90,7 @@ class PipelineError:
     """Error message that can flow through queues."""
     stage: Literal["Prefetcher", "Decoder", "LDGpuBatcher", "LDPostProcessor", "S3ParquetWriter"]
     task: ImageTask
-    s3_etag: Optional[str]
+    source_etag: Optional[str]
     error_type: str
     message: str
     traceback: Optional[str] = None
