@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 from dataclasses import dataclass
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -19,14 +20,21 @@ class _PendingFrame:
     """
     Represents one input image being processed (possibly split into many tiles).
 
-    We store enough metadata to stitch tile predictions back into a full-size mask.
+    We keep enough metadata from DecodedFrame to emit correct outputs and errors.
     """
     frame_id: int
     lane_second_pass: bool
 
-    # Original input (kept as-is for packaging in InferredFrame)
-    orig_frame: Any
-    orig_is_binary: bool
+    # Propagated metadata from DecodedFrame
+    task: Any  # ImageTask
+    source_etag: Optional[str]
+    first_pass: bool
+    rotation_angle: Optional[float]
+    tps_data: Optional[Any]
+
+    # The (possibly binarized) frame used for inference (H,W uint8)
+    frame: Any
+    is_binary: bool
 
     # Shapes/padding
     orig_h: int
@@ -47,7 +55,6 @@ class _PendingFrame:
     # Progress tracking
     expected_tiles: int
     received_tiles: int = 0
-
 
 @dataclass
 class _TileWorkItem:
@@ -110,6 +117,86 @@ class LDGpuBatcher:
         # For "images" mode: keep pending frames in arrival order so we can group them
         self._image_queue: Deque[int] = deque()
 
+
+    # -----------------------------
+    # Error handling helpers
+    # -----------------------------
+    @staticmethod
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "out of memory" in msg or "cuda out of memory" in msg
+
+    def _maybe_reinit_gpu(self, reason: str) -> None:
+        """Best-effort GPU/model reinit hook (opt-in via cfg)."""
+        try:
+            do_on_oom = bool(getattr(self.cfg, "gpu_reinit_on_oom", False))
+            do_on_err = bool(getattr(self.cfg, "gpu_reinit_on_error", False))
+            if not (do_on_oom or do_on_err):
+                return
+            if (not do_on_err) and (reason != "oom"):
+                return
+
+            try:
+                self.model.to("cpu")
+            except Exception:
+                pass
+
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
+                self.model.to(self.device)
+                self.model.eval()
+            except Exception:
+                pass
+        except Exception:
+            return
+
+    async def _emit_pipeline_error(
+        self,
+        *,
+        internal_stage: str,
+        exc: BaseException,
+        lane_second_pass: bool,
+        task: Any,
+        source_etag: Optional[str],
+        retryable: bool = False,
+        attempt: int = 1,
+    ) -> None:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        err = PipelineError(
+            stage="LDGpuBatcher",
+            task=task,
+            source_etag=source_etag,
+            error_type=type(exc).__name__,
+            message=f"[{internal_stage}] {exc}",
+            traceback=tb,
+            retryable=bool(retryable),
+            attempt=int(attempt),
+        )
+        if lane_second_pass:
+            await self.q_gpu_pass_2_to_post_processor.put(err)
+        else:
+            await self.q_gpu_pass_1_to_post_processor.put(err)
+
+    def _drop_frame(self, frame_id: int) -> None:
+        """Remove any partial state for a frame to avoid deadlocks/leaks after an error."""
+        if frame_id in self._pending_frames:
+            del self._pending_frames[frame_id]
+
+        if self._tile_pool:
+            self._tile_pool = deque([t for t in self._tile_pool if t.frame_id != frame_id])
+
+        if self._image_queue:
+            self._image_queue = deque([fid for fid in self._image_queue if fid != frame_id])
+
     async def _pop_one(self, q: asyncio.Queue, timeout_s: float):
         try:
             return await asyncio.wait_for(q.get(), timeout=timeout_s)
@@ -152,8 +239,23 @@ class LDGpuBatcher:
                         continue
 
                     # enqueue + maybe process a batch
-                    await self._enqueue_decoded_frame(msg, second_pass=True)
-                    await self._maybe_process_batches()
+                    # enqueue + maybe process a batch
+                    try:
+                        await self._enqueue_decoded_frame(msg, second_pass=True)
+                        await self._maybe_process_batches()
+                    except Exception as e:
+                        retryable = self._is_cuda_oom(e)
+                        if retryable:
+                            self._maybe_reinit_gpu("oom")
+                        await self._emit_pipeline_error(
+                        internal_stage="run.reprocess_message",
+                        exc=e,
+                        lane_second_pass=True,
+                        task=msg.task,
+                        source_etag=msg.source_etag,
+                        retryable=retryable,
+                        attempt=1,
+                        )
 
                 if took_any:
                     continue
@@ -173,8 +275,23 @@ class LDGpuBatcher:
                         await self.q_gpu_pass_1_to_post_processor.put(msg)
                         continue
 
-                    await self._enqueue_decoded_frame(msg, second_pass=False)
-                    await self._maybe_process_batches()
+                    # enqueue + maybe process a batch
+                    try:
+                        await self._enqueue_decoded_frame(msg, second_pass=False)
+                        await self._maybe_process_batches()
+                    except Exception as e:
+                        retryable = self._is_cuda_oom(e)
+                        if retryable:
+                            self._maybe_reinit_gpu("oom")
+                        await self._emit_pipeline_error(
+                        internal_stage="run.init_message",
+                        exc=e,
+                        lane_second_pass=False,
+                        task=msg.task,
+                        source_etag=msg.source_etag,
+                        retryable=retryable,
+                        attempt=1,
+                        )
 
             # If neither lane had work, still give the batcher a chance to flush partial batches.
             # This is important to keep latency bounded when traffic is low.
@@ -233,10 +350,18 @@ class LDGpuBatcher:
         pending = _PendingFrame(
             frame_id=frame_id,
             lane_second_pass=second_pass,
-            orig_frame=dec_frame.frame,      # keep original (not necessarily binarized) for output packaging
-            orig_is_binary=bool(dec_frame.is_binary),
-            orig_h=h,
-            orig_w=w,
+
+            task=dec_frame.task,
+            source_etag=dec_frame.source_etag,
+            first_pass=bool(dec_frame.first_pass),
+            rotation_angle=dec_frame.rotation_angle,
+            tps_data=dec_frame.tps_data,
+
+            frame=gray,
+            is_binary=is_binary,
+
+            orig_h=int(dec_frame.orig_h),
+            orig_w=int(dec_frame.orig_w),
             pad_y=pad_y,
             pad_x=pad_x,
             h_pad=h_pad,
@@ -361,83 +486,68 @@ class LDGpuBatcher:
     async def _process_one_tiles_batch(self, batch_size: int) -> None:
         """
         Pop up to batch_size tiles across any frames, run model, scatter + stitch.
+
+        Strategy A on failure: emit PipelineError for each impacted frame and drop its partial state.
+        Retry: if CUDA OOM, split into smaller batches down to 1 tile.
         """
-        items: List[_TileWorkItem] = []
-        for _ in range(batch_size):
-            items.append(self._tile_pool.popleft())
-
-        # Stack tiles into [B, 1, 512, 512], then expand to 3 channels without copy.
-        tiles_1 = torch.stack([it.tile_1ch for it in items], dim=0)  # [B,1,512,512]
-        tiles_3 = tiles_1.expand(-1, 3, -1, -1)                     # [B,3,512,512] view
-
-        soft = self._infer_tiles_to_soft(tiles_3)  # [B,1,512,512] float32 on device
-
-        # Scatter each tile prediction into its pending frame accumulator
-        for i, it in enumerate(items):
-            pending = self._pending_frames.get(it.frame_id)
-            if pending is None:
-                # Shouldn't happen, but don't crash the pipeline for one corrupted state.
-                continue
-
-            # Max-stitch into accumulator (robust in overlap regions)
-            y0, x0 = it.y0, it.x0
-            region = pending.accum_soft[:, y0 : y0 + self.cfg.patch_size, x0 : x0 + self.cfg.patch_size]
-            pending.accum_soft[:, y0 : y0 + self.cfg.patch_size, x0 : x0 + self.cfg.patch_size] = torch.maximum(
-                region, soft[i]
-            )
-
-            pending.received_tiles += 1
-
-        # Finalize any frames that are now complete
-        await self._finalize_completed_frames()
-
-    async def _process_one_images_batch(self, image_batch_size: int) -> None:
-        """
-        Pop up to image_batch_size frames, gather ALL their tiles, run ONE big model call,
-        scatter + stitch. This minimizes model launches and is closest to your reference pipeline.
-        """
-        frame_ids: List[int] = []
-        for _ in range(image_batch_size):
-            frame_ids.append(self._image_queue.popleft())
-
-        # Gather all tiles for these frames.
-        # IMPORTANT: we keep "other frames" tiles in the pool untouched.
-        # To do this efficiently without complex indexing, we do a simple pass that
-        # extracts relevant tiles and keeps the rest.
-        selected: List[_TileWorkItem] = []
-        remaining: Deque[_TileWorkItem] = deque()
-
-        selected_set = set(frame_ids)
-        while self._tile_pool:
-            it = self._tile_pool.popleft()
-            if it.frame_id in selected_set:
-                selected.append(it)
-            else:
-                remaining.append(it)
-        self._tile_pool = remaining
-
-        if not selected:
+        if batch_size <= 0 or not self._tile_pool:
             return
 
-        # Stack + infer
-        tiles_1 = torch.stack([it.tile_1ch for it in selected], dim=0)  # [T,1,512,512]
-        tiles_3 = tiles_1.expand(-1, 3, -1, -1)                         # [T,3,512,512]
+        items: List[_TileWorkItem] = []
+        for _ in range(min(batch_size, len(self._tile_pool))):
+            items.append(self._tile_pool.popleft())
 
-        soft = self._infer_tiles_to_soft(tiles_3)  # [T,1,512,512]
+        impacted_frame_ids = sorted({it.frame_id for it in items})
 
-        # Scatter back
-        for i, it in enumerate(selected):
-            pending = self._pending_frames.get(it.frame_id)
-            if pending is None:
-                continue
-            y0, x0 = it.y0, it.x0
-            region = pending.accum_soft[:, y0 : y0 + self.cfg.patch_size, x0 : x0 + self.cfg.patch_size]
-            pending.accum_soft[:, y0 : y0 + self.cfg.patch_size, x0 : x0 + self.cfg.patch_size] = torch.maximum(
-                region, soft[i]
-            )
-            pending.received_tiles += 1
+        try:
+            tiles_1 = torch.stack([it.tile_1ch for it in items], dim=0)
+            tiles_3 = tiles_1.expand(-1, 3, -1, -1)
+
+            soft = self._infer_tiles_to_soft(tiles_3)
+
+            for i, it in enumerate(items):
+                pending = self._pending_frames.get(it.frame_id)
+                if pending is None:
+                    continue
+                x0, y0 = it.x0, it.y0
+                ps = pending.patch_size
+                pending.accum_soft[:, y0:y0+ps, x0:x0+ps] = torch.maximum(
+                    pending.accum_soft[:, y0:y0+ps, x0:x0+ps],
+                    soft[i],
+                )
+                pending.received_tiles += 1
+
+        except Exception as e:
+            retryable = self._is_cuda_oom(e)
+            if retryable:
+                self._maybe_reinit_gpu("oom")
+                for it in reversed(items):
+                    self._tile_pool.appendleft(it)
+                if batch_size > 1:
+                    left = max(1, batch_size // 2)
+                    right = max(1, batch_size - left)
+                    await self._process_one_tiles_batch(left)
+                    await self._process_one_tiles_batch(right)
+                    return
+
+            for fid in impacted_frame_ids:
+                pending = self._pending_frames.get(fid)
+                if pending is None:
+                    continue
+                await self._emit_pipeline_error(
+                    internal_stage="infer.tiles_batch",
+                    exc=e,
+                    lane_second_pass=bool(pending.lane_second_pass),
+                    task=pending.task,
+                    source_etag=pending.source_etag,
+                    retryable=bool(retryable),
+                    attempt=1,
+                )
+                self._drop_frame(fid)
+            return
 
         await self._finalize_completed_frames()
+
 
     def _infer_tiles_to_soft(self, tiles_3: torch.Tensor) -> torch.Tensor:
         """
@@ -465,12 +575,93 @@ class LDGpuBatcher:
             soft = torch.sigmoid(sel).to(torch.float32)
             return soft
 
+    async def _process_one_images_batch(self, image_batch_size: int) -> None:
+        """
+        Pop up to image_batch_size frames, gather ALL their tiles, run ONE big model call,
+        scatter + stitch.
+
+        Strategy A on failure: emit PipelineError for each impacted frame and drop its partial state.
+        Retry: if CUDA OOM, fall back to processing frames one-by-one.
+        """
+        if image_batch_size <= 0 or not self._image_queue:
+            return
+
+        frame_ids: List[int] = []
+        for _ in range(min(image_batch_size, len(self._image_queue))):
+            frame_ids.append(self._image_queue.popleft())
+
+        impacted = [fid for fid in frame_ids if fid in self._pending_frames]
+        if not impacted:
+            return
+
+        try:
+            tiles: List[_TileWorkItem] = []
+            for fid in impacted:
+                pending = self._pending_frames[fid]
+                gray = pending.frame
+                t_u8 = torch.from_numpy(gray).unsqueeze(0)
+                t = t_u8.to(self.device, non_blocking=True).float().div_(255.0)
+                t = F.pad(t, (pending.pad_x, 0, pending.pad_y, 0), value=1.0)
+
+                tile_index = 0
+                for y0 in pending.y_starts:
+                    for x0 in pending.x_starts:
+                        tile_1ch = t[:, y0:y0+pending.patch_size, x0:x0+pending.patch_size]
+                        tiles.append(_TileWorkItem(frame_id=fid, tile_index=tile_index, x0=x0, y0=y0, tile_1ch=tile_1ch))
+                        tile_index += 1
+
+            tiles_1 = torch.stack([it.tile_1ch for it in tiles], dim=0)
+            tiles_3 = tiles_1.expand(-1, 3, -1, -1)
+            soft = self._infer_tiles_to_soft(tiles_3)
+
+            for i, it in enumerate(tiles):
+                pending = self._pending_frames.get(it.frame_id)
+                if pending is None:
+                    continue
+                x0, y0 = it.x0, it.y0
+                ps = pending.patch_size
+                pending.accum_soft[:, y0:y0+ps, x0:x0+ps] = torch.maximum(
+                    pending.accum_soft[:, y0:y0+ps, x0:x0+ps],
+                    soft[i],
+                )
+                pending.received_tiles += 1
+
+        except Exception as e:
+            retryable = self._is_cuda_oom(e)
+            if retryable:
+                self._maybe_reinit_gpu("oom")
+                for fid in reversed(frame_ids):
+                    self._image_queue.appendleft(fid)
+                for _ in range(len(frame_ids)):
+                    await self._process_one_images_batch(1)
+                return
+
+            for fid in impacted:
+                pending = self._pending_frames.get(fid)
+                if pending is None:
+                    continue
+                await self._emit_pipeline_error(
+                    internal_stage="infer.images_batch",
+                    exc=e,
+                    lane_second_pass=bool(pending.lane_second_pass),
+                    task=pending.task,
+                    source_etag=pending.source_etag,
+                    retryable=False,
+                    attempt=1,
+                )
+                self._drop_frame(fid)
+            return
+
+        await self._finalize_completed_frames()
+
     async def _finalize_completed_frames(self) -> None:
         """
         Emit InferredFrame for any pending frames whose tiles are all received.
+
+        This function is also an error boundary: any exception becomes a PipelineError for that frame.
         """
         done_ids: List[int] = []
-        for frame_id, pending in self._pending_frames.items():
+        for frame_id, pending in list(self._pending_frames.items()):
             if pending.received_tiles >= pending.expected_tiles:
                 done_ids.append(frame_id)
 
@@ -479,28 +670,47 @@ class LDGpuBatcher:
             if pending is None:
                 continue
 
-            # Crop padding if any (in this implementation pad_y is currently 0 except small images,
-            # but pad_x may exist; keep it general and correct).
-            mask_soft = pending.accum_soft  # [1, H_pad, W_pad]
-            if pending.pad_y > 0:
-                mask_soft = mask_soft[:, : pending.orig_h, :]
-            if pending.pad_x > 0:
-                mask_soft = mask_soft[:, :, : pending.orig_w]
+            try:
+                mask_soft = pending.accum_soft
+                if pending.pad_y > 0:
+                    mask_soft = mask_soft[:, : pending.orig_h, :]
+                if pending.pad_x > 0:
+                    mask_soft = mask_soft[:, :, : pending.orig_w]
 
-            # Threshold -> uint8 {0,255} on GPU, then move to CPU
-            binary = (mask_soft > self.cfg.class_threshold).to(torch.uint8) * 255  # [1,H,W]
-            line_mask_np = binary.squeeze(0).cpu().numpy()  # [H,W], uint8
+                binary = (mask_soft > self.cfg.class_threshold).to(torch.uint8) * 255
+                line_mask_np = binary.squeeze(0).cpu().numpy()
 
-            out = InferredFrame(
-                frame=pending.orig_frame,
-                is_binary=pending.orig_is_binary,
-                line_mask=line_mask_np,
-            )
+                out = InferredFrame(
+                    task=pending.task,
+                    source_etag=pending.source_etag,
+                    frame=pending.frame,
+                    orig_h=pending.orig_h,
+                    orig_w=pending.orig_w,
+                    is_binary=pending.is_binary,
+                    first_pass=pending.first_pass,
+                    rotation_angle=pending.rotation_angle,
+                    tps_data=pending.tps_data,
+                    line_mask=line_mask_np,
+                )
 
-            if pending.lane_second_pass:
-                await self.q_gpu_pass_2_to_post_processor.put(out)
-            else:
-                await self.q_gpu_pass_1_to_post_processor.put(out)
+                if pending.lane_second_pass:
+                    await self.q_gpu_pass_2_to_post_processor.put(out)
+                else:
+                    await self.q_gpu_pass_1_to_post_processor.put(out)
+
+            except Exception as e:
+                retryable = self._is_cuda_oom(e)
+                if retryable:
+                    self._maybe_reinit_gpu("oom")
+                await self._emit_pipeline_error(
+                    internal_stage="finalize",
+                    exc=e,
+                    lane_second_pass=bool(pending.lane_second_pass),
+                    task=pending.task,
+                    source_etag=pending.source_etag,
+                    retryable=bool(retryable),
+                    attempt=1,
+                )
 
     # -----------------------------
     # Flush
