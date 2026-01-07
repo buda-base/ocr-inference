@@ -113,6 +113,7 @@ class LDGpuBatcher:
         # Internal buffers
         self._next_frame_id: int = 1
         self._pending_frames: Dict[int, _PendingFrame] = {}
+        # Tile pool: naturally bounded by queue backpressure (see _enqueue_decoded_frame docstring)
         self._tile_pool: Deque[_TileWorkItem] = deque()
 
 
@@ -215,98 +216,103 @@ class LDGpuBatcher:
     # -----------------------------
     # Main scheduler loop
     # -----------------------------
-    async def run(self):
+    async def run(self) -> None:
+        """Main scheduler loop for GPU batching."""
         # Prefer reprocess lane, but don't starve init
         reprocess_budget = self.cfg.reprocess_budget
         init_budget = 1
 
-        while True:
-            # termination condition: both lanes ended (and any internal buffers flushed)
-            if self._init_done and self._re_done:
-                await self._flush()
-                await self.q_gpu_pass_1_to_post_processor.put(EndOfStream(stream="gpu_pass_1", producer="LDGpuBatcher"))
-                await self.q_gpu_pass_2_to_post_processor.put(EndOfStream(stream="gpu_pass_2", producer="LDGpuBatcher"))
-                return
+        try:
+            while True:
+                # termination condition: both lanes ended (and any internal buffers flushed)
+                if self._init_done and self._re_done:
+                    await self._flush()
+                    await self.q_gpu_pass_1_to_post_processor.put(EndOfStream(stream="gpu_pass_1", producer="LDGpuBatcher"))
+                    await self.q_gpu_pass_2_to_post_processor.put(EndOfStream(stream="gpu_pass_2", producer="LDGpuBatcher"))
+                    break
 
-            took_any = False
+                took_any = False
 
-            # TODO: re-do with less blocking
+                # TODO: re-do with less blocking
 
-            # --- prefer reprocess lane (from LDPostProcessor) ---
-            if not self._re_done:
-                for _ in range(reprocess_budget):
-                    msg = await self._pop_one(self.q_re, self.batch_timeout_s)
-                    if msg is None:
-                        break
-                    took_any = True
+                # --- prefer reprocess lane (from LDPostProcessor) ---
+                if not self._re_done:
+                    for _ in range(reprocess_budget):
+                        msg = await self._pop_one(self.q_re, self.batch_timeout_s)
+                        if msg is None:
+                            break
+                        took_any = True
 
-                    if isinstance(msg, EndOfStream) and msg.stream == "transformed_pass_1":
-                        self._re_done = True
-                        break
-                    if isinstance(msg, PipelineError):
-                        await self.q_gpu_pass_2_to_post_processor.put(msg)
+                        if isinstance(msg, EndOfStream) and msg.stream == "transformed_pass_1":
+                            self._re_done = True
+                            break
+                        if isinstance(msg, PipelineError):
+                            await self.q_gpu_pass_2_to_post_processor.put(msg)
+                            continue
+
+                        # enqueue + maybe process a batch
+                        try:
+                            await self._enqueue_decoded_frame(msg, second_pass=True)
+                            await self._maybe_process_batches()
+                        except Exception as e:
+                            retryable = self._is_cuda_oom(e)
+                            if retryable:
+                                self._maybe_reinit_gpu("oom")
+                            await self._emit_pipeline_error(
+                                internal_stage="run.reprocess_message",
+                                exc=e,
+                                lane_second_pass=True,
+                                task=msg.task,
+                                source_etag=msg.source_etag,
+                                retryable=retryable,
+                                attempt=1,
+                            )
+
+                    if took_any:
                         continue
 
-                    # enqueue + maybe process a batch
-                    # enqueue + maybe process a batch
-                    try:
-                        await self._enqueue_decoded_frame(msg, second_pass=True)
-                        await self._maybe_process_batches()
-                    except Exception as e:
-                        retryable = self._is_cuda_oom(e)
-                        if retryable:
-                            self._maybe_reinit_gpu("oom")
-                        await self._emit_pipeline_error(
-                        internal_stage="run.reprocess_message",
-                        exc=e,
-                        lane_second_pass=True,
-                        task=msg.task,
-                        source_etag=msg.source_etag,
-                        retryable=retryable,
-                        attempt=1,
-                        )
+                # --- then init lane (from Decoder) ---
+                if not self._init_done:
+                    for _ in range(init_budget):
+                        msg = await self._pop_one(self.q_init, self.batch_timeout_s)
+                        if msg is None:
+                            break
+                        took_any = True
 
-                if took_any:
-                    continue
+                        if isinstance(msg, EndOfStream) and msg.stream == "decoded":
+                            self._init_done = True
+                            break
+                        if isinstance(msg, PipelineError):
+                            await self.q_gpu_pass_1_to_post_processor.put(msg)
+                            continue
 
-            # --- then init lane (from Decoder) ---
-            if not self._init_done:
-                for _ in range(init_budget):
-                    msg = await self._pop_one(self.q_init, self.batch_timeout_s)
-                    if msg is None:
-                        break
-                    took_any = True
+                        # enqueue + maybe process a batch
+                        try:
+                            await self._enqueue_decoded_frame(msg, second_pass=False)
+                            await self._maybe_process_batches()
+                        except Exception as e:
+                            retryable = self._is_cuda_oom(e)
+                            if retryable:
+                                self._maybe_reinit_gpu("oom")
+                            await self._emit_pipeline_error(
+                                internal_stage="run.init_message",
+                                exc=e,
+                                lane_second_pass=False,
+                                task=msg.task,
+                                source_etag=msg.source_etag,
+                                retryable=retryable,
+                                attempt=1,
+                            )
 
-                    if isinstance(msg, EndOfStream) and msg.stream == "decoded":
-                        self._init_done = True
-                        break
-                    if isinstance(msg, PipelineError):
-                        await self.q_gpu_pass_1_to_post_processor.put(msg)
-                        continue
-
-                    # enqueue + maybe process a batch
-                    try:
-                        await self._enqueue_decoded_frame(msg, second_pass=False)
-                        await self._maybe_process_batches()
-                    except Exception as e:
-                        retryable = self._is_cuda_oom(e)
-                        if retryable:
-                            self._maybe_reinit_gpu("oom")
-                        await self._emit_pipeline_error(
-                        internal_stage="run.init_message",
-                        exc=e,
-                        lane_second_pass=False,
-                        task=msg.task,
-                        source_etag=msg.source_etag,
-                        retryable=retryable,
-                        attempt=1,
-                        )
-
-            # If neither lane had work, still give the batcher a chance to flush partial batches.
-            # This is important to keep latency bounded when traffic is low.
-            if not took_any:
-                await self._maybe_process_batches(force_on_timeout=True)
-                await asyncio.sleep(0)
+                # If neither lane had work, still give the batcher a chance to flush partial batches.
+                # This is important to keep latency bounded when traffic is low.
+                if not took_any:
+                    await self._maybe_process_batches(force_on_timeout=True)
+                    await asyncio.sleep(0)
+        finally:
+            # Strategic GPU cache clearing at end of processing
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # -----------------------------
     # Frame ingestion

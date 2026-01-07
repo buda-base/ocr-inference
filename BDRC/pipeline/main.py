@@ -397,30 +397,30 @@ async def run_one_volume(args):
     progress_events: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=10_000)
     hook = make_progress_hook(progress_events) if args.progress else None
 
-    worker = LDVolumeWorker(cfg, volume_task, s3ctx=s3ctx, progress=hook)
+    # Use async context manager for proper cleanup
+    async with LDVolumeWorker(cfg, volume_task, s3ctx=s3ctx, progress=hook) as worker:
+        total = len(volume_task.image_tasks)
 
-    total = len(volume_task.image_tasks)
-
-    if args.progress:
-        ui = asyncio.create_task(
-            ui_loop(
-                events=progress_events,
-                worker=worker,
-                total=total,
-                show_queues=args.progress_queues,
+        if args.progress:
+            ui = asyncio.create_task(
+                ui_loop(
+                    events=progress_events,
+                    worker=worker,
+                    total=total,
+                    show_queues=args.progress_queues,
+                )
             )
-        )
-        try:
-            await worker.run()
-        finally:
-            # If pipeline dies early, unblock UI.
             try:
-                progress_events.put_nowait({"type": "close"})
-            except asyncio.QueueFull:
-                pass
-            await ui
-    else:
-        await worker.run()
+                await worker.run()
+            finally:
+                # If pipeline dies early, unblock UI.
+                try:
+                    progress_events.put_nowait({"type": "close"})
+                except asyncio.QueueFull:
+                    pass
+                await ui
+        else:
+            await worker.run()
 
 
 def main():

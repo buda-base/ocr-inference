@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Union, Tuple, List
+from typing import Any, Literal, Optional, Union, Tuple, List, Callable
 
 # --- Sentinel ---------------------------------------------------------------
 

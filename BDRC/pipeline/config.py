@@ -73,3 +73,47 @@ class PipelineConfig:
     # Artefact writer
     max_error_message_len = 128
     flush_every = 4096  # Flush Parquet buffer every N records
+    
+    def __post_init__(self):
+        """Validate configuration values."""
+        # Queue size validations - ensure queues are large enough for batch sizes
+        if self.max_q_decoder_to_gpu_pass_1 < self.tiles_batch_n * 2:
+            raise ValueError(
+                f"max_q_decoder_to_gpu_pass_1 ({self.max_q_decoder_to_gpu_pass_1}) "
+                f"must be at least 2x tiles_batch_n ({self.tiles_batch_n}) to avoid blocking"
+            )
+        
+        # Batch size validations
+        if self.tiles_batch_n <= 0:
+            raise ValueError(f"tiles_batch_n must be > 0, got {self.tiles_batch_n}")
+        
+        # GPU settings
+        if self.use_gpu:
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    raise ValueError("GPU requested but CUDA is not available")
+            except ImportError:
+                pass  # torch may not be available at config time
+        
+        # Overlap validations
+        if not (0 <= self.patch_vertical_overlap_px < self.patch_size):
+            raise ValueError(
+                f"patch_vertical_overlap_px must be in [0, patch_size), "
+                f"got {self.patch_vertical_overlap_px} (patch_size={self.patch_size})"
+            )
+        if not (0 <= self.patch_horizontal_overlap_px < self.patch_size):
+            raise ValueError(
+                f"patch_horizontal_overlap_px must be in [0, patch_size), "
+                f"got {self.patch_horizontal_overlap_px} (patch_size={self.patch_size})"
+            )
+        
+        # Timeout validations
+        if self.batch_timeout_ms <= 0:
+            raise ValueError(f"batch_timeout_ms must be > 0, got {self.batch_timeout_ms}")
+        if self.s3_get_timeout_s <= 0:
+            raise ValueError(f"s3_get_timeout_s must be > 0, got {self.s3_get_timeout_s}")
+        
+        # Batch type validation
+        if self.batch_type != "tiles":
+            raise ValueError(f"batch_type must be 'tiles', got '{self.batch_type}'")

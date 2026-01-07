@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 
@@ -90,6 +91,13 @@ class ParquetWriter:
         self._errors_path = None
 
         self._progress = progress
+        
+        # Error tracking for progress reporting
+        self._success_count = 0
+        self._error_count = 0
+        self._error_by_stage: Dict[str, int] = {}
+        self._last_summary_time = 0.0
+        self._summary_interval = 100  # Emit summary every N items
 
     def _emit_progress(self, event: Dict[str, Any]) -> None:
         """Best-effort progress emission. Must never break the pipeline."""
@@ -230,11 +238,29 @@ class ParquetWriter:
                 self._ensure_open()
                 self._buffer.append(self._row_from_error(msg))
                 self._write_error_jsonl(msg)
-                self._emit_progress({"type": "item", "ok": False, "img": msg.task.img_filename, "stage": msg.stage, "error_type": msg.error_type})
+                
+                # Track errors
+                self._error_count += 1
+                stage = msg.stage
+                self._error_by_stage[stage] = self._error_by_stage.get(stage, 0) + 1
+                
+                self._emit_progress({
+                    "type": "item",
+                    "ok": False,
+                    "img": msg.task.img_filename,
+                    "stage": msg.stage,
+                    "error_type": msg.error_type
+                })
             else:
                 # Record
                 self._buffer.append(self._row_from_record(msg))
+                self._success_count += 1
                 self._emit_progress({"type": "item", "ok": True, "img": msg.task.img_filename})
+            
+            # Emit periodic error summary
+            total = self._success_count + self._error_count
+            if total > 0 and total % self._summary_interval == 0:
+                self._emit_error_summary()
 
             # For small volumes, you can increase flush_every or set it very high.
             if len(self._buffer) >= self.flush_every:
@@ -243,4 +269,28 @@ class ParquetWriter:
         # Final flush & close
         self._flush()
         self._close()
+        
+        # Emit final error summary
+        if self._success_count > 0 or self._error_count > 0:
+            self._emit_error_summary(final=True)
+        
         self._emit_progress({"type": "close"})
+    
+    def _emit_error_summary(self, final: bool = False) -> None:
+        """Emit error rate summary for monitoring."""
+        total = self._success_count + self._error_count
+        if total == 0:
+            return
+        
+        error_rate = (self._error_count / total) * 100.0 if total > 0 else 0.0
+        
+        summary = {
+            "type": "error_summary",
+            "final": final,
+            "total": total,
+            "success": self._success_count,
+            "errors": self._error_count,
+            "error_rate_pct": error_rate,
+            "errors_by_stage": dict(self._error_by_stage),
+        }
+        self._emit_progress(summary)
