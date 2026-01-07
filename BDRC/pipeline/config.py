@@ -42,6 +42,8 @@ class PipelineConfig:
     image_batch_n: int = 1 # number of images in an image batch (relevant only if batch_type == "images")
     tiles_batch_n: int = 16 # number of tiles / patches in an tile batch (relevant only if batch_type == "tiles")
     class_threshold: float = 0.9
+    gpu_reinit_on_error = False
+    gpu_reinit_on_oom = True
 
     # Output
     parquet_compression: str = "zstd"

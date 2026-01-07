@@ -89,7 +89,7 @@ class Record:
 @dataclass(frozen=True)
 class PipelineError:
     """Error message that can flow through queues."""
-    stage: Literal["Prefetcher", "Decoder", "LDGpuBatcher", "LDPostProcessor", "S3ParquetWriter"]
+    stage: Literal["Prefetcher", "Decoder", "LDGpuBatcher", "LDPostProcessor", "ParquetWriter"]
     task: ImageTask
     source_etag: Optional[str]
     error_type: str
@@ -105,3 +105,8 @@ FetchedBytesMsg = Union[FetchedBytes, PipelineError, EndOfStream]
 DecodedFrameMsg = Union[DecodedFrame, PipelineError, EndOfStream]
 InferredFrameMsg = Union[InferredFrame, PipelineError, EndOfStream]
 RecordMsg = Union[Record, PipelineError, EndOfStream]
+
+# --- For UI
+
+ProgressEvent = Dict[str, Any]
+ProgressHook = Callable[[ProgressEvent], None]
