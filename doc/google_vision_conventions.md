@@ -12,17 +12,19 @@ Batches are an internal execution detail and never mix volumes.
 |----|----|
 | `W_id` | BDRC Work ID |
 | `I_id` | BDRC Volume ID (image group), globally unique |
+| `I_version` | The volume version (from the DB) |
 | Image | A single scanned page |
 | Volume | All images under one `I_id` |
 | Lane | Vision API path (`images` or `files`) |
 | Batch | One Vision API async request (internal) |
 | Bundle | Final output unit for downstream |
+| Run | A run of the pipeline (might happen two or three times during the project) |
 
 ## 2. Source Images (S3 → GCS)
 
 ### Staged GCS layout
 
-The S3 structure is preserved verbatim:
+The S3 structure is preserved verbatim in the copy:
 
 ```
 gs://bec-ocr-in/Works/{md5_2}/{W_id}/images/{W_id}-{I_id}/...
@@ -36,11 +38,13 @@ Each image is identified by:
 |----|----|
 | `W_id` | Work ID |
 | `I_id` | Volume ID |
+| `I_version` | The volume version |
 | `img_fname` | Image file name (string, as-is) |
-| `img_sha256` | SHA-256 checksum of image bytes (**authoritative**) |
+| `s3_etag` | SHA-256 checksum of image bytes |
+| `img_sha256` | SHA-256 checksum of image bytes |
 | `source_path` | Full S3/GCS path |
 
-Checksum ensures correctness when images are replaced upstream.
+Checksum and etag ensures correctness when images are replaced upstream.
 
 ## 4. Manifests
 
@@ -58,8 +62,9 @@ gs://ocr-in/manifests/{run_id}/volumes/{W_id}-{I_id}/inventory.jsonl
 
 ```json
 {
-  "I_id": "I12345",
-  "W_id": "W22084",
+  "i_id": "I12345",
+  "w_id": "W22084",
+  "i_version": "...",
   "img_fname": "I123450001.tif",
   "source_gcs_uri": "gs://ocr-in/Works/60/W22084/images/W22084-I12345/I123450001.tif",
   "media_type": "image/tiff",
@@ -67,6 +72,7 @@ gs://ocr-in/manifests/{run_id}/volumes/{W_id}-{I_id}/inventory.jsonl
   "width": 2000,
   "height": 3000,
   "img_size_bytes": 512044,
+  "s3_etag": "abc123...",
   "img_sha256": "abc123..."
 }
 ````
@@ -86,8 +92,9 @@ gs://ocr-in/manifests/{run_id}/batches/{W_id}-{I_id}/{lane}/{batch_id}.json
 ```json
 {
   "run_id": "ocr-20251229-101530Z-v1",
-  "I_id": "I12345",
-  "W_id": "W22084",
+  "i_id": "I12345",
+  "w_id": "W22084",
+  "i_version": "...",
   "lane": "files",
   "batch_id": "files-I12345-0003",
   "items_jsonl": "gs://ocr-in/manifests/.../inventory.jsonl",
@@ -135,10 +142,20 @@ gs://ocr-volumes/
       bundle.parquet
       raw.jsonl.gz
       index.json
-      _SUCCESS
+      success.json
 ```
 
-This layout is mirrored to S3 if required.
+This layout is mirrored to S3 once the run is complete:
+
+```
+s3://bec.bdrc.io/
+  artefacts/google_vision/
+    {W_id}-{I_id}-{I_version}/
+      bundle.parquet
+      raw.jsonl.gz
+      index.json
+      success.json
+```
 
 ### 6.1 `bundle.parquet`
 
@@ -147,10 +164,12 @@ One row per image.
 Columns:
 
 * `run_id`
-* `W_id`
-* `I_id`
+* `w_id`
+* `i_id`
+* `i_version`
 * `row_in_bundle`
 * `img_fname`
+* `s3_etag`
 * `img_sha256`
 * `img_size_bytes`
 * `source_gcs_uri`
@@ -170,9 +189,11 @@ One JSON object per image, same order as parquet.
 ```json
 {
   "row_in_bundle": 12,
-  "I_id": "I12345",
-  "W_id": "W22084",
+  "i_id": "I12345",
+  "w_id": "W22084",
+  "i_version": "...",
   "img_fname": "I123450001.tif",
+  "s3_etag": "abc123...",
   "image_sha256": "abc123...",
   "vision_response": { ... original Vision per-image response ... }
 }
@@ -187,8 +208,9 @@ Lightweight control file.
 ```json
 {
   "run_id": "ocr-20251229-101530Z-v1",
-  "I_id": "I12345",
-  "W_id": "W22084",
+  "i_id": "I12345",
+  "w_id": "W22084",
+  "i_version": "W22084",
   "count": 387,
   "parquet": "bundle.parquet",
   "raw": "raw.jsonl.gz",
@@ -199,8 +221,8 @@ Lightweight control file.
 
 ## 7. Idempotency & Retries
 
-* Bundles are committed by writing `_SUCCESS`
-* If `_SUCCESS` exists, the bundle is immutable
+* Bundles are committed by writing `success.json`
+* If `success.json` exists, the bundle is immutable
 * Reprocessing a volume produces new `run_id`
 * Checksums prevent silent reuse of stale images
 
