@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 from urllib.parse import urlparse, unquote
 
-from .types_common import ImageTask, FetchedBytes, PipelineError, FetchedBytesMsg, EndOfStream, 
+from .types_common import *
 
 class BasePrefetcher:
     """
@@ -93,7 +93,7 @@ class BasePrefetcher:
 # --- S3 implementation ---
 
 class S3Prefetcher(BasePrefetcher):
-    def __init__(self, cfg, s3ctx, volume_task: S3VolumeTask, q_prefetcher_to_decoder: asyncio.Queue[FetchedBytesMsg]):
+    def __init__(self, cfg, s3ctx, volume_task: VolumeTask, q_prefetcher_to_decoder: asyncio.Queue[FetchedBytesMsg]):
         super().__init__(cfg, volume_task, q_prefetcher_to_decoder)
         self.s3 = s3ctx
 
@@ -111,7 +111,7 @@ class S3Prefetcher(BasePrefetcher):
 # --- Local implementation ---
 
 class LocalPrefetcher(BasePrefetcher):
-    def __init__(self, cfg, volume_task: LocalVolumeTask, q_prefetcher_to_decoder: asyncio.Queue[FetchedBytesMsg]):
+    def __init__(self, cfg, volume_task: VolumeTask, q_prefetcher_to_decoder: asyncio.Queue[FetchedBytesMsg]):
         super().__init__(cfg, volume_task, q_prefetcher_to_decoder)
 
     async def _fetch_impl(self, task: ImageTask) -> tuple[Optional[str], bytes]:

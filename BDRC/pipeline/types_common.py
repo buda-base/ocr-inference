@@ -18,6 +18,7 @@ class EndOfStream:
 class VolumeTask:
     """Input descriptor for the prefetcher.
     """
+    io_mode: str # "local" or "s3"
     debug_folder_path: str # local folder for debugging output, never on s3 (for now)
     output_parquet_uri: str
     output_jsonldgz_uri: str

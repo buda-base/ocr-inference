@@ -52,7 +52,7 @@ def _open_filesystem_and_path(uri: str, cfg) -> tuple[Any, str]:
 
 class ParquetWriter:
     """
-    Writes a *single* Parquet file and a JSONL error sidecar.
+    Writes a single Parquet file and a JSONL error sidecar.
 
     Input queue: RecordMsg
       - Record rows become ok=True rows in Parquet.
@@ -69,16 +69,14 @@ class ParquetWriter:
         cfg,
         q_post_processor_to_writer: asyncio.Queue,
         parquet_uri: str,
-        errors_jsonl_uri: Optional[str] = None,
-        flush_every: int = 4096,
-        max_error_message_len: int = 128,
+        errors_jsonl_uri: str
     ):
         self.cfg = cfg
         self.q_post_processor_to_writer = q_post_processor_to_writer
         self.parquet_uri = parquet_uri
-        self.errors_jsonl_uri = errors_jsonl_uri or (parquet_uri + ".errors.jsonl")
-        self.flush_every = flush_every
-        self.max_error_message_len = max_error_message_len
+        self.errors_jsonl_uri = errors_jsonl_uri
+        self.flush_every = cfg.flush_every
+        self.max_error_message_len = cfg.max_error_message_len
 
         self._schema = schema_mod.ld_build_schema()
         self._writer: Optional[Any] = None
