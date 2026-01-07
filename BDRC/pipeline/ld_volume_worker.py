@@ -34,7 +34,7 @@ class LDVolumeWorker:
         self.decoder = Decoder(cfg, self.q_prefetcher_to_decoder, self.q_decoder_to_gpu_pass_1)
         self.batcher = LDGpuBatcher(cfg, self.q_decoder_to_gpu_pass_1, self.q_post_processor_to_gpu_pass_2, self.q_gpu_pass_1_to_post_processor, self.q_gpu_pass_2_to_post_processor)
         self.postprocessor = LDPostProcessor(cfg, self.q_gpu_pass_1_to_post_processor, self.q_gpu_pass_2_to_post_processor, self.q_post_processor_to_gpu_pass_2, self.q_post_processor_to_writer)
-        self.writer = ParquetWriter(cfg, self.q_post_processor_to_writer, volume_task.output_parquet_uri, volume_task.output_jsonldgz_uri, progress=progress)
+        self.writer = ParquetWriter(cfg, self.q_post_processor_to_writer, volume_task.output_parquet_uri, volume_task.output_jsonl_uri, progress=progress)
 
     async def run(self):
         await asyncio.gather(

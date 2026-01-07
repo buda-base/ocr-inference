@@ -198,11 +198,11 @@ class ParquetWriter:
             return
 
         rows_len = len(self._buffer)
-        self._emit({"type": "flush", "state": "start", "rows": rows_len})
+        self._emit_progress({"type": "flush", "state": "start", "rows": rows_len})
         table = pa.Table.from_pylist(self._buffer, schema=self._schema)
         self._writer.write_table(table)
         self._buffer.clear()
-        self._emit({"type": "flush", "state": "end", "rows": rows_len})
+        self._emit_progress({"type": "flush", "state": "end", "rows": rows_len})
 
     def _close(self) -> None:
         """Close outputs."""
@@ -230,11 +230,11 @@ class ParquetWriter:
                 self._ensure_open()
                 self._buffer.append(self._row_from_error(msg))
                 self._write_error_jsonl(msg)
-                self._emit({"type": "item", "ok": False, "img": msg.task.img_filename, "stage": msg.stage, "error_type": msg.error_type})
+                self._emit_progress({"type": "item", "ok": False, "img": msg.task.img_filename, "stage": msg.stage, "error_type": msg.error_type})
             else:
                 # Record
                 self._buffer.append(self._row_from_record(msg))
-                self._emit({"type": "item", "ok": True, "img": msg.task.img_filename})
+                self._emit_progress({"type": "item", "ok": True, "img": msg.task.img_filename})
 
             # For small volumes, you can increase flush_every or set it very high.
             if len(self._buffer) >= self.flush_every:
@@ -243,4 +243,4 @@ class ParquetWriter:
         # Final flush & close
         self._flush()
         self._close()
-        self._emit({"type": "close"})
+        self._emit_progress({"type": "close"})
