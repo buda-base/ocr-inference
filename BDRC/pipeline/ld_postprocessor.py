@@ -1,7 +1,8 @@
 
 import asyncio
-from .types_common import DecodedFrame, Record, InferredFrame
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import traceback
+from .types_common import DecodedFrame, Record, InferredFrame, PipelineError, EndOfStream
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from .img_helpers import apply_transform_1
 
 import cv2
@@ -38,6 +39,29 @@ class LDPostProcessor:
 
         self._p1_done = False
         self._p2_done = False
+
+    async def _emit_pipeline_error(
+        self,
+        *,
+        internal_stage: str,
+        exc: BaseException,
+        task: Any,
+        source_etag: Optional[str],
+        retryable: bool = False,
+        attempt: int = 1,
+    ) -> None:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        err = PipelineError(
+            stage="LDPostProcessor",
+            task=task,
+            source_etag=source_etag,
+            error_type=type(exc).__name__,
+            message=f"[{internal_stage}] {exc}",
+            traceback=tb,
+            retryable=bool(retryable),
+            attempt=int(attempt),
+        )
+        await self.q_post_processor_to_writer.put(err)
 
     async def _pop_one(self, q: asyncio.Queue, timeout_s: float):
         try:
@@ -76,7 +100,17 @@ class LDPostProcessor:
                         continue
 
                     frame: InferredFrame = msg
-                    await self._finalize_record(frame)  # cheap path
+                    try:
+                        await self._finalize_record(frame)  # cheap path
+                    except Exception as e:
+                        await self._emit_pipeline_error(
+                            internal_stage="run.finalize_pass2",
+                            exc=e,
+                            task=frame.task,
+                            source_etag=frame.source_etag,
+                            retryable=False,
+                            attempt=1,
+                        )
 
             if took:
                 continue
@@ -102,7 +136,17 @@ class LDPostProcessor:
                         continue
 
                     frame: InferredFrame = msg
-                    await self._handle_pass1(frame)
+                    try:
+                        await self._handle_pass1(frame)
+                    except Exception as e:
+                        await self._emit_pipeline_error(
+                            internal_stage="run.handle_pass1",
+                            exc=e,
+                            task=frame.task,
+                            source_etag=frame.source_etag,
+                            retryable=False,
+                            attempt=1,
+                        )
 
             if not took:
                 await asyncio.sleep(0)
