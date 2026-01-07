@@ -98,10 +98,11 @@ class LDGpuBatcher:
 
         # Device/model configuration
         self.device = "cuda"
-        # TODO: import model
         self.model = getattr(cfg, "model", None)
         if self.model is None:
             raise ValueError("cfg.model must be set (torch.nn.Module)")
+        if not isinstance(self.model, torch.nn.Module):
+            raise TypeError(f"cfg.model must be torch.nn.Module, got {type(self.model)}")
         self.model.to(self.device)
         self.model.eval()
 
@@ -113,9 +114,6 @@ class LDGpuBatcher:
         self._next_frame_id: int = 1
         self._pending_frames: Dict[int, _PendingFrame] = {}
         self._tile_pool: Deque[_TileWorkItem] = deque()
-
-        # For "images" mode: keep pending frames in arrival order so we can group them
-        self._image_queue: Deque[int] = deque()
 
 
     # -----------------------------
@@ -169,7 +167,11 @@ class LDGpuBatcher:
         source_etag: Optional[str],
         retryable: bool = False,
         attempt: int = 1,
+        timeout_s: float = 5.0,
     ) -> None:
+        import logging
+        logger = logging.getLogger(__name__)
+        
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         err = PipelineError(
             stage="LDGpuBatcher",
@@ -181,21 +183,28 @@ class LDGpuBatcher:
             retryable=bool(retryable),
             attempt=int(attempt),
         )
-        if lane_second_pass:
-            await self.q_gpu_pass_2_to_post_processor.put(err)
-        else:
-            await self.q_gpu_pass_1_to_post_processor.put(err)
+        target_q = self.q_gpu_pass_2_to_post_processor if lane_second_pass else self.q_gpu_pass_1_to_post_processor
+        
+        try:
+            await asyncio.wait_for(target_q.put(err), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            # Log critical - queue is stuck, but don't block the pipeline
+            logger.critical(
+                f"Failed to emit error after {timeout_s}s: queue full. "
+                f"Dropping error for {task.img_filename if task else 'unknown'}"
+            )
 
     def _drop_frame(self, frame_id: int) -> None:
         """Remove any partial state for a frame to avoid deadlocks/leaks after an error."""
         if frame_id in self._pending_frames:
+            pending = self._pending_frames[frame_id]
+            # Explicitly free GPU memory
+            if hasattr(pending, 'accum_soft') and pending.accum_soft is not None:
+                del pending.accum_soft
             del self._pending_frames[frame_id]
 
         if self._tile_pool:
             self._tile_pool = deque([t for t in self._tile_pool if t.frame_id != frame_id])
-
-        if self._image_queue:
-            self._image_queue = deque([fid for fid in self._image_queue if fid != frame_id])
 
     async def _pop_one(self, q: asyncio.Queue, timeout_s: float):
         try:
@@ -375,10 +384,6 @@ class LDGpuBatcher:
         )
         self._pending_frames[frame_id] = pending
 
-        if self.cfg.batch_type == "images":
-            # Record frame order for grouping
-            self._image_queue.append(frame_id)
-
         # Create tile work items
         tile_index = 0
         for y0 in y_starts:
@@ -471,17 +476,10 @@ class LDGpuBatcher:
         """
         Decide whether to run inference now.
 
-        - In "tiles" mode: run when we have tiles_batch_n tiles (or if force_on_timeout and any tiles exist).
-        - In "images" mode: run when we have image_batch_n images (or if force_on_timeout and any images exist).
+        Run when we have tiles_batch_n tiles (or if force_on_timeout and any tiles exist).
         """
-        if self.cfg.batch_type == "tiles":
-            if len(self._tile_pool) >= self.cfg.tiles_batch_n or (force_on_timeout and len(self._tile_pool) > 0):
-                await self._process_one_tiles_batch(min(self.cfg.tiles_batch_n, len(self._tile_pool)))
-        elif self.cfg.batch_type == "images":
-            if len(self._image_queue) >= self.cfg.image_batch_n or (force_on_timeout and len(self._image_queue) > 0):
-                await self._process_one_images_batch(min(self.cfg.image_batch_n, len(self._image_queue)))
-        else:
-            raise ValueError("cfg.batch_type must be either 'tiles' or 'images'")
+        if len(self._tile_pool) >= self.cfg.tiles_batch_n or (force_on_timeout and len(self._tile_pool) > 0):
+            await self._process_one_tiles_batch(min(self.cfg.tiles_batch_n, len(self._tile_pool)))
 
     async def _process_one_tiles_batch(self, batch_size: int) -> None:
         """
@@ -575,84 +573,6 @@ class LDGpuBatcher:
             soft = torch.sigmoid(sel).to(torch.float32)
             return soft
 
-    async def _process_one_images_batch(self, image_batch_size: int) -> None:
-        """
-        Pop up to image_batch_size frames, gather ALL their tiles, run ONE big model call,
-        scatter + stitch.
-
-        Strategy A on failure: emit PipelineError for each impacted frame and drop its partial state.
-        Retry: if CUDA OOM, fall back to processing frames one-by-one.
-        """
-        if image_batch_size <= 0 or not self._image_queue:
-            return
-
-        frame_ids: List[int] = []
-        for _ in range(min(image_batch_size, len(self._image_queue))):
-            frame_ids.append(self._image_queue.popleft())
-
-        impacted = [fid for fid in frame_ids if fid in self._pending_frames]
-        if not impacted:
-            return
-
-        try:
-            tiles: List[_TileWorkItem] = []
-            for fid in impacted:
-                pending = self._pending_frames[fid]
-                gray = pending.frame
-                t_u8 = torch.from_numpy(gray).unsqueeze(0)
-                t = t_u8.to(self.device, non_blocking=True).float().div_(255.0)
-                t = F.pad(t, (pending.pad_x, 0, pending.pad_y, 0), value=1.0)
-
-                tile_index = 0
-                for y0 in pending.y_starts:
-                    for x0 in pending.x_starts:
-                        tile_1ch = t[:, y0:y0+pending.patch_size, x0:x0+pending.patch_size]
-                        tiles.append(_TileWorkItem(frame_id=fid, tile_index=tile_index, x0=x0, y0=y0, tile_1ch=tile_1ch))
-                        tile_index += 1
-
-            tiles_1 = torch.stack([it.tile_1ch for it in tiles], dim=0)
-            tiles_3 = tiles_1.expand(-1, 3, -1, -1)
-            soft = self._infer_tiles_to_soft(tiles_3)
-
-            for i, it in enumerate(tiles):
-                pending = self._pending_frames.get(it.frame_id)
-                if pending is None:
-                    continue
-                x0, y0 = it.x0, it.y0
-                ps = pending.patch_size
-                pending.accum_soft[:, y0:y0+ps, x0:x0+ps] = torch.maximum(
-                    pending.accum_soft[:, y0:y0+ps, x0:x0+ps],
-                    soft[i],
-                )
-                pending.received_tiles += 1
-
-        except Exception as e:
-            retryable = self._is_cuda_oom(e)
-            if retryable:
-                self._maybe_reinit_gpu("oom")
-                for fid in reversed(frame_ids):
-                    self._image_queue.appendleft(fid)
-                for _ in range(len(frame_ids)):
-                    await self._process_one_images_batch(1)
-                return
-
-            for fid in impacted:
-                pending = self._pending_frames.get(fid)
-                if pending is None:
-                    continue
-                await self._emit_pipeline_error(
-                    internal_stage="infer.images_batch",
-                    exc=e,
-                    lane_second_pass=bool(pending.lane_second_pass),
-                    task=pending.task,
-                    source_etag=pending.source_etag,
-                    retryable=False,
-                    attempt=1,
-                )
-                self._drop_frame(fid)
-            return
-
-        await self._finalize_completed_frames()
 
     async def _finalize_completed_frames(self) -> None:
         """
@@ -697,6 +617,9 @@ class LDGpuBatcher:
                     await self.q_gpu_pass_2_to_post_processor.put(out)
                 else:
                     await self.q_gpu_pass_1_to_post_processor.put(out)
+                
+                # Free GPU memory after emitting
+                del pending.accum_soft
 
             except Exception as e:
                 retryable = self._is_cuda_oom(e)
@@ -711,6 +634,9 @@ class LDGpuBatcher:
                     retryable=bool(retryable),
                     attempt=1,
                 )
+                # Free GPU memory on error too
+                if hasattr(pending, 'accum_soft') and pending.accum_soft is not None:
+                    del pending.accum_soft
 
     # -----------------------------
     # Flush
@@ -725,19 +651,12 @@ class LDGpuBatcher:
         """
         # Keep processing until no work remains.
         # In practice, this loops only a few times.
-        while self._tile_pool or self._image_queue:
-            if self.cfg.batch_type == "tiles":
-                # Process all remaining tiles in chunks
-                n = min(self.cfg.tiles_batch_n, len(self._tile_pool))
-                if n == 0:
-                    break
-                await self._process_one_tiles_batch(n)
-            else:
-                # Process all remaining images in chunks
-                n = min(self.cfg.image_batch_n, len(self._image_queue))
-                if n == 0:
-                    break
-                await self._process_one_images_batch(n)
+        while self._tile_pool:
+            # Process all remaining tiles in chunks
+            n = min(self.cfg.tiles_batch_n, len(self._tile_pool))
+            if n == 0:
+                break
+            await self._process_one_tiles_batch(n)
 
         # Safety net: if any frames are somehow left (shouldn't happen), try to finalize.
         await self._finalize_completed_frames()

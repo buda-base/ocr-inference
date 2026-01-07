@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
+import torch
+
 from rich.console import Console
 from rich.live import Live
 from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn
@@ -277,11 +279,46 @@ def _get_local_image_tasks(input_folder: str) -> List[ImageTask]:
 
 
 async def run_one_volume(args):
-    # Build PipelineConfig
+    # Load model from checkpoint
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
+    
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    
+    # Extract model (handle different checkpoint formats)
+    if isinstance(checkpoint, dict):
+        if "model" in checkpoint:
+            model = checkpoint["model"]
+        elif "state_dict" in checkpoint:
+            # If only state_dict, we need the model architecture
+            # For now, assume model is passed as a separate object or in checkpoint
+            raise ValueError(
+                "Checkpoint contains only state_dict. "
+                "Please ensure checkpoint contains 'model' key with the full model, "
+                "or provide model architecture separately."
+            )
+        else:
+            # Try to use the checkpoint dict directly as state_dict
+            # This requires model architecture to be provided separately
+            raise ValueError(
+                "Cannot determine model from checkpoint. "
+                "Please ensure checkpoint contains 'model' key with the full model."
+            )
+    else:
+        # Checkpoint is the model directly
+        model = checkpoint
+    
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError(f"Loaded checkpoint is not a torch.nn.Module, got {type(model)}")
+    
+    # Build PipelineConfig with model
     cfg = PipelineConfig(
         s3_bucket="archive.tbrc.org",  # Default for S3 operations
         s3_region="us-east-1",
     )
+    cfg.model = model
     
     # Build VolumeTask based on input mode
     volume_task: VolumeTask
@@ -413,6 +450,13 @@ def main():
         "--output-folder",
         type=str,
         help="Output folder path or URI (file:// or s3://). Defaults set based on input mode."
+    )
+    
+    # Model
+    p.add_argument(
+        "-c", "--checkpoint",
+        required=True,
+        help="Path to model checkpoint (.pth)",
     )
     
     # UI

@@ -50,38 +50,42 @@ class Decoder:
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
 
-        while True:
-            msg = await self.q_prefetcher_to_decoder.get()
+        try:
+            while True:
+                msg = await self.q_prefetcher_to_decoder.get()
 
-            if isinstance(msg, EndOfStream):
-                # Forward sentinel downstream and stop
-                await self.q_decoder_to_gpu_pass_1.put(EndOfStream(stream="decoded", producer="Decoder"))
-                return
+                if isinstance(msg, EndOfStream):
+                    # Forward sentinel downstream and stop
+                    await self.q_decoder_to_gpu_pass_1.put(EndOfStream(stream="decoded", producer="Decoder"))
+                    return
 
-            if isinstance(msg, PipelineError):
-                # Pass-through errors unchanged
-                await self.q_decoder_to_gpu_pass_1.put(msg)
-                continue
+                if isinstance(msg, PipelineError):
+                    # Pass-through errors unchanged
+                    await self.q_decoder_to_gpu_pass_1.put(msg)
+                    continue
 
-            # Otherwise it must be FetchedBytes
-            try:
-                fut = loop.run_in_executor(self.pool, self._decode_one, msg)
-                decoded = await fut
-                await self.q_decoder_to_gpu_pass_1.put(decoded)
-            except Exception as e:
-                import traceback
-                await self.q_decoder_to_gpu_pass_1.put(
-                    PipelineError(
-                        stage="Decoder",
-                        task=msg.task,
-                        source_etag=msg.source_etag,
-                        error_type=type(e).__name__,
-                        message=str(e),
-                        traceback=traceback.format_exc(),
-                        retryable=False,
-                        attempt=1,
+                # Otherwise it must be FetchedBytes
+                try:
+                    fut = loop.run_in_executor(self.pool, self._decode_one, msg)
+                    decoded = await fut
+                    await self.q_decoder_to_gpu_pass_1.put(decoded)
+                except Exception as e:
+                    import traceback
+                    await self.q_decoder_to_gpu_pass_1.put(
+                        PipelineError(
+                            stage="Decoder",
+                            task=msg.task,
+                            source_etag=msg.source_etag,
+                            error_type=type(e).__name__,
+                            message=str(e),
+                            traceback=traceback.format_exc(),
+                            retryable=False,
+                            attempt=1,
+                        )
                     )
-                )
+        finally:
+            # Ensure thread pool is properly shut down
+            self.pool.shutdown(wait=True, timeout=30.0)
 
 
 

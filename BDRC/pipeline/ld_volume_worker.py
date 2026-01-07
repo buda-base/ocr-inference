@@ -37,10 +37,27 @@ class LDVolumeWorker:
         self.writer = ParquetWriter(cfg, self.q_post_processor_to_writer, volume_task.output_parquet_uri, volume_task.output_jsonl_uri, progress=progress)
 
     async def run(self):
-        await asyncio.gather(
-            self.prefetcher.run(),
-            self.decoder.run(),
-            self.batcher.run(),
-            self.postprocessor.run(),
-            self.writer.run(),
-        )
+        """Run all pipeline stages concurrently with proper exception handling."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        tasks = [
+            asyncio.create_task(self.prefetcher.run(), name="prefetcher"),
+            asyncio.create_task(self.decoder.run(), name="decoder"),
+            asyncio.create_task(self.batcher.run(), name="batcher"),
+            asyncio.create_task(self.postprocessor.run(), name="postprocessor"),
+            asyncio.create_task(self.writer.run(), name="writer"),
+        ]
+        
+        # Wait for all tasks, but handle exceptions per-task to avoid cascading failures
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Log any exceptions
+        stage_names = ["prefetcher", "decoder", "batcher", "postprocessor", "writer"]
+        for name, result in zip(stage_names, results):
+            if isinstance(result, Exception):
+                logger.error(f"Stage {name} failed: {result}", exc_info=result)
+        
+        # Re-raise writer failure as it's critical (data loss risk)
+        if isinstance(results[4], Exception):
+            raise RuntimeError(f"Writer stage failed: {results[4]}") from results[4]

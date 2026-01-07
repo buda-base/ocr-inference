@@ -38,12 +38,13 @@ class PipelineConfig:
     cuda_streams: int = 2
     binarize_block_size: int = 31
     binarize_c: int = 15
-    batch_type: str = "tiles" # "tiles" for batching tiles, "images" for batching on images
-    image_batch_n: int = 1 # number of images in an image batch (relevant only if batch_type == "images")
-    tiles_batch_n: int = 16 # number of tiles / patches in an tile batch (relevant only if batch_type == "tiles")
+    batch_type: str = "tiles" # "tiles" for batching tiles (images batch mode removed)
+    tiles_batch_n: int = 16 # number of tiles / patches in a tile batch
     class_threshold: float = 0.9
     gpu_reinit_on_error = False
     gpu_reinit_on_oom = True
+    reprocess_budget: int = 3  # Priority weight for reprocess lane (higher = more priority)
+    controller_poll_ms: int = 5  # Polling timeout for post-processor
 
     # Output
     parquet_compression: str = "zstd"
@@ -71,4 +72,4 @@ class PipelineConfig:
 
     # Artefact writer
     max_error_message_len = 128
-    flush_parquet_every = 4096
+    flush_every = 4096  # Flush Parquet buffer every N records
