@@ -107,6 +107,7 @@ class LDGpuBatcher:
         self.model.eval()
 
         self.line_class_index: int = 0
+        self._accum_dtype = torch.float16
 
         self.batch_timeout_s: float = cfg.batch_timeout_ms / 1000.0
 
@@ -115,6 +116,28 @@ class LDGpuBatcher:
         self._pending_frames: Dict[int, _PendingFrame] = {}
         # Tile pool: naturally bounded by queue backpressure (see _enqueue_decoded_frame docstring)
         self._tile_pool: Deque[_TileWorkItem] = deque()
+
+    async def _throttle_tile_pool(self, incoming_tiles: int) -> None:
+        """
+        Backpressure safety: if cfg.max_tiles_in_pool is set, avoid unbounded growth
+        of the internal tile pool under load (which can hold onto large GPU tensors).
+        """
+        max_tiles = self.cfg.max_tiles_in_pool
+        if max_tiles <= 0:
+            return
+        if incoming_tiles <= 0:
+            return
+        if incoming_tiles > max_tiles:
+            raise ValueError(
+                f"incoming_tiles ({incoming_tiles}) exceeds max_tiles_in_pool ({max_tiles}); "
+                f"increase max_tiles_in_pool or reduce tiling (patch_size/overlaps)."
+            )
+
+        # Keep draining until there is room for the incoming tiles.
+        # We force processing even for partial batches to guarantee progress under low traffic.
+        while (len(self._tile_pool) + incoming_tiles) > max_tiles:
+            await self._maybe_process_batches(force_on_timeout=True)
+            await asyncio.sleep(0)
 
 
     # -----------------------------
@@ -339,16 +362,24 @@ class LDGpuBatcher:
 
         h, w = int(gray.shape[0]), int(gray.shape[1])
 
+        # Compute padding + tiling starts (CPU-only) and throttle BEFORE allocating GPU tensors.
+        x_starts, y_starts, pad_x, pad_y, h_pad, w_pad = self._compute_tiling_geometry(h, w)
+        expected_tiles = len(x_starts) * len(y_starts)
+        await self._throttle_tile_pool(expected_tiles)
+
         # Convert to torch on CPU first, then to GPU.
         # Keep it uint8 until we are on GPU to reduce PCIe bandwidth a bit.
-        t_u8 = torch.from_numpy(gray)  # [H, W], uint8, CPU
+        #
+        # pin the CPU tensor so the subsequent H2D copy can
+        # actually leverage non_blocking=True (async DMA).
+        t_u8 = torch.from_numpy(gray)  # [H, W], uint8, CPU (shares memory with numpy)
+        if torch.cuda.is_available():
+            # pin_memory() returns a new tensor backed by pinned (page-locked) memory.
+            t_u8 = t_u8.pin_memory()
         t_u8 = t_u8.unsqueeze(0)       # [1, H, W]
 
         # Move to GPU and normalize to [0, 1] float32
         t = t_u8.to(self.device, non_blocking=True).float().div_(255.0)  # [1, H, W] float32
-
-        # Compute padding + tiling starts
-        x_starts, y_starts, pad_x, pad_y, h_pad, w_pad = self._compute_tiling_geometry(h, w)
 
         # Pad with "white" background = 1.0 (original uses pad value 255 for uint8)
         # F.pad order for 3D [C,H,W] is (pad_left, pad_right, pad_top, pad_bottom)
@@ -356,12 +387,11 @@ class LDGpuBatcher:
 
         # Allocate accumulator for stitching predictions on GPU.
         # We'll use max() in overlaps (very robust for segmentation probabilities).
-        accum = torch.zeros((1, h_pad, w_pad), device=self.device, dtype=torch.float32)
+        accum = torch.zeros((1, h_pad, w_pad), device=self.device, dtype=self._accum_dtype)
 
         frame_id = self._next_frame_id
         self._next_frame_id += 1
 
-        expected_tiles = len(x_starts) * len(y_starts)
         pending = _PendingFrame(
             frame_id=frame_id,
             lane_second_pass=second_pass,
@@ -507,7 +537,7 @@ class LDGpuBatcher:
             tiles_1 = torch.stack([it.tile_1ch for it in items], dim=0)
             tiles_3 = tiles_1.expand(-1, 3, -1, -1)
 
-            soft = self._infer_tiles_to_soft(tiles_3)
+            soft = self._infer_tiles_to_soft(tiles_3).to(dtype=self._accum_dtype)
 
             for i, it in enumerate(items):
                 pending = self._pending_frames.get(it.frame_id)
