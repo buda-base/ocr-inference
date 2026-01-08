@@ -33,6 +33,9 @@ class PipelineConfig:
 
     # GPU batching
     use_gpu: bool = True
+    # Optional cap for the internal tile pool to limit peak memory under backpressure.
+    # 0 disables throttling.
+    max_tiles_in_pool: int = 2048
     batch_size: int = 16
     batch_timeout_ms: int = 25
     cuda_streams: int = 2
@@ -40,7 +43,7 @@ class PipelineConfig:
     binarize_c: int = 15
     batch_type: str = "tiles" # "tiles" for batching tiles (images batch mode removed)
     tiles_batch_n: int = 16 # number of tiles / patches in a tile batch
-    class_threshold: float = 0.9
+    class_threshold: float = 0.85
     gpu_reinit_on_error = False
     gpu_reinit_on_oom = True
     reprocess_budget: int = 3  # Priority weight for reprocess lane (higher = more priority)

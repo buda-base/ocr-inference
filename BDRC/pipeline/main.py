@@ -277,41 +277,47 @@ def _get_local_image_tasks(input_folder: str) -> List[ImageTask]:
     
     return image_tasks
 
+def load_model(
+    checkpoint_path: str | Path,
+    *,
+    classes: int = 1,
+) -> torch.nn.Module:
+    """
+    Load the segmentation model from a checkpoint.
+
+    Assumptions (as per existing training artifacts):
+      - checkpoint is a dict with a "state_dict" key.
+      - model architecture is DeepLabV3Plus from segmentation_models_pytorch.
+
+    Performance:
+      - load weights on CPU (fast, avoids GPU RAM spikes).
+      - set eval + disable grads.
+    """
+    ckpt_path = Path(checkpoint_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {ckpt_path}")
+
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        raise ValueError("Expected checkpoint dict with a 'state_dict' key")
+
+    state_dict: Dict[str, torch.Tensor] = checkpoint["state_dict"]
+    # Common training wrappers (DataParallel, Lightning, etc.)
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
+
+    import segmentation_models_pytorch as sm
+
+    # Keep this fully local/offline by default (no encoder pretrained weights download).
+    model = sm.DeepLabV3Plus(encoder_name="resnet34", encoder_weights=None, classes=classes)
+    model.load_state_dict(state_dict, strict=True)
+
+    model.eval()
+    model.requires_grad_(False)
+    return model
 
 async def run_one_volume(args):
-    # Load model from checkpoint
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
-    
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    
-    # Extract model (handle different checkpoint formats)
-    if isinstance(checkpoint, dict):
-        if "model" in checkpoint:
-            model = checkpoint["model"]
-        elif "state_dict" in checkpoint:
-            # If only state_dict, we need the model architecture
-            # For now, assume model is passed as a separate object or in checkpoint
-            raise ValueError(
-                "Checkpoint contains only state_dict. "
-                "Please ensure checkpoint contains 'model' key with the full model, "
-                "or provide model architecture separately."
-            )
-        else:
-            # Try to use the checkpoint dict directly as state_dict
-            # This requires model architecture to be provided separately
-            raise ValueError(
-                "Cannot determine model from checkpoint. "
-                "Please ensure checkpoint contains 'model' key with the full model."
-            )
-    else:
-        # Checkpoint is the model directly
-        model = checkpoint
-    
-    if not isinstance(model, torch.nn.Module):
-        raise TypeError(f"Loaded checkpoint is not a torch.nn.Module, got {type(model)}")
+    model = load_model(args.checkpoint, classes=1)
     
     # Build PipelineConfig with model
     cfg = PipelineConfig(

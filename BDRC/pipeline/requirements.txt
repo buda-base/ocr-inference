@@ -33,3 +33,5 @@ aiobotocore # doesn't work too well unfortunately, just slightly too old for bot
 
 # TPS (provides `from tps import ThinPlateSpline`)
 thin-plate-spline==1.2.1
+
+segmentation_models_pytorch # for line segmentation
