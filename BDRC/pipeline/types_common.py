@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Union, Tuple, List, Callable
+from typing import Any, Literal, Optional, Union, Tuple, List, Callable, Dict
 
 # --- Sentinel ---------------------------------------------------------------
 
@@ -15,16 +17,6 @@ class EndOfStream:
 # --- Core tasks / payloads --------------------------------------------------
 
 @dataclass(frozen=True)
-class VolumeTask:
-    """Input descriptor for the prefetcher.
-    """
-    io_mode: str # "local" or "s3"
-    debug_folder_path: str # local folder for debugging output, never on s3 (for now)
-    output_parquet_uri: str
-    output_jsonl_uri: str
-    image_tasks: List[ImageTask]
-
-@dataclass(frozen=True)
 class ImageTask:
     """
     A unit of work.
@@ -34,6 +26,16 @@ class ImageTask:
     """
     source_uri: str
     img_filename: str
+
+@dataclass(frozen=True)
+class VolumeTask:
+    """Input descriptor for the prefetcher.
+    """
+    io_mode: str # "local" or "s3"
+    debug_folder_path: str # local folder for debugging output, never on s3 (for now)
+    output_parquet_uri: str
+    output_jsonl_uri: str
+    image_tasks: List[ImageTask]
 
 @dataclass(frozen=True)
 class FetchedBytes:
