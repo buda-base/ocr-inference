@@ -426,9 +426,8 @@ async def run_one_volume(args):
 def main():
     p = argparse.ArgumentParser(description="Line detection pipeline for OCR inference")
     
-    # Input mode (mutually exclusive)
-    input_group = p.add_mutually_exclusive_group(required=True)
-    input_group.add_argument(
+    # Input mode
+    p.add_argument(
         "--input-folder",
         type=str,
         help="Local folder containing image files (creates local VolumeTask)"
@@ -469,13 +468,13 @@ def main():
     
     args = p.parse_args()
     
-    # Validate S3 mode arguments
+    # Validate input mode arguments
     if args.input_folder:
         if args.w or args.i:
             p.error("--input-folder cannot be used with --w or --i")
     else:
         if not (args.w and args.i):
-            p.error("S3 mode requires both --w and --i")
+            p.error("Either --input-folder OR both --w and --i must be provided")
     
     if args.progress_queues:
         args.progress = True
