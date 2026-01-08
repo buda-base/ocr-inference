@@ -8,7 +8,7 @@
 #   then install this file.
 #
 # Reference (DLAMI GPU PyTorch Ubuntu 22.04 family):
-# torch==2.4.1  # preinstalled in the AMI; verify on your instance via `python -c "import torch; print(torch.__version__)"`
+# torch==2.9  # preinstalled in the AMI; verify on your instance via `python -c "import torch; print(torch.__version__)"`
 
 # Core numerics
 numpy==1.26.4
