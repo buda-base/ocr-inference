@@ -43,6 +43,30 @@ class LDVolumeWorker:
         self._is_running = False
         self._is_healthy = True
         self._last_error_time: Optional[float] = None
+        # Task tracking for cancellation/cleanup
+        self._tasks: list[asyncio.Task[Any]] = []
+
+    async def __aenter__(self) -> "LDVolumeWorker":
+        # No heavy initialization needed; stages are created in __init__.
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        # Best-effort cleanup if caller exits early due to exceptions/cancellation.
+        await self.aclose()
+        # Don't suppress exceptions.
+        return False
+
+    async def aclose(self) -> None:
+        """Best-effort cancellation of any running stage tasks."""
+        if not self._tasks:
+            return
+        for t in self._tasks:
+            if not t.done():
+                t.cancel()
+        # Drain cancellations; never raise from cleanup.
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
 
 
     def health_check(self) -> Dict[str, Any]:
@@ -107,13 +131,14 @@ class LDVolumeWorker:
         self._is_healthy = True
         
         try:
-            tasks = [
+            tasks: list[asyncio.Task[Any]] = [
                 asyncio.create_task(self.prefetcher.run(), name="prefetcher"),
                 asyncio.create_task(self.decoder.run(), name="decoder"),
                 asyncio.create_task(self.batcher.run(), name="batcher"),
                 asyncio.create_task(self.postprocessor.run(), name="postprocessor"),
                 asyncio.create_task(self.writer.run(), name="writer"),
             ]
+            self._tasks = tasks
             
             # Wait for all tasks, but handle exceptions per-task to avoid cascading failures
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -130,4 +155,6 @@ class LDVolumeWorker:
             if isinstance(results[4], Exception):
                 raise RuntimeError(f"Writer stage failed: {results[4]}") from results[4]
         finally:
+            # If we're being cancelled or a stage failed unexpectedly, ensure no background tasks linger.
+            await self.aclose()
             self._is_running = False
