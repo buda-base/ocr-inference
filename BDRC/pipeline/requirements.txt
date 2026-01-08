@@ -1,0 +1,35 @@
+# This project is validated on AWS Deep Learning AMI (DLAMI) for PyTorch (GPU).
+# Assumptions: Ubuntu 22.04, a DLAMI-provided CUDA-enabled PyTorch already installed.
+#
+# IMPORTANT:
+# - Do NOT add `torch` / `torchvision` / `torchaudio` here when using DLAMI unless you
+#   intentionally want to replace the AMI-provided CUDA/PyTorch stack.
+# - If you are NOT using DLAMI, install a matching CUDA-enabled PyTorch build first,
+#   then install this file.
+#
+# Reference (DLAMI GPU PyTorch Ubuntu 22.04 family):
+# torch==2.4.1  # preinstalled in the AMI; verify on your instance via `python -c "import torch; print(torch.__version__)"`
+
+# Core numerics
+numpy==1.26.4
+scipy==1.11.4
+
+# Image IO / processing
+pillow==10.4.0
+opencv-python-headless==4.10.0.84
+
+# Outputs
+pyarrow==16.1.0
+
+# S3 + async S3 (note: aioboto3 pulls compatible boto3/botocore pins)
+boto3
+botocore
+aioboto3==12.0.0
+
+# CLI UI
+rich==13.7.1
+
+# TPS (provides `from tps import ThinPlateSpline`)
+thin-plate-spline==1.2.1
+
+

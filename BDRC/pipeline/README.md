@@ -2,6 +2,13 @@
 
 This directory contains the runtime pieces that make a volume worker efficient, safe, and easy to reason about.
 
+## Dependencies / runtime assumptions
+
+This pipeline is designed and tested against an **AWS Deep Learning AMI (DLAMI) for PyTorch (GPU)** (Ubuntu 22.04), where **CUDA + PyTorch are preinstalled and known-compatible**.
+
+- **`requirements.txt` intentionally does not install `torch`** to avoid accidentally replacing the DLAMI-provided CUDA/PyTorch stack (a common source of “CUDA not available” / binary mismatch issues).
+- **If you run outside DLAMI** (or in a custom container), install a matching CUDA-enabled PyTorch build first (per the official PyTorch install instructions), then install `requirements.txt`.
+
 ## Components
 
 ```
