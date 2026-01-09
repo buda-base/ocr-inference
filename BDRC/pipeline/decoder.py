@@ -10,6 +10,7 @@ from functools import lru_cache
 import math
 
 from .types_common import ImageTask, DecodedFrame, FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, DecodedFrame, PipelineError, EndOfStream
+from .debug_helpers import save_debug_bytes_sync, save_debug_image_sync
 
 
 class ImageDecodeError(RuntimeError):
@@ -33,6 +34,9 @@ class Decoder:
         )
 
     def _decode_one(self, item: FetchedBytes) -> DecodedFrame:
+        # Debug: save original bytes (synchronous, in thread pool - allows early GC of bytes)
+        save_debug_bytes_sync(self.cfg, item.task.img_filename, item.file_bytes)
+        
         frame, is_binary, orig_h, orig_w = bytes_to_frame(
             item.task.img_filename,
             item.file_bytes,
@@ -45,7 +49,12 @@ class Decoder:
             snap_extra_patch_row_threshold_px=self.cfg.snap_extra_patch_row_threshold_px,
             max_patch_rows=self.cfg.max_patch_rows
         )
-        return DecodedFrame(task=item.task, source_etag=item.source_etag, orig_h=orig_h, orig_w=orig_w, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
+        
+        # Debug: save decoded image (synchronous, in thread pool)
+        save_debug_image_sync(self.cfg, item.task.img_filename, "01_decoded", frame)
+        
+        decoded = DecodedFrame(task=item.task, source_etag=item.source_etag, orig_h=orig_h, orig_w=orig_w, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
+        return decoded
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()

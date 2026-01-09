@@ -1,5 +1,6 @@
 
 from dataclasses import dataclass
+from typing import Optional
 
 @dataclass
 class PipelineConfig:
@@ -77,6 +78,11 @@ class PipelineConfig:
     # Artefact writer
     max_error_message_len = 128
     flush_every = 4096  # Flush Parquet buffer every N records
+    
+    # Debug
+    debug_mode: bool = False
+    debug_folder: Optional[str] = None  # Local folder path for debug output
+    debug_images: Optional[set[str]] = None  # Set of image filenames to debug (None = all images)
     
     def __post_init__(self):
         """Validate configuration values."""

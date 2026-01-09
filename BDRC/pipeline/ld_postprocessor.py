@@ -4,6 +4,7 @@ import traceback
 from .types_common import DecodedFrame, Record, InferredFrame, PipelineError, EndOfStream
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from .img_helpers import apply_transform_1
+from .debug_helpers import should_debug_image, save_debug_image, save_debug_contours
 
 import cv2
 import numpy as np
@@ -152,8 +153,25 @@ class LDPostProcessor:
                 await asyncio.sleep(0)
 
     async def _handle_pass1(self, inf_frame: InferredFrame) -> None:
+        # Check debug mode once and reuse
+        debug_this_image = should_debug_image(self.cfg, inf_frame.task.img_filename)
+        
+        # Debug helper (fire-and-forget, errors won't affect pipeline)
+        async def _save_debug_safe(func, *args):
+            try:
+                await func(*args)
+            except Exception:
+                pass  # Silently ignore debug save errors
+        
+        if debug_this_image:
+            asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "10_pass1_line_mask", inf_frame.line_mask))
+        
         # 1. detect contours
         contours = get_filtered_contours(inf_frame.line_mask)
+
+        # Debug: save pass1 contours
+        if debug_this_image:
+            asyncio.create_task(_save_debug_safe(save_debug_contours, self.cfg, inf_frame.task.img_filename, "11_pass1_contours", inf_frame.frame, contours))
 
         # 2. rotation angle
         h, w = inf_frame.line_mask.shape
@@ -164,6 +182,13 @@ class LDPostProcessor:
         )
         if rotation_angle != 0.0:
             contours = rotate_contours(contours, rotation_angle, h, w)
+            
+            # Debug: save rotation image
+            if debug_this_image:
+                # Import private helper for rotation (same package, so it's fine)
+                from .img_helpers import _apply_rotation_1
+                rotated_frame = _apply_rotation_1(inf_frame.frame, rotation_angle)
+                asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "12_rotation", rotated_frame))
 
         # 3. TPS points (may be None)
         tps_points = get_tps_points(
@@ -197,6 +222,19 @@ class LDPostProcessor:
             alpha = self.cfg.tps_alpha
 
         transformed_frame = apply_transform_1(inf_frame.frame, rotation_angle, input_pts, output_pts, alpha)
+        
+        # Debug: save TPS image (if TPS was applied)
+        if debug_this_image and tps_points is not None:
+            # We want to show TPS on the rotated image (if rotation was applied)
+            # Import private helpers (same package, so it's fine)
+            from .img_helpers import _apply_rotation_1, _apply_tps_1
+            if rotation_angle != 0.0:
+                rotated_frame = _apply_rotation_1(inf_frame.frame, rotation_angle)
+                tps_frame = _apply_tps_1(rotated_frame, input_pts, output_pts, alpha)
+            else:
+                tps_frame = _apply_tps_1(inf_frame.frame, input_pts, output_pts, alpha)
+            asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "13_tps", tps_frame))
+        
         await self.q_post_processor_to_gpu_pass_2.put(
             DecodedFrame(
                 task=inf_frame.task,
@@ -212,8 +250,24 @@ class LDPostProcessor:
         )
 
     async def _finalize_record(self, inf_frame: InferredFrame) -> None:
+        # Debug: save pass2 line mask (fire-and-forget, errors won't affect pipeline)
+        async def _save_debug_safe(func, *args):
+            try:
+                await func(*args)
+            except Exception:
+                pass  # Silently ignore debug save errors
+        
+        if should_debug_image(self.cfg, inf_frame.task.img_filename):
+            asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "20_pass2_line_mask", inf_frame.line_mask))
+        
         # Cheap pass2 finalization: just contours
         contours = get_filtered_contours(inf_frame.line_mask)
+        
+        # Debug: save pass2 contours (on the transformed frame if available)
+        if should_debug_image(self.cfg, inf_frame.task.img_filename):
+            # Use the frame from inf_frame (which is the transformed frame after rotation/TPS)
+            asyncio.create_task(_save_debug_safe(save_debug_contours, self.cfg, inf_frame.task.img_filename, "21_pass2_contours", inf_frame.frame, contours))
+        
         # scale contours to original image dimensions (frame.orig_h, frame.orig_w)
         contours = scale_contours(contours, inf_frame.line_mask.shape[0], inf_frame.line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
         # scale tps_data to original image dimensions
