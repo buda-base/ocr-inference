@@ -85,7 +85,9 @@ class Decoder:
                     )
         finally:
             # Ensure thread pool is properly shut down
-            self.pool.shutdown(wait=True, timeout=30.0)
+            # ThreadPoolExecutor.shutdown() has no timeout parameter (Python 3.12+).
+            # We do a best-effort clean shutdown; cancellation is handled by task cancellation upstream.
+            self.pool.shutdown(wait=True)
 
 
 

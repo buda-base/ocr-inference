@@ -31,7 +31,8 @@ except Exception:  # pragma: no cover
 SESSION = boto3.Session() if boto3 is not None else None
 S3 = SESSION.client("s3") if SESSION is not None else None
 
-console = Console()
+# Send UI + diagnostics to stderr by default (stdout can be reserved for piping results).
+console = Console(stderr=True)
 
 # Common image file extensions
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
@@ -134,11 +135,29 @@ def get_image_list_and_version_s3(w_id: str, i_id: str) -> Tuple[Optional[List[I
 def make_progress_hook(q: asyncio.Queue[Dict[str, Any]]):
     # Called from inside pipeline tasks; must not block.
     def hook(evt: Dict[str, Any]) -> None:
+        # Always surface fatal events to stderr immediately, even if the UI queue is full.
+        if evt.get("type") == "fatal":
+            try:
+                stage = evt.get("stage", "unknown")
+                err = evt.get("error", "unknown error")
+                console.print(f"[bold red]FATAL[/bold red] ({stage}): {err}", highlight=False)
+                # Print a compact payload for debugging (e.g. record_summary, URIs)
+                extra = {k: v for k, v in evt.items() if k not in ("type",)}
+                console.print(extra, highlight=False)
+            except Exception:
+                pass
         try:
             q.put_nowait(evt)
         except asyncio.QueueFull:
-            # Drop progress events under load; pipeline must win.
-            pass
+            # Drop events under load; pipeline must win.
+            # But for fatal, make a best-effort to deliver it to the UI by evicting one older event.
+            if evt.get("type") == "fatal":
+                try:
+                    _ = q.get_nowait()
+                    q.put_nowait(evt)
+                except Exception:
+                    pass
+            return
     return hook
 
 
