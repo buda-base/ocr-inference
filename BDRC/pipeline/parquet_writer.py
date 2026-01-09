@@ -16,6 +16,7 @@ import pyarrow.fs as pafs
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 import numpy as np
+import reprlib
 
 
 def _truncate(s: Optional[str], max_len: int) -> Optional[str]:
@@ -238,6 +239,7 @@ class ParquetWriter:
                     "stage": "ParquetWriter._flush",
                     "error": f"{type(e).__name__}: {e}",
                     "sample_row_keys": sorted(list(sample.keys())) if isinstance(sample, dict) else None,
+                    "sample_row_summary": self._summarize_obj(sample) if isinstance(sample, dict) else None,
                 }
             )
             raise
@@ -297,7 +299,21 @@ class ParquetWriter:
                     )
                 else:
                     # Record
-                    self._buffer.append(self._row_from_record(msg))
+                    try:
+                        self._buffer.append(self._row_from_record(msg))
+                    except Exception as e:
+                        # This is the most actionable failure mode: record contains values we cannot serialize
+                        # into the declared Arrow schema. Emit a compact summary for debugging.
+                        self._emit_progress(
+                            {
+                                "type": "fatal",
+                                "stage": "ParquetWriter._row_from_record",
+                                "error": f"{type(e).__name__}: {e}",
+                                "img": getattr(getattr(msg, "task", None), "img_filename", None),
+                                "record_summary": self._summarize_record(msg),
+                            }
+                        )
+                        raise
                     self._success_count += 1
                     self._emit_progress({"type": "item", "ok": True, "img": msg.task.img_filename})
 
@@ -353,6 +369,69 @@ class ParquetWriter:
     # -----------------------------
     # Serialization helpers (PyArrow compatibility)
     # -----------------------------
+    @staticmethod
+    def _repr_short(obj: Any, limit: int = 240) -> str:
+        r = reprlib.Repr()
+        r.maxstring = 120
+        r.maxother = 120
+        s = r.repr(obj)
+        if len(s) > limit:
+            return s[: limit - 1] + "…"
+        return s
+
+    def _summarize_obj(self, obj: Any) -> Any:
+        """
+        Return a JSON-serializable summary of obj (types/shapes/lengths), safe for logging.
+        Never returns large payloads.
+        """
+        try:
+            if obj is None:
+                return None
+            if isinstance(obj, (str, int, float, bool)):
+                return obj
+            if isinstance(obj, dict):
+                out: Dict[str, Any] = {}
+                for k, v in list(obj.items())[:50]:
+                    out[str(k)] = self._summarize_obj(v)
+                if len(obj) > 50:
+                    out["_truncated"] = f"{len(obj) - 50} keys omitted"
+                return out
+            if isinstance(obj, np.ndarray):
+                return {
+                    "type": "ndarray",
+                    "dtype": str(obj.dtype),
+                    "shape": list(obj.shape),
+                    "size": int(obj.size),
+                }
+            if isinstance(obj, (list, tuple)):
+                return {
+                    "type": type(obj).__name__,
+                    "len": len(obj),
+                    "sample0": self._summarize_obj(obj[0]) if len(obj) > 0 else None,
+                    "sample1": self._summarize_obj(obj[1]) if len(obj) > 1 else None,
+                }
+            # Fallback
+            return {"type": type(obj).__name__, "repr": self._repr_short(obj)}
+        except Exception as e:
+            return {"type": type(obj).__name__, "summary_error": f"{type(e).__name__}: {e}"}
+
+    def _summarize_record(self, rec: Any) -> Dict[str, Any]:
+        """Compact, safe debug info for a Record that failed serialization."""
+        try:
+            task = getattr(rec, "task", None)
+            return {
+                "img_filename": getattr(task, "img_filename", None),
+                "source_uri": getattr(task, "source_uri", None),
+                "source_etag": getattr(rec, "source_etag", None),
+                "rotation_angle": getattr(rec, "rotation_angle", None),
+                "tps_data": self._summarize_obj(getattr(rec, "tps_data", None)),
+                "contours": self._summarize_obj(getattr(rec, "contours", None)),
+                "contours_bboxes": self._summarize_obj(getattr(rec, "contours_bboxes", None)),
+                "nb_contours": getattr(rec, "nb_contours", None),
+            }
+        except Exception as e:
+            return {"summary_error": f"{type(e).__name__}: {e}"}
+
     @staticmethod
     def _clamp_int16(v: int) -> int:
         if v < -32768:
@@ -424,12 +503,34 @@ class ParquetWriter:
         except Exception:
             return None, None
 
-        in_arr = np.asarray(in_pts, dtype=np.float32).reshape(-1, 2)
-        out_arr = np.asarray(out_pts, dtype=np.float32).reshape(-1, 2)
+        try:
+            in_arr = np.asarray(in_pts, dtype=np.float32)
+            out_arr = np.asarray(out_pts, dtype=np.float32)
+        except Exception:
+            return None, None
+
+        # Accept (N,2) or anything reshapeable to (N,2) with even element count.
+        try:
+            if in_arr.ndim != 2 or in_arr.shape[1] != 2:
+                if in_arr.size < 2 or (in_arr.size % 2) != 0:
+                    return None, None
+                in_arr = in_arr.reshape(-1, 2)
+            if out_arr.ndim != 2 or out_arr.shape[1] != 2:
+                if out_arr.size < 2 or (out_arr.size % 2) != 0:
+                    return None, None
+                out_arr = out_arr.reshape(-1, 2)
+        except Exception:
+            return None, None
+
         n = min(in_arr.shape[0], out_arr.shape[0])
+        if n <= 0:
+            return None, None
         pts = []
         for i in range(n):
             iy, ix = float(in_arr[i, 0]), float(in_arr[i, 1])
             oy, ox = float(out_arr[i, 0]), float(out_arr[i, 1])
             pts.append([iy, ix, oy, ox])
-        return pts, float(alpha)
+        try:
+            return pts, float(alpha)
+        except Exception:
+            return pts, None
