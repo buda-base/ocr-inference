@@ -15,6 +15,7 @@ import pyarrow.fs as pafs
 
 from urllib.parse import urlparse, unquote
 from pathlib import Path
+import numpy as np
 
 
 def _truncate(s: Optional[str], max_len: int) -> Optional[str]:
@@ -151,42 +152,40 @@ class ParquetWriter:
             raise
 
     def _row_from_record(self, rec: Record) -> Dict[str, Any]:
-        # Identity + ok/error summary
+        # Schema-aligned row (see parquet_schemas.py)
+        tps_points, tps_alpha = self._serialize_tps(rec.tps_data)
         row = {
             "img_file_name": rec.task.img_filename,
             "source_etag": rec.source_etag,
+            "rotation_angle": rec.rotation_angle,
+            "tps_points": tps_points,
+            "tps_alpha": tps_alpha,
+            "contours": self._serialize_contours(rec.contours),
+            "nb_contours": int(rec.nb_contours),
+            "contours_bboxes": self._serialize_bboxes(rec.contours_bboxes),
+            # Hybrid error summary (nullable)
             "ok": True,
             "error_stage": None,
             "error_type": None,
             "error_message": None,
-            "error_id": None,
-            # Record fields
-            "rotation_angle": rec.rotation_angle,
-            "tps_data": rec.tps_data,
-            "contours": rec.contours,
-            "nb_contours": rec.nb_contours,
-            "contours_bboxes": rec.contours_bboxes,
         }
         return row
 
     def _row_from_error(self, err: PipelineError) -> Dict[str, Any]:
-        img_file_name = None
-        if err.task is not None:
-            img_file_name = getattr(err.task, "img_filename", None)
-
+        img_file_name = getattr(getattr(err, "task", None), "img_filename", None)
         row = {
             "img_file_name": img_file_name,
-            "img_source_etag": getattr(err, "source_etag", None),
+            "source_etag": getattr(err, "source_etag", None),
+            "rotation_angle": None,
+            "tps_points": None,
+            "tps_alpha": None,
+            "contours": None,
+            "nb_contours": None,
+            "contours_bboxes": None,
             "ok": False,
             "error_stage": err.stage,
             "error_type": err.error_type,
             "error_message": _truncate(err.message, self.max_error_message_len),
-            # Feature fields are null for error rows
-            "rotation_angle": None,
-            "tps_data": None,
-            "contours": None,
-            "nb_contours": None,
-            "contours_bboxes": None,
         }
         return row
 
@@ -224,7 +223,24 @@ class ParquetWriter:
 
         rows_len = len(self._buffer)
         self._emit_progress({"type": "flush", "state": "start", "rows": rows_len})
-        table = pa.Table.from_pylist(self._buffer, schema=self._schema)
+        try:
+            table = pa.Table.from_pylist(self._buffer, schema=self._schema)
+        except Exception as e:
+            # Surface schema/serialization issues clearly in the UI.
+            sample = None
+            try:
+                sample = self._buffer[0]
+            except Exception:
+                pass
+            self._emit_progress(
+                {
+                    "type": "fatal",
+                    "stage": "ParquetWriter._flush",
+                    "error": f"{type(e).__name__}: {e}",
+                    "sample_row_keys": sorted(list(sample.keys())) if isinstance(sample, dict) else None,
+                }
+            )
+            raise
         self._writer.write_table(table)
         self._buffer.clear()
         self._emit_progress({"type": "flush", "state": "end", "rows": rows_len})
@@ -237,6 +253,14 @@ class ParquetWriter:
         if self._error_fh is not None:
             self._error_fh.close()
             self._error_fh = None
+        # If the run had no errors, remove the (possibly empty) errors JSONL sidecar.
+        # This keeps downstream consumers simpler and avoids leaving stale empty files around.
+        if self._error_count == 0 and self._err_fs is not None and self._errors_path is not None:
+            try:
+                self._err_fs.delete_file(self._errors_path)
+            except Exception:
+                # Best-effort: ignore deletion failures (permissions / eventual consistency / etc.)
+                pass
 
     async def run(self) -> None:
         """
@@ -325,3 +349,87 @@ class ParquetWriter:
             "errors_by_stage": dict(self._error_by_stage),
         }
         self._emit_progress(summary)
+
+    # -----------------------------
+    # Serialization helpers (PyArrow compatibility)
+    # -----------------------------
+    @staticmethod
+    def _clamp_int16(v: int) -> int:
+        if v < -32768:
+            return -32768
+        if v > 32767:
+            return 32767
+        return v
+
+    def _serialize_contours(self, contours: Any) -> Any:
+        """
+        Schema: list<list<struct<x:int16,y:int16>>>
+        Input: typically List[np.ndarray] where each ndarray is (N,1,2) or (N,2).
+        """
+        if contours is None:
+            return None
+        out = []
+        for c in contours:
+            if c is None:
+                continue
+            if isinstance(c, np.ndarray):
+                pts = c.reshape(-1, 2)
+                pts_list = pts.tolist()
+            else:
+                pts_list = list(c)
+            contour_structs = []
+            for xy in pts_list:
+                x = int(xy[0])
+                y = int(xy[1])
+                contour_structs.append({"x": self._clamp_int16(x), "y": self._clamp_int16(y)})
+            out.append(contour_structs)
+        return out
+
+    def _serialize_bboxes(self, bboxes: Any) -> Any:
+        """
+        Schema: list<struct<x:int16,y:int16,w:int16,h:int16>>
+        Input: typically List[Tuple[int,int,int,int]]
+        """
+        if bboxes is None:
+            return None
+        out = []
+        for b in bboxes:
+            if b is None:
+                continue
+            x, y, w, h = b
+            out.append(
+                {
+                    "x": self._clamp_int16(int(x)),
+                    "y": self._clamp_int16(int(y)),
+                    "w": self._clamp_int16(int(w)),
+                    "h": self._clamp_int16(int(h)),
+                }
+            )
+        return out
+
+    def _serialize_tps(self, tps_data: Any) -> tuple[Any, Any]:
+        """
+        Schema:
+          - tps_points: list<list<float32>>
+          - tps_alpha: float16
+
+        Input (from pipeline): (input_pts[N,2], output_pts[N,2], alpha) or None.
+
+        We store one row per point as [in_y, in_x, out_y, out_x] to keep both mappings.
+        """
+        if not tps_data:
+            return None, None
+        try:
+            in_pts, out_pts, alpha = tps_data
+        except Exception:
+            return None, None
+
+        in_arr = np.asarray(in_pts, dtype=np.float32).reshape(-1, 2)
+        out_arr = np.asarray(out_pts, dtype=np.float32).reshape(-1, 2)
+        n = min(in_arr.shape[0], out_arr.shape[0])
+        pts = []
+        for i in range(n):
+            iy, ix = float(in_arr[i, 0]), float(in_arr[i, 1])
+            oy, ox = float(out_arr[i, 0]), float(out_arr[i, 1])
+            pts.append([iy, ix, oy, ox])
+        return pts, float(alpha)
