@@ -84,6 +84,10 @@ class PipelineConfig:
     debug_folder: Optional[str] = None  # Local folder path for debug output
     debug_images: Optional[set[str]] = None  # Set of image filenames to debug (None = all images)
     
+    # GPU profiling
+    enable_pytorch_profiler: bool = False  # Enable PyTorch profiler for GPU timing analysis
+    profiler_trace_output: Optional[str] = None  # Output path for profiler trace (default: pytorch_trace.json)
+    
     def __post_init__(self):
         """Validate configuration values."""
         # Queue size validations - ensure queues are large enough for batch sizes

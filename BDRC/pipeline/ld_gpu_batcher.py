@@ -117,6 +117,28 @@ class LDGpuBatcher:
         self._pending_frames: Dict[int, _PendingFrame] = {}
         # Tile pool: naturally bounded by queue backpressure (see _enqueue_decoded_frame docstring)
         self._tile_pool: Deque[_TileWorkItem] = deque()
+        
+        # PyTorch profiler (optional)
+        self._profiler: Optional[Any] = None
+        self._profiler_enabled = getattr(cfg, "enable_pytorch_profiler", False)
+        if self._profiler_enabled:
+            try:
+                # Create profiler - we'll use it as a context manager for each inference
+                self._profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                )
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to initialize PyTorch profiler: {e}")
+                self._profiler_enabled = False
+                self._profiler = None
 
     async def _throttle_tile_pool(self, incoming_tiles: int) -> None:
         """
@@ -342,6 +364,20 @@ class LDGpuBatcher:
                     # We made progress; it's still a good time to check whether the init lane fully drained.
                     await self._maybe_emit_gpu_pass_1_eos()
         finally:
+            # Export profiler trace if enabled
+            if self._profiler_enabled and self._profiler is not None:
+                try:
+                    output_path = getattr(self.cfg, "profiler_trace_output", None) or "pytorch_trace.json"
+                    self._profiler.export_chrome_trace(output_path)
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(f"PyTorch profiler trace exported to: {output_path}")
+                    logger.info(f"View in Chrome: chrome://tracing (load {output_path})")
+                except Exception as e:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Failed to export profiler trace: {e}")
+            
             # Strategic GPU cache clearing at end of processing
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -638,7 +674,13 @@ class LDGpuBatcher:
         returns: [B, 1, 512, 512] float32 on device
         """
         with torch.inference_mode():
-            logits = self.model(tiles_3)
+            # Profile the model forward pass if profiler is enabled
+            if self._profiler_enabled and self._profiler is not None:
+                # Use profiler as context manager for this inference call
+                with self._profiler:
+                    logits = self.model(tiles_3)
+            else:
+                logits = self.model(tiles_3)
 
             # Handle either [B,1,H,W] or [B,C,H,W]
             if logits.ndim != 4:
