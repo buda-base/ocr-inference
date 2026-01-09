@@ -126,7 +126,10 @@ class OCRLine:
 
     guid: UUID
     text: str
-    encoding: Encoding
+    encoding: str
+    ctc_conf: Optional[float] | None
+    logits: Optional[List[float]] | None
+    lm_scores: Optional[List[float]] | None
 
 
 @dataclass

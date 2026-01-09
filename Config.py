@@ -80,7 +80,7 @@ LINE_SORTING = {"threshold": LineSorting.THRESHOLD, "peaks": LineSorting.PEAKS}
 TPS_MODE = {"local": TPSMode.LOCAL, "global": TPSMode.GLOBAL}
 
 
-PARQUET_SCHEMA = pa.schema([
+LINE_DETECTION_SCHEMA = pa.schema([
     ("image_name", pa.string()),
     ("image_width", pa.int32()),
     ("image_height", pa.int32()),

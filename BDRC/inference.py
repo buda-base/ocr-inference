@@ -2,13 +2,17 @@ from typing import List, Tuple, Union
 
 import os
 import cv2
+import math
 import numpy as np
 from numpy.typing import NDArray
 
 from glob import glob
 import onnxruntime as ort
 import pyewts
+
 from pyctcdecode import build_ctcdecoder
+from pyctcdecode.decoder import OutputBeam
+
 from scipy.special import softmax
 
 from torch.utils.data import Dataset
@@ -19,6 +23,7 @@ from BDRC.data import (
     Encoding,
     DewarpingResult,
     LayoutDetectionConfig,
+    Line,
     LineDetectionConfig,
     OCRLine,
     OCRModelConfig,
@@ -69,9 +74,11 @@ class CTCDecoder:
     def decode(self, inputs: List[int]) -> str:
         return "".join(self.charset[x - 1] for x in inputs)
 
-    def ctc_decode(self, logits):
+    def ctc_decode(self, logits: NDArray) -> str:
         return self.ctc_decoder.decode(logits).replace(" ", "")
 
+    def ctc_beam_decode(self, logits: NDArray) ->List[OutputBeam]:
+        return self.ctc_decoder.decode_beams(logits)
 
 class Detection:
     def __init__(self, config: LineDetectionConfig | LayoutDetectionConfig):
@@ -314,9 +321,32 @@ class OCRInference:
                 logits, axes=[1, 0]
             )  # adjust logits to have shape time, vocab
 
-        text = self.decoder.ctc_decode(logits)
+        return self.decoder.ctc_decode(logits)
+    
+    
+    def _decode_beams(self, logits: NDArray) -> List[OutputBeam]:
+        if logits.shape[0] == len(self.decoder.ctc_vocab):
+            logits = np.transpose(
+                logits, axes=[1, 0]
+            )  # adjust logits to have shape time, vocab
 
-        return text
+        return self.decoder.ctc_beam_decode(logits)
+    
+
+    def run_beam_code(self, line_image: NDArray, pre_pad: bool = True) -> List[OutputBeam]:
+        if pre_pad:
+            line_image = self._pre_pad(line_image)
+        line_image = self._prepare_ocr_line(line_image)
+
+        if self._swap_hw:
+            line_image = np.transpose(line_image, axes=[0, 2, 1])
+
+        if not self._squeeze_channel_dim:
+            line_image = np.expand_dims(line_image, axis=1)
+
+        logits = self._predict(line_image)
+        return self._decode_beams(logits)
+    
 
     def run(self, line_image: NDArray, pre_pad: bool = True) -> str:
 
@@ -331,9 +361,7 @@ class OCRInference:
             line_image = np.expand_dims(line_image, axis=1)
 
         logits = self._predict(line_image)
-        text = self._decode(logits)
-
-        return text
+        return self._decode(logits)
 
 
 class OCRPipeline:
@@ -370,7 +398,7 @@ class OCRPipeline:
 
     def update_ocr_model(self, config: OCRModelConfig):
         self.ocr_model_config = config
-        self.ocr_inference = OCRInference(self.platform, config)
+        self.ocr_inference = OCRInference(config)
 
     def update_line_detection(
         self, config: Union[LineDetectionConfig, LayoutDetectionConfig]
@@ -378,11 +406,11 @@ class OCRPipeline:
         if isinstance(config, LineDetectionConfig) and isinstance(
             self.line_config, LayoutDetectionConfig
         ):
-            self.line_inference = LineDetection(self.platform, config)
+            self.line_inference = LineDetection(config)
         elif isinstance(config, LayoutDetectionConfig) and isinstance(
             self.line_config, LineDetectionConfig
         ):
-            self.line_inference = LayoutDetection(self.platform, config)
+            self.line_inference = LayoutDetection(config)
 
         else:
             return
@@ -397,11 +425,12 @@ class OCRPipeline:
         Returns:
             (OpStatus.SUCCESS, line_mask) or (OpStatus.FAILED, error_message)
         """
-        if isinstance(self.line_config, LineDetectionConfig):
+        if isinstance(self.line_config, LineDetectionConfig) and self.line_inference is not None:
             line_mask = self.line_inference.predict(image)
-        else:
+        elif isinstance(self.line_config, LayoutDetectionConfig) and self.line_inference is not None:
             layout_mask = self.line_inference.predict(image)
             line_mask = layout_mask[:, :, self.line_config.classes.index("line")]
+
         return OpStatus.SUCCESS, line_mask
 
     def build_lines(
@@ -518,8 +547,7 @@ class OCRPipeline:
         self,
         line_images: List,
         sorted_lines: List,
-        target_encoding: Encoding = Encoding.UNICODE,
-    ) -> Tuple[OpStatus, List[OCRLine] | str]:
+        target_encoding: Encoding = Encoding.UNICODE) -> Tuple[OpStatus, List[OCRLine] | str]:
         """Stage 5: Run OCR inference on line images.
 
         Returns:
@@ -529,7 +557,7 @@ class OCRPipeline:
         for line_img, line_info in zip(line_images, sorted_lines):
             if line_img.shape[0] == 0 or line_img.shape[1] == 0:
                 continue
-
+            
             pred = (
                 self.ocr_inference.run(line_img, self.use_line_prepadding)
                 .strip()
@@ -551,11 +579,73 @@ class OCRPipeline:
                 OCRLine(
                     guid=line_info.guid,
                     text=pred,
-                    encoding=(
-                        Encoding.WYLIE
-                        if target_encoding == Encoding.WYLIE
-                        else Encoding.UNICODE
+                    encoding=(Encoding.WYLIE.name
+                        if target_encoding == Encoding.WYLIE.name
+                        else Encoding.UNICODE.name
                     ),
+                    ctc_conf=None,
+                    norm_logp=None,
+                    logits=None,
+                    lm_scores = None
+                )
+            )
+
+        return OpStatus.SUCCESS, ocr_lines
+
+    def run_text_recognition_eval(
+        self,
+        line_images: List,
+        sorted_lines: List,
+        target_encoding: Encoding = Encoding.UNICODE,
+        top_k_beams: int = 10
+    ) -> Tuple[OpStatus, List[OCRLine]]:
+        """Stage 5: Run OCR inference on line images.
+
+        Returns:
+            (OpStatus.SUCCESS, ocr_lines) or (OpStatus.FAILED, error_message)
+        """
+        ocr_lines = []
+        for line_img, line_info in zip(line_images, sorted_lines):
+            if line_img.shape[0] == 0 or line_img.shape[1] == 0:
+                continue
+            
+            beams = self.ocr_inference.run_beam_code(line_img, self.use_line_prepadding)
+
+            if not beams:
+                continue
+
+            if len(beams) > top_k_beams:
+                beams = beams[:top_k_beams]
+
+            pred = beams[0].text.strip().replace(" ", "") # beams[0] = top-1 pred
+            pred = pred.replace("§", " ")
+
+            if (
+                self.encoder == CharsetEncoder.WYLIE
+                and target_encoding == Encoding.UNICODE
+            ):
+                pred = self.converter.toUnicode(pred)
+            elif (
+                self.encoder == CharsetEncoder.STACK
+                and target_encoding == Encoding.WYLIE
+            ):
+                pred = self.converter.toWylie(pred)
+
+            # length-normalized log-probs of top-1 pred
+            L = max(len(beams[0].text), 1)
+            norm_logp = beams[0].logit_score / L
+
+            ocr_lines.append(
+                OCRLine(
+                    guid=line_info.guid,
+                    text=pred,
+                    encoding=(
+                        Encoding.WYLIE.name
+                        if target_encoding == Encoding.WYLIE._name_ else Encoding.UNICODE.name
+                    ),
+                    ctc_conf=float(math.exp(norm_logp)),
+                    logits=[float(x.logit_score) for x in beams],
+                    lm_scores = None
                 )
             )
 
@@ -574,7 +664,8 @@ class OCRPipeline:
         use_tps: bool = False,
         tps_threshold: float = 0.25,
         target_encoding: Encoding = Encoding.UNICODE,
-    ):
+        eval_mode: bool = False
+    ) -> Tuple[OpStatus, List[OCRLine] | List[Line] | str]:
         try:
             if not self.ready:
                 return OpStatus.FAILED, "OCR pipeline not ready"
@@ -633,17 +724,25 @@ class OCRPipeline:
 
             # Stage 5: OCR inference
             try:
-                status, result = self.run_text_recognition(
-                    line_images, sorted_lines, target_encoding=target_encoding
-                )
-                if status == OpStatus.FAILED:
-                    return status, result
+
+                if (eval_mode):
+                    status, result = self.run_text_recognition_eval(
+                        line_images, sorted_lines, target_encoding=target_encoding
+                    )
+                    if status == OpStatus.FAILED:
+                        return status, result
+                else:
+                    status, result = self.run_text_recognition(
+                        line_images, sorted_lines, target_encoding=target_encoding
+                    )
+                    if status == OpStatus.FAILED:
+                        return status, result
                 ocr_lines = result
             except Exception as e:
                 return OpStatus.FAILED, f"OCR processing failed: {str(e)}"
 
-            return OpStatus.SUCCESS, (rot_mask, sorted_lines, ocr_lines, page_angle)
-
+            return OpStatus.SUCCESS, [rot_mask, sorted_lines, ocr_lines, float(page_angle)]
+        
         except Exception as e:
             return OpStatus.FAILED, f"OCR pipeline failed: {str(e)}"
 

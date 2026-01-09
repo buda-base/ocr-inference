@@ -51,7 +51,12 @@ from BDRC.line_detection import (
     mask_n_crop,
     rotate_from_angle,
 )
-from Config import CHARSETENCODER, OCRARCHITECTURE, COLOR_DICT, PARQUET_SCHEMA
+from Config import (
+    CHARSETENCODER,
+    OCRARCHITECTURE,
+    COLOR_DICT,
+    LINE_DETECTION_SCHEMA,
+)
 
 from huggingface_hub import snapshot_download
 
@@ -107,37 +112,6 @@ def download_model(identifier: str) -> str:
     assert os.path.isfile(model_config)
 
     return model_config
-
-
-def read_ocr_model_config(config_file: str):
-    model_dir = os.path.dirname(config_file)
-    file = open(config_file, encoding="utf-8")
-    json_content = json.loads(file.read())
-
-    onnx_model_file = f"{model_dir}/{json_content['onnx-model']}"
-
-    input_width = json_content["input_width"]
-    input_height = json_content["input_height"]
-    input_layer = json_content["input_layer"]
-    output_layer = json_content["output_layer"]
-    squeeze_channel_dim = (
-        True if json_content["squeeze_channel_dim"] == "yes" else False
-    )
-    swap_hw = True if json_content["swap_hw"] == "yes" else False
-    characters = get_charset(json_content["charset"])
-
-    config = OCRModelConfig(
-        onnx_model_file,
-        input_width,
-        input_height,
-        input_layer,
-        output_layer,
-        squeeze_channel_dim,
-        swap_hw,
-        characters,
-    )
-
-    return config
 
 
 def read_line_model_config(config_file: str) -> LineDetectionConfig:
@@ -219,7 +193,7 @@ def create_dir(dir_name: str) -> None:
             print(f"Failed to create directory at: {dir_name}, {e}")
 
 
-def build_ocr_data(id_val, file_path: str, target_width: int = None):
+def build_ocr_data(id_val, file_path: str, target_width: int = 2048):
     """
     Build OCR data from a file path.
 
@@ -859,7 +833,7 @@ def create_preview_image(
                 mask, line_predictions, contourIdx=idx, color=color, thickness=-1
             )
 
-    if len(caption_predictions) > 0:
+    if caption_predictions is not None and len(caption_predictions) > 0:
         color = tuple([int(x) for x in COLOR_DICT["caption"].split(",")])
 
         for idx, _ in enumerate(caption_predictions):
@@ -867,7 +841,7 @@ def create_preview_image(
                 mask, caption_predictions, contourIdx=idx, color=color, thickness=-1
             )
 
-    if len(margin_predictions) > 0:
+    if margin_predictions is not None and len(margin_predictions) > 0:
         color = tuple([int(x) for x in COLOR_DICT["margin"].split(",")])
 
         for idx, _ in enumerate(margin_predictions):
@@ -1032,7 +1006,7 @@ def write_result_parquet(result, out_dir):
                 "bboxes": bboxes_to_pyarrow(result["bboxes"]),
             }
         ],
-        schema=PARQUET_SCHEMA,
+        schema=LINE_DETECTION_SCHEMA,
     )
 
     out_path = os.path.join(out_dir, f"{base_name}.parquet")
@@ -1136,3 +1110,59 @@ def infer_batch(
         }
 
         return result
+
+
+
+def save_ocr_lines_parquet(ocr_lines, out_path):
+    """
+    Saves a list of OCRLine to Parquet.
+    """
+
+    data = {
+        "guid": [],
+        "text": [],
+        "encoding": [],
+        "ctc_conf": [],
+        "norm_logp": [],
+        "n_beams": [],
+        "logits": [],
+        "lm_scores": []
+    }
+
+    for line in ocr_lines:
+        data["guid"].append(str(line.guid))
+        data["text"].append(line.text)
+        data["encoding"].append(line.encoding)
+        data["ctc_conf"].append(float(line.ctc_conf))
+
+        # If you add these fields:
+        data["norm_logp"].append(float(getattr(line, "norm_logp", 0.0)))
+        data["n_beams"].append(len(line.logits))
+
+        data["logits"].append(line.logits)
+
+        if line.lm_scores is None:
+            data["lm_scores"].append(None)
+        else:
+            data["lm_scores"].append(line.lm_scores)
+
+    table = pa.Table.from_pydict(
+        data,
+        schema=pa.schema([
+            ("guid", pa.string()),
+            ("text", pa.string()),
+            ("encoding", pa.string()),
+            ("ctc_conf", pa.float32()),
+            ("norm_logp", pa.float32()),
+            ("n_beams", pa.int16()),
+            ("logits", pa.list_(pa.float32())),
+            ("lm_scores", pa.list_(pa.float32()))
+        ])
+    )
+
+    pq.write_table(
+        table,
+        out_path,
+        compression="zstd",
+        compression_level=7
+    )

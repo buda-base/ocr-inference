@@ -11,7 +11,7 @@ def download_all_models():
         try:
             ret = download_model(v)
             print(ret)
-        except BaseException as e:
+        except BaseException:
             print(f"Failed to download model: {v}")
 
 
