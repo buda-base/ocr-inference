@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -401,7 +402,7 @@ async def run_one_volume(args):
         if args.output_folder:
             output_base_uri = _normalize_uri(args.output_folder).rstrip('/')
         else:
-            output_base_uri = f"s3://bec.bdrc.io/artefacts/line_detection_v1/{w_id}-{i_id}-{i_version}"
+            output_base_uri = f"s3://tests-bec.bdrc.io/artefacts/line_detection_v1/{w_id}-{i_id}-{i_version}"
         
         parquet_filename = f"{w_id}-{i_id}-{i_version}.parquet"
         jsonl_filename = f"{w_id}-{i_id}-{i_version}.jsonl"
@@ -430,6 +431,8 @@ async def run_one_volume(args):
     # Use async context manager for proper cleanup
     async with LDVolumeWorker(cfg, volume_task, s3ctx=s3ctx, progress=hook) as worker:
         total = len(volume_task.image_tasks)
+        worker_run_t0: Optional[float] = None
+        worker_run_s: Optional[float] = None
 
         if args.progress:
             ui = asyncio.create_task(
@@ -441,16 +444,28 @@ async def run_one_volume(args):
                 )
             )
             try:
+                worker_run_t0 = time.perf_counter()
                 await worker.run()
+                worker_run_s = time.perf_counter() - worker_run_t0
             finally:
+                if worker_run_s is None and worker_run_t0 is not None:
+                    worker_run_s = time.perf_counter() - worker_run_t0
                 # If pipeline dies early, unblock UI.
                 try:
                     progress_events.put_nowait({"type": "close"})
                 except asyncio.QueueFull:
                     pass
                 await ui
+                # Logging after Live has exited to avoid mangling the UI.
+                if worker_run_s is not None:
+                    ips = (float(total) / worker_run_s) if (total and worker_run_s > 0) else 0.0
+                    console.log(f"Volume worker runtime: {worker_run_s:.3f}s (images={total}, {ips:.2f} img/s)")
         else:
+            worker_run_t0 = time.perf_counter()
             await worker.run()
+            worker_run_s = time.perf_counter() - worker_run_t0
+            ips = (float(total) / worker_run_s) if (total and worker_run_s > 0) else 0.0
+            console.log(f"Volume worker runtime: {worker_run_s:.3f}s (images={total}, {ips:.2f} img/s)")
 
 
 def main():

@@ -72,6 +72,7 @@ class PipelineConfig:
     tps_add_corners: bool = True
     tps_alpha: float = 0.5
     legacy_tps_detect: bool = False
+    add_corners: bool = True
 
     # Artefact writer
     max_error_message_len = 128

@@ -95,6 +95,7 @@ class LDGpuBatcher:
 
         self._init_done = False
         self._re_done = False
+        self._p1_eos_sent = False
 
         # Device/model configuration
         self.device = "cuda"
@@ -250,7 +251,11 @@ class LDGpuBatcher:
                 # termination condition: both lanes ended (and any internal buffers flushed)
                 if self._init_done and self._re_done:
                     await self._flush()
-                    await self.q_gpu_pass_1_to_post_processor.put(EndOfStream(stream="gpu_pass_1", producer="LDGpuBatcher"))
+                    if not self._p1_eos_sent:
+                        await self.q_gpu_pass_1_to_post_processor.put(
+                            EndOfStream(stream="gpu_pass_1", producer="LDGpuBatcher")
+                        )
+                        self._p1_eos_sent = True
                     await self.q_gpu_pass_2_to_post_processor.put(EndOfStream(stream="gpu_pass_2", producer="LDGpuBatcher"))
                     break
 
@@ -331,11 +336,53 @@ class LDGpuBatcher:
                 # This is important to keep latency bounded when traffic is low.
                 if not took_any:
                     await self._maybe_process_batches(force_on_timeout=True)
+                    await self._maybe_emit_gpu_pass_1_eos()
                     await asyncio.sleep(0)
+                else:
+                    # We made progress; it's still a good time to check whether the init lane fully drained.
+                    await self._maybe_emit_gpu_pass_1_eos()
         finally:
             # Strategic GPU cache clearing at end of processing
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def _has_pending_init_lane_work(self) -> bool:
+        """
+        Return True if there is any remaining *first-pass lane* work that could still produce
+        messages on q_gpu_pass_1_to_post_processor.
+        """
+        # Pending frames in init lane
+        if any((not p.lane_second_pass) for p in self._pending_frames.values()):
+            return True
+
+        # Tiles still enqueued for any init-lane pending frame
+        for t in self._tile_pool:
+            p = self._pending_frames.get(t.frame_id)
+            if p is not None and (not p.lane_second_pass):
+                return True
+
+        return False
+
+    async def _maybe_emit_gpu_pass_1_eos(self) -> None:
+        """
+        Break the end-of-stream cycle between batcher and post-processor:
+
+        - PostProcessor only sends EndOfStream(stream="transformed_pass_1") after it learns that
+          gpu_pass_1 is finished.
+        - Batcher previously only sent gpu_pass_1 EOS at final shutdown, but final shutdown required
+          transformed_pass_1 EOS -> deadlock.
+
+        We therefore emit gpu_pass_1 EOS as soon as the init lane is *fully drained*.
+        """
+        if self._p1_eos_sent:
+            return
+        if not self._init_done:
+            return
+        if self._has_pending_init_lane_work():
+            return
+
+        await self.q_gpu_pass_1_to_post_processor.put(EndOfStream(stream="gpu_pass_1", producer="LDGpuBatcher"))
+        self._p1_eos_sent = True
 
     # -----------------------------
     # Frame ingestion
