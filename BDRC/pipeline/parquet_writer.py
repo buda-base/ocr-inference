@@ -114,21 +114,41 @@ class ParquetWriter:
         if self._writer is not None:
             return
 
-        self._fs, self._parquet_path = _open_filesystem_and_path(self.parquet_uri, self.cfg)
-        self._err_fs, self._errors_path = _open_filesystem_and_path(self.errors_jsonl_uri, self.cfg)
+        try:
+            self._fs, self._parquet_path = _open_filesystem_and_path(self.parquet_uri, self.cfg)
+            self._err_fs, self._errors_path = _open_filesystem_and_path(self.errors_jsonl_uri, self.cfg)
 
-        # Open output streams (direct write; no tmp)
-        parquet_sink = self._fs.open_output_stream(self._parquet_path)
-        self._writer = pq.ParquetWriter(
-            parquet_sink,
-            schema=self._schema,
-            compression=getattr(self.cfg, "parquet_compression", "zstd"),
-            use_dictionary=getattr(self.cfg, "parquet_dictionary_enabled", True),
-            data_page_size=getattr(self.cfg, "parquet_data_page_size", 65536),
-        )
+            # Open output streams (direct write; no tmp)
+            parquet_sink = self._fs.open_output_stream(self._parquet_path)
+            self._writer = pq.ParquetWriter(
+                parquet_sink,
+                schema=self._schema,
+                compression=getattr(self.cfg, "parquet_compression", "zstd"),
+                use_dictionary=getattr(self.cfg, "parquet_dictionary_enabled", True),
+                data_page_size=getattr(self.cfg, "parquet_data_page_size", 65536),
+            )
 
-        # Error sidecar (JSONL)
-        self._error_fh = self._err_fs.open_output_stream(self._errors_path)
+            # Error sidecar (JSONL)
+            self._error_fh = self._err_fs.open_output_stream(self._errors_path)
+        except Exception as e:
+            # Surface the problem to the UI immediately; this is the #1 source of "0 persisted".
+            hint = None
+            if str(self.parquet_uri).startswith("s3://") or str(self.errors_jsonl_uri).startswith("s3://"):
+                hint = (
+                    "Output is on S3. Check AWS credentials and that you have write permission "
+                    "to the destination bucket/prefix (or use --output-folder file:///... to write locally)."
+                )
+            self._emit_progress(
+                {
+                    "type": "fatal",
+                    "stage": "ParquetWriter._ensure_open",
+                    "error": f"{type(e).__name__}: {e}",
+                    "parquet_uri": self.parquet_uri,
+                    "errors_jsonl_uri": self.errors_jsonl_uri,
+                    "hint": hint,
+                }
+            )
+            raise
 
     def _row_from_record(self, rec: Record) -> Dict[str, Any]:
         # Identity + ok/error summary
@@ -172,14 +192,11 @@ class ParquetWriter:
 
     def _write_error_jsonl(self, err: PipelineError) -> None:
         """Write full error details as a JSONL line."""
-        img_file_name = None
-        if err.task is not None:
-            img_file_name = getattr(err.task, "img_filename", None)
-
         # Prefer a stable schema: explicit keys + safe string fields.
+        task = err.task
         payload = {
-            "source_uri": err.task.source_uri,
-            "img_filename": err.task.img_filename,
+            "source_uri": getattr(task, "source_uri", None),
+            "img_filename": getattr(task, "img_filename", None),
             "source_etag": err.source_etag,
             "stage": err.stage,
             "error_type": err.error_type,
@@ -225,56 +242,70 @@ class ParquetWriter:
         """
         Consume messages until EndOfStream, then flush and close.
         """
-        # If pyarrow is absent, we still drain the queue to keep pipeline behavior consistent.
-        # (Useful for unit tests / environments without optional deps.)
-        while True:
-            msg = await self.q_post_processor_to_writer.get()
+        try:
+            # If pyarrow is absent, we still drain the queue to keep pipeline behavior consistent.
+            # (Useful for unit tests / environments without optional deps.)
+            while True:
+                msg = await self.q_post_processor_to_writer.get()
 
-            if isinstance(msg, EndOfStream):
-                break
+                if isinstance(msg, EndOfStream):
+                    break
 
-            if isinstance(msg, PipelineError):
-                # Write error summary row to Parquet + full JSONL record
-                self._ensure_open()
-                self._buffer.append(self._row_from_error(msg))
-                self._write_error_jsonl(msg)
-                
-                # Track errors
-                self._error_count += 1
-                stage = msg.stage
-                self._error_by_stage[stage] = self._error_by_stage.get(stage, 0) + 1
-                
-                self._emit_progress({
-                    "type": "item",
-                    "ok": False,
-                    "img": msg.task.img_filename,
-                    "stage": msg.stage,
-                    "error_type": msg.error_type
-                })
-            else:
-                # Record
-                self._buffer.append(self._row_from_record(msg))
-                self._success_count += 1
-                self._emit_progress({"type": "item", "ok": True, "img": msg.task.img_filename})
-            
-            # Emit periodic error summary
-            total = self._success_count + self._error_count
-            if total > 0 and total % self._summary_interval == 0:
-                self._emit_error_summary()
+                if isinstance(msg, PipelineError):
+                    # Write error summary row to Parquet + full JSONL record
+                    self._ensure_open()
+                    self._buffer.append(self._row_from_error(msg))
+                    self._write_error_jsonl(msg)
 
-            # For small volumes, you can increase flush_every or set it very high.
-            if len(self._buffer) >= self.flush_every:
-                self._flush()
+                    # Track errors
+                    self._error_count += 1
+                    stage = msg.stage
+                    self._error_by_stage[stage] = self._error_by_stage.get(stage, 0) + 1
 
-        # Final flush & close
-        self._flush()
-        self._close()
-        
-        # Emit final error summary
-        if self._success_count > 0 or self._error_count > 0:
-            self._emit_error_summary(final=True)
-        
-        self._emit_progress({"type": "close"})
+                    self._emit_progress(
+                        {
+                            "type": "item",
+                            "ok": False,
+                            "img": getattr(msg.task, "img_filename", "") if getattr(msg, "task", None) else "",
+                            "stage": msg.stage,
+                            "error_type": msg.error_type,
+                        }
+                    )
+                else:
+                    # Record
+                    self._buffer.append(self._row_from_record(msg))
+                    self._success_count += 1
+                    self._emit_progress({"type": "item", "ok": True, "img": msg.task.img_filename})
+
+                # Emit periodic error summary
+                total = self._success_count + self._error_count
+                if total > 0 and total % self._summary_interval == 0:
+                    self._emit_error_summary()
+
+                # For small volumes, you can increase flush_every or set it very high.
+                if len(self._buffer) >= self.flush_every:
+                    self._flush()
+
+            # Final flush & close
+            self._flush()
+            self._close()
+
+            # Emit final error summary
+            if self._success_count > 0 or self._error_count > 0:
+                self._emit_error_summary(final=True)
+
+            self._emit_progress({"type": "close"})
+        except Exception as e:
+            self._emit_progress(
+                {
+                    "type": "fatal",
+                    "stage": "ParquetWriter.run",
+                    "error": f"{type(e).__name__}: {e}",
+                    "parquet_uri": self.parquet_uri,
+                    "errors_jsonl_uri": self.errors_jsonl_uri,
+                }
+            )
+            raise
     
     def _emit_error_summary(self, final: bool = False) -> None:
         """Emit error rate summary for monitoring."""

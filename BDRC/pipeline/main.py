@@ -1,7 +1,5 @@
 import argparse
 import asyncio
-import boto3
-import botocore
 import gzip
 import hashlib
 import io
@@ -14,7 +12,7 @@ import torch
 
 from rich.console import Console
 from rich.live import Live
-from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn
+from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn, MofNCompleteColumn
 from rich.table import Table
 
 from .ld_volume_worker import LDVolumeWorker
@@ -22,8 +20,15 @@ from .types_common import VolumeTask, ImageTask
 from .config import PipelineConfig
 from .s3ctx import S3Context
 
-SESSION = boto3.Session()
-S3 = SESSION.client('s3')
+try:
+    import boto3  # type: ignore
+    import botocore  # type: ignore
+except Exception:  # pragma: no cover
+    boto3 = None
+    botocore = None
+
+SESSION = boto3.Session() if boto3 is not None else None
+S3 = SESSION.client("s3") if SESSION is not None else None
 
 console = Console()
 
@@ -62,6 +67,11 @@ def gets3blob(s3Key: str) -> Tuple[Optional[io.BytesIO], Optional[str]]:
     Downloads an S3 object and returns (BytesIO buffer, etag).
     Returns (None, None) if object not found.
     """
+    if S3 is None or botocore is None:
+        raise RuntimeError(
+            "S3 mode requires boto3+botocore. Install them (see requirements.txt) "
+            "or use --input-folder / --output-folder file:///... for local mode."
+        )
     try:
         # Single request: get_object provides both Body and ETag.
         obj = S3.get_object(Bucket="archive.tbrc.org", Key=s3Key)
@@ -166,6 +176,7 @@ async def ui_loop(
     progress = Progress(
         TextColumn("[bold]{task.description}"),
         BarColumn(),
+        MofNCompleteColumn(),
         TaskProgressColumn(),
         TimeElapsedColumn(),
         transient=False,
@@ -177,6 +188,9 @@ async def ui_loop(
 
     flush_state = "idle"
     last_img = ""
+    fatal: Optional[str] = None
+    fatal_stage: Optional[str] = None
+    fatal_hint: Optional[str] = None
 
     def render():
         # Compose a single live layout (progress + optional queue panel)
@@ -184,7 +198,13 @@ async def ui_loop(
         grid.add_row(progress)
 
         meta = Table.grid(expand=True)
-        meta.add_row(f"Flush: [bold]{flush_state}[/bold]    Last: {last_img}")
+        total_s = str(total) if total is not None else "?"
+        meta_line = f"Total: [bold]{total_s}[/bold]    Flush: [bold]{flush_state}[/bold]    Last: {last_img}"
+        if fatal:
+            meta_line += f"\n[bold red]FATAL[/bold red] ({fatal_stage or 'unknown'}): {fatal}"
+            if fatal_hint:
+                meta_line += f"\nHint: {fatal_hint}"
+        meta.add_row(meta_line)
         grid.add_row(meta)
 
         if show_queues:
@@ -209,6 +229,10 @@ async def ui_loop(
                     progress.advance(err_task, 1)
             elif et == "flush":
                 flush_state = evt.get("state", "unknown")
+            elif et == "fatal":
+                fatal = evt.get("error") or "unknown error"
+                fatal_stage = evt.get("stage")
+                fatal_hint = evt.get("hint")
             elif et == "close":
                 flush_state = "closed"
                 live.update(render())
