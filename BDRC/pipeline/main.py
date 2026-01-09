@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from collections import deque
 import gzip
 import hashlib
 import io
@@ -207,15 +208,32 @@ async def ui_loop(
     fatal: Optional[str] = None
     fatal_stage: Optional[str] = None
     fatal_hint: Optional[str] = None
+    # Sliding-window throughput (images/s over last 3 seconds)
+    rate_window_s = 3.0
+    item_times_s: "deque[float]" = deque()
+
+    def _prune(now_s: float) -> None:
+        cutoff = now_s - rate_window_s
+        while item_times_s and item_times_s[0] < cutoff:
+            item_times_s.popleft()
 
     def render():
         # Compose a single live layout (progress + optional queue panel)
+        now_s = time.monotonic()
+        _prune(now_s)
+        rate = (len(item_times_s) / rate_window_s) if rate_window_s > 0 else 0.0
+
         grid = Table.grid(expand=True)
         grid.add_row(progress)
 
         meta = Table.grid(expand=True)
         total_s = str(total) if total is not None else "?"
-        meta_line = f"Total: [bold]{total_s}[/bold]    Flush: [bold]{flush_state}[/bold]    Last: {last_img}"
+        meta_line = (
+            f"Total: [bold]{total_s}[/bold]    "
+            f"Rate(3s): [bold]{rate:.2f} img/s[/bold]    "
+            f"Flush: [bold]{flush_state}[/bold]    "
+            f"Last: {last_img}"
+        )
         if fatal:
             meta_line += f"\n[bold red]FATAL[/bold red] ({fatal_stage or 'unknown'}): {fatal}"
             if fatal_hint:
@@ -238,6 +256,7 @@ async def ui_loop(
 
             et = evt.get("type")
             if et == "item":
+                item_times_s.append(time.monotonic())
                 last_img = evt.get("img") or ""
                 if evt.get("ok"):
                     progress.advance(done_task, 1)
