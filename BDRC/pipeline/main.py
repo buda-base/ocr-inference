@@ -9,17 +9,13 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
-import torch
-
 from rich.console import Console
 from rich.live import Live
 from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn, MofNCompleteColumn
 from rich.table import Table
 
-from .ld_volume_worker import LDVolumeWorker
 from .types_common import VolumeTask, ImageTask
 from .config import PipelineConfig
-from .s3ctx import S3Context
 
 try:
     import boto3  # type: ignore
@@ -321,46 +317,11 @@ def _get_local_image_tasks(input_folder: str) -> List[ImageTask]:
     
     return image_tasks
 
-def load_model(
-    checkpoint_path: str | Path,
-    *,
-    classes: int = 1,
-) -> torch.nn.Module:
-    """
-    Load the segmentation model from a checkpoint.
-
-    Assumptions (as per existing training artifacts):
-      - checkpoint is a dict with a "state_dict" key.
-      - model architecture is DeepLabV3Plus from segmentation_models_pytorch.
-
-    Performance:
-      - load weights on CPU (fast, avoids GPU RAM spikes).
-      - set eval + disable grads.
-    """
-    ckpt_path = Path(checkpoint_path)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Model checkpoint not found: {ckpt_path}")
-
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
-        raise ValueError("Expected checkpoint dict with a 'state_dict' key")
-
-    state_dict: Dict[str, torch.Tensor] = checkpoint["state_dict"]
-    # Common training wrappers (DataParallel, Lightning, etc.)
-    if any(k.startswith("module.") for k in state_dict.keys()):
-        state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
-
-    import segmentation_models_pytorch as sm
-
-    # Keep this fully local/offline by default (no encoder pretrained weights download).
-    model = sm.DeepLabV3Plus(encoder_name="resnet34", encoder_weights=None, classes=classes)
-    model.load_state_dict(state_dict, strict=True)
-
-    model.eval()
-    model.requires_grad_(False)
-    return model
-
 async def run_one_volume(args):
+    # Import model loading and volume worker only when needed (requires torch)
+    from .model_utils import load_model
+    from .ld_volume_worker import LDVolumeWorker
+    
     model = load_model(args.checkpoint, classes=1)
     
     # Build PipelineConfig with model
@@ -370,9 +331,16 @@ async def run_one_volume(args):
     )
     cfg.model = model
     
+    # Set up debug configuration
+    debug_images_set = None
+    if args.debug_image:
+        debug_images_set = set(args.debug_image)
+    cfg.debug_mode = args.debug
+    cfg.debug_images = debug_images_set
+    
     # Build VolumeTask based on input mode
     volume_task: VolumeTask
-    s3ctx: Optional[S3Context] = None
+    s3ctx: Optional[Any] = None  # S3Context imported lazily when needed
     
     if args.input_folder:
         # Local mode
@@ -397,8 +365,22 @@ async def run_one_volume(args):
         jsonl_uri = _join_uri(output_base_uri, "errors.jsonl")
         
         # Debug folder (always local)
-        debug_folder = str(Path(input_folder).parent / f"{Path(input_folder).name}_debug")
-        os.makedirs(debug_folder, exist_ok=True)
+        if args.debug_folder:
+            debug_folder = os.path.abspath(args.debug_folder)
+        else:
+            # Default: {output_folder}_debug/
+            if output_base_uri.startswith("file://"):
+                path_part = output_base_uri[7:]
+                if os.name == 'nt' and path_part.startswith('/') and len(path_part) > 1 and path_part[2] == ':':
+                    path_part = path_part[1:]
+                debug_folder = str(Path(path_part).parent / f"{Path(path_part).name}_debug")
+            else:
+                # For S3 output, use a local debug folder
+                debug_folder = str(Path(input_folder).parent / f"{Path(input_folder).name}_debug")
+        
+        if cfg.debug_mode:
+            os.makedirs(debug_folder, exist_ok=True)
+        cfg.debug_folder = debug_folder if cfg.debug_mode else None
         
         volume_task = VolumeTask(
             io_mode="local",
@@ -429,15 +411,33 @@ async def run_one_volume(args):
         parquet_uri = _join_uri(output_base_uri, parquet_filename)
         jsonl_uri = _join_uri(output_base_uri, jsonl_filename)
         
+        # Debug folder (always local)
+        if args.debug_folder:
+            debug_folder = os.path.abspath(args.debug_folder)
+        else:
+            # Default: {output_folder}_debug/ (but output might be S3, so use home)
+            if output_base_uri.startswith("file://"):
+                path_part = output_base_uri[7:]
+                if os.name == 'nt' and path_part.startswith('/') and len(path_part) > 1 and path_part[2] == ':':
+                    path_part = path_part[1:]
+                debug_folder = str(Path(path_part).parent / f"{Path(path_part).name}_debug")
+            else:
+                debug_folder = str(Path.home() / f"debug_{w_id}_{i_id}")
+        
+        if cfg.debug_mode:
+            os.makedirs(debug_folder, exist_ok=True)
+        cfg.debug_folder = debug_folder if cfg.debug_mode else None
+        
         volume_task = VolumeTask(
             io_mode="s3",
-            debug_folder_path=str(Path.home() / f"debug_{w_id}_{i_id}"),  # Local debug folder
+            debug_folder_path=debug_folder if cfg.debug_mode else str(Path.home() / f"debug_{w_id}_{i_id}"),  # Local debug folder
             output_parquet_uri=parquet_uri,
             output_jsonl_uri=jsonl_uri,
             image_tasks=image_tasks,
         )
         
-        # Create S3Context for S3 mode
+        # Create S3Context for S3 mode (lazy import to avoid requiring aiobotocore)
+        from .s3ctx import S3Context
         global_sem = asyncio.Semaphore(cfg.s3_max_inflight_global)
         s3ctx = S3Context(cfg, global_sem)
         
@@ -530,6 +530,19 @@ def main():
         help="Also show queue fullness (updates ~1s). Implies --progress.",
     )
     
+    # Debug
+    p.add_argument("--debug", action="store_true", help="Enable debug mode to output intermediate data.")
+    p.add_argument(
+        "--debug-folder",
+        type=str,
+        help="Debug output folder (defaults to {output_folder}_debug/). Implies --debug.",
+    )
+    p.add_argument(
+        "--debug-image",
+        action="append",
+        help="Enable debug output only for specified image filename(s). Can be specified multiple times. Implies --debug.",
+    )
+    
     args = p.parse_args()
     
     # Validate input mode arguments
@@ -542,6 +555,10 @@ def main():
     
     if args.progress_queues:
         args.progress = True
+    
+    # Handle debug flags
+    if args.debug_folder or args.debug_image:
+        args.debug = True
 
     asyncio.run(run_one_volume(args))
 
