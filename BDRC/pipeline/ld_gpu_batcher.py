@@ -112,6 +112,14 @@ class LDGpuBatcher:
 
         self.batch_timeout_s: float = cfg.batch_timeout_ms / 1000.0
 
+
+        # CUDA streams for overlap
+        # - compute happens on the default stream
+        # - D2H copies for finalized masks happen on a dedicated stream so we can overlap
+        #   the next tile batch compute with output transfer.
+        self._d2h_stream = torch.cuda.Stream(device=self.device) if torch.cuda.is_available() else None
+        self._d2h_inflight_limit = int(getattr(cfg, "d2h_inflight_limit", 2))
+        self._d2h_inflight = 0
         # Internal buffers
         self._next_frame_id: int = 1
         self._pending_frames: Dict[int, _PendingFrame] = {}
@@ -119,19 +127,45 @@ class LDGpuBatcher:
         self._tile_pool: Deque[_TileWorkItem] = deque()
         
         # PyTorch profiler (optional)
+        # NOTE: The most interpretable workflow is:
+        #   - keep ONE profiler context open during the run loop,
+        #   - advance it with prof.step() once per model invocation,
+        #   - use a schedule to capture a short representative window,
+        #   - write traces for TensorBoard (much easier than raw Chrome/Perfetto).
         self._profiler: Optional[Any] = None
+        self._profiler_started: bool = False
+        self._profiler_step: int = 0
+
         self._profiler_enabled = getattr(cfg, "enable_pytorch_profiler", False)
         if self._profiler_enabled:
             try:
-                # Create profiler - we'll use it as a context manager for each inference
+                import os
+                prof_dir = getattr(self.cfg, "profiler_dir", "tb_profiler_logs")
+                os.makedirs(prof_dir, exist_ok=True)
+
+                # Keep stacks/shapes off by default: they add a LOT of events and make traces hard to read.
+                prof_with_stack = getattr(self.cfg, "profiler_with_stack", False)
+                prof_record_shapes = getattr(self.cfg, "profiler_record_shapes", False)
+                prof_profile_memory = getattr(self.cfg, "profiler_profile_memory", True)
+
+                # Capture only a short window (wait/warmup/active) unless you explicitly change these.
+                wait = int(getattr(self.cfg, "profiler_wait", 1))
+                warmup = int(getattr(self.cfg, "profiler_warmup", 1))
+                active = int(getattr(self.cfg, "profiler_active", 3))
+                repeat = int(getattr(self.cfg, "profiler_repeat", 1))
+
+                sched = torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
+
                 self._profiler = torch.profiler.profile(
                     activities=[
                         torch.profiler.ProfilerActivity.CPU,
                         torch.profiler.ProfilerActivity.CUDA,
                     ],
-                    record_shapes=True,
-                    profile_memory=True,
-                    with_stack=True,
+                    schedule=sched,
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(prof_dir),
+                    record_shapes=prof_record_shapes,
+                    profile_memory=prof_profile_memory,
+                    with_stack=prof_with_stack,
                 )
             except Exception as e:
                 import logging
@@ -253,6 +287,63 @@ class LDGpuBatcher:
         if self._tile_pool:
             self._tile_pool = deque([t for t in self._tile_pool if t.frame_id != frame_id])
 
+
+    async def _emit_inferred_after_d2h(
+        self,
+        *,
+        pending: _PendingFrame,
+        packed_host: torch.Tensor,
+        done_evt: Optional[torch.cuda.Event],
+        h: int,
+        w: int,
+        pad: int,
+    ) -> None:
+        """Wait for async D2H copy to complete, then emit InferredFrame.
+
+        This runs as a background asyncio task so the main batching loop can keep feeding the GPU.
+        """
+        try:
+            if done_evt is not None:
+                # Avoid blocking the event loop thread.
+                await asyncio.to_thread(done_evt.synchronize)
+
+            packed_np = packed_host.numpy()
+            line_mask_packed = ("packedbits", packed_np, int(h), int(w), int(pad))
+
+            out = InferredFrame(
+                task=pending.task,
+                source_etag=pending.source_etag,
+                frame=pending.frame,
+                orig_h=pending.orig_h,
+                orig_w=pending.orig_w,
+                is_binary=pending.is_binary,
+                first_pass=pending.first_pass,
+                rotation_angle=pending.rotation_angle,
+                tps_data=pending.tps_data,
+                line_mask=line_mask_packed,
+            )
+
+            if pending.lane_second_pass:
+                await self.q_gpu_pass_2_to_post_processor.put(out)
+            else:
+                await self.q_gpu_pass_1_to_post_processor.put(out)
+
+        except Exception as e:
+            retryable = self._is_cuda_oom(e)
+            if retryable:
+                self._maybe_reinit_gpu("oom")
+            await self._emit_pipeline_error(
+                internal_stage="finalize.emit_after_d2h",
+                exc=e,
+                lane_second_pass=bool(pending.lane_second_pass),
+                task=pending.task,
+                source_etag=pending.source_etag,
+                retryable=bool(retryable),
+                attempt=1,
+            )
+        finally:
+            self._d2h_inflight = max(0, self._d2h_inflight - 1)
+
     async def _pop_one(self, q: asyncio.Queue, timeout_s: float):
         try:
             return await asyncio.wait_for(q.get(), timeout=timeout_s)
@@ -267,6 +358,19 @@ class LDGpuBatcher:
         # Prefer reprocess lane, but don't starve init
         reprocess_budget = self.cfg.reprocess_budget
         init_budget = 1
+
+
+        # Start profiler once for the whole run loop (much more readable than re-entering per inference).
+        if self._profiler_enabled and self._profiler is not None and not self._profiler_started:
+            try:
+                self._profiler.__enter__()
+                self._profiler_started = True
+            except Exception:
+                # If profiler fails mid-run, disable it rather than crashing the scheduler.
+                self._profiler_enabled = False
+                self._profiler = None
+                self._profiler_started = False
+
 
         try:
             while True:
@@ -364,18 +468,49 @@ class LDGpuBatcher:
                     # We made progress; it's still a good time to check whether the init lane fully drained.
                     await self._maybe_emit_gpu_pass_1_eos()
         finally:
-            # Export profiler trace if enabled
+            # Finalize profiler & emit summaries/traces (if enabled)
             if self._profiler_enabled and self._profiler is not None:
+                import logging
+                logger = logging.getLogger(__name__)
                 try:
-                    output_path = getattr(self.cfg, "profiler_trace_output", None) or "pytorch_trace.json"
-                    self._profiler.export_chrome_trace(output_path)
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.info(f"PyTorch profiler trace exported to: {output_path}")
-                    logger.info(f"View in Chrome: chrome://tracing (load {output_path})")
+                    # Make sure all queued CUDA work is finished so the trace is complete/readable.
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                except Exception:
+                    pass
+
+                # Close the profiler context if we opened it in run()
+                if self._profiler_started:
+                    try:
+                        self._profiler.__exit__(None, None, None)
+                    except Exception as e:
+                        logger.warning(f"Failed to close PyTorch profiler cleanly: {e}")
+                    finally:
+                        self._profiler_started = False
+
+                # Print operator summaries directly in logs (fastest way to answer 'what dominates?')
+                try:
+                    ka = self._profiler.key_averages()
+                    logger.info("=== PyTorch Profiler: top ops by CUDA time ===\n" +
+                                ka.table(sort_by="cuda_time_total", row_limit=30))
+                    logger.info("=== PyTorch Profiler: top ops by self CPU time ===\n" +
+                                ka.table(sort_by="self_cpu_time_total", row_limit=30))
+                    if getattr(self.cfg, "profiler_profile_memory", True):
+                        logger.info("=== PyTorch Profiler: top ops by CUDA memory usage ===\n" +
+                                    ka.table(sort_by="cuda_memory_usage", row_limit=30))
                 except Exception as e:
-                    import logging
-                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Failed to compute profiler summaries: {e}")
+
+                # Optional: export a single Chrome trace (useful, but TensorBoard is usually better)
+                try:
+                    if getattr(self.cfg, "profiler_export_chrome", True):
+                        output_path = getattr(self.cfg, "profiler_trace_output", None) or "pytorch_trace.json"
+                        self._profiler.export_chrome_trace(output_path)
+                        logger.info(f"PyTorch profiler Chrome trace exported to: {output_path}")
+                        logger.info(f"Open in Chrome: chrome://tracing (load {output_path})")
+                        prof_dir = getattr(self.cfg, "profiler_dir", "tb_profiler_logs")
+                        logger.info(f"TensorBoard traces (recommended): {prof_dir}  (run: tensorboard --logdir {prof_dir})")
+                except Exception as e:
                     logger.warning(f"Failed to export profiler trace: {e}")
             
             # Strategic GPU cache clearing at end of processing
@@ -596,9 +731,18 @@ class LDGpuBatcher:
         Decide whether to run inference now.
 
         Run when we have tiles_batch_n tiles (or if force_on_timeout and any tiles exist).
+        If we have many tiles queued, drain multiple full batches in one call to reduce
+        scheduling overhead (fewer context switches / Python overhead).
         """
-        if len(self._tile_pool) >= self.cfg.tiles_batch_n or (force_on_timeout and len(self._tile_pool) > 0):
+        if not self._tile_pool:
+            return
+
+        if force_on_timeout and len(self._tile_pool) > 0:
             await self._process_one_tiles_batch(min(self.cfg.tiles_batch_n, len(self._tile_pool)))
+            return
+
+        while len(self._tile_pool) >= self.cfg.tiles_batch_n:
+            await self._process_one_tiles_batch(self.cfg.tiles_batch_n)
 
     async def _process_one_tiles_batch(self, batch_size: int) -> None:
         """
@@ -617,10 +761,20 @@ class LDGpuBatcher:
         impacted_frame_ids = sorted({it.frame_id for it in items})
 
         try:
-            tiles_1 = torch.stack([it.tile_1ch for it in items], dim=0)
-            tiles_3 = tiles_1.expand(-1, 3, -1, -1)
+            with torch.profiler.record_function("tile_batch_prepare"):
+                tiles_1 = torch.stack([it.tile_1ch for it in items], dim=0)
+                tiles_3 = tiles_1.expand(-1, 3, -1, -1)
 
-            soft = self._infer_tiles_to_soft(tiles_3).to(dtype=self._accum_dtype)
+            with torch.profiler.record_function("tile_batch_infer"):
+                soft = self._infer_tiles_to_soft(tiles_3).to(dtype=self._accum_dtype)
+
+            # Advance profiler schedule once per inference call.
+            if self._profiler_enabled and self._profiler is not None and self._profiler_started:
+                try:
+                    self._profiler.step()
+                    self._profiler_step += 1
+                except Exception:
+                    pass
 
             for i, it in enumerate(items):
                 pending = self._pending_frames.get(it.frame_id)
@@ -665,6 +819,10 @@ class LDGpuBatcher:
 
         await self._finalize_completed_frames()
 
+        # Ensure all async D2H emissions are complete before shutdown.
+        while self._d2h_inflight > 0:
+            await asyncio.sleep(0)
+
 
     def _infer_tiles_to_soft(self, tiles_3: torch.Tensor) -> torch.Tensor:
         """
@@ -674,13 +832,18 @@ class LDGpuBatcher:
         returns: [B, 1, 512, 512] float32 on device
         """
         with torch.inference_mode():
-            # Profile the model forward pass if profiler is enabled
-            if self._profiler_enabled and self._profiler is not None:
-                # Use profiler as context manager for this inference call
-                with self._profiler:
-                    logits = self.model(tiles_3)
-            else:
+            # IMPORTANT: we keep the profiler context open for the whole run() loop and only
+            # call prof.step() once per invocation (see _process_tile_batch).
+            # Here we just add named ranges to make the trace readable.
+            prof_sync = bool(getattr(self.cfg, "profiler_sync_cuda", False))
+            if self._profiler_enabled and prof_sync and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            with torch.profiler.record_function("model_forward"):
                 logits = self.model(tiles_3)
+
+            if self._profiler_enabled and prof_sync and torch.cuda.is_available():
+                torch.cuda.synchronize()
 
             # Handle either [B,1,H,W] or [B,C,H,W]
             if logits.ndim != 4:
@@ -695,7 +858,8 @@ class LDGpuBatcher:
                     idx = 0
                 sel = logits[:, idx : idx + 1, :, :]  # keep channel dim
 
-            soft = torch.sigmoid(sel).to(torch.float32)
+            with torch.profiler.record_function("logits_to_probs"):
+                soft = torch.sigmoid(sel).to(torch.float32)
             return soft
 
 
@@ -722,27 +886,52 @@ class LDGpuBatcher:
                 if pending.pad_x > 0:
                     mask_soft = mask_soft[:, :, : pending.orig_w]
 
-                binary = (mask_soft > self.cfg.class_threshold).to(torch.uint8) * 255
-                line_mask_np = binary.squeeze(0).cpu().numpy()
 
-                out = InferredFrame(
-                    task=pending.task,
-                    source_etag=pending.source_etag,
-                    frame=pending.frame,
-                    orig_h=pending.orig_h,
-                    orig_w=pending.orig_w,
-                    is_binary=pending.is_binary,
-                    first_pass=pending.first_pass,
-                    rotation_angle=pending.rotation_angle,
-                    tps_data=pending.tps_data,
-                    line_mask=line_mask_np,
+                with torch.profiler.record_function("threshold_to_packedbits"):
+                    # Boolean mask on GPU
+                    mask_bool = (mask_soft > self.cfg.class_threshold).squeeze(0)  # [H,W] bool
+
+                    # Pack bits along width to reduce D2H bandwidth by ~8x.
+                    # We pack little-endian to match np.unpackbits(..., bitorder="little") downstream.
+                    h, w = mask_bool.shape
+                    pad = (-int(w)) % 8
+                    if pad:
+                        mask_bool = F.pad(mask_bool, (0, pad), value=False)
+
+                    mask_u8 = mask_bool.to(torch.uint8)  # 0/1
+                    w8 = (int(w) + pad) // 8
+                    mask_u8 = mask_u8.view(h, w8, 8)
+
+                    weights = (1 << torch.arange(8, device=mask_u8.device, dtype=torch.uint8)).view(1, 1, 8)
+                    packed = (mask_u8 * weights).sum(dim=2).contiguous()  # [H, W8] uint8
+
+                # Async D2H on a dedicated stream to overlap with next batch compute.
+                with torch.profiler.record_function("packedbits_d2h_async"):
+                    if self._d2h_stream is None:
+                        packed_host = packed.cpu()
+                        done_evt = None
+                    else:
+                        while self._d2h_inflight >= self._d2h_inflight_limit:
+                            await asyncio.sleep(0)
+
+                        packed_host = torch.empty_like(packed, device="cpu", pin_memory=True)
+                        done_evt = torch.cuda.Event()
+                        self._d2h_inflight += 1
+                        with torch.cuda.stream(self._d2h_stream):
+                            packed_host.copy_(packed, non_blocking=True)
+                            done_evt.record(self._d2h_stream)
+
+                # Emit in background after the copy completes (does not block the main batching loop).
+                asyncio.create_task(
+                    self._emit_inferred_after_d2h(
+                        pending=pending,
+                        packed_host=packed_host,
+                        done_evt=done_evt,
+                        h=int(h),
+                        w=int(w),
+                        pad=int(pad),
+                    )
                 )
-
-                if pending.lane_second_pass:
-                    await self.q_gpu_pass_2_to_post_processor.put(out)
-                else:
-                    await self.q_gpu_pass_1_to_post_processor.put(out)
-                
                 # Free GPU memory after emitting
                 del pending.accum_soft
 
@@ -785,3 +974,7 @@ class LDGpuBatcher:
 
         # Safety net: if any frames are somehow left (shouldn't happen), try to finalize.
         await self._finalize_completed_frames()
+
+        # Ensure all async D2H emissions are complete before shutdown.
+        while self._d2h_inflight > 0:
+            await asyncio.sleep(0)
