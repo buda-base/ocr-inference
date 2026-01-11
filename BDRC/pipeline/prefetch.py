@@ -21,7 +21,13 @@ class BasePrefetcher:
         self.q_prefetcher_to_decoder = q_prefetcher_to_decoder
         self._per_worker_sem: asyncio.Semaphore
 
-    def _is_retryable(self, exc: Exception) -> bool:
+    def _is_retryable(self, exc: Exception) -> Union[bool, float]:
+        """Determine if an exception is retryable and return retry delay.
+        
+        Returns:
+            False: Not retryable
+            float: Retryable with the given delay in seconds (per attempt, will be multiplied by attempt number)
+        """
         return False  # keep simple; classify later if desired
 
     async def _fetch_impl(self, task: ImageTask) -> tuple[Optional[str], bytes]:
@@ -39,7 +45,11 @@ class BasePrefetcher:
 
             except Exception as e:
                 tb = traceback.format_exc()
-                retryable = self._is_retryable(e)
+                retry_result = self._is_retryable(e)
+                
+                # retry_result is either False (not retryable) or a float (delay per attempt)
+                retryable = retry_result is not False
+                base_delay = retry_result if isinstance(retry_result, (int, float)) else 0.2
 
                 err = PipelineError(
                     stage="Prefetcher",
@@ -56,7 +66,9 @@ class BasePrefetcher:
                     return err
 
                 attempt += 1
-                await asyncio.sleep(0.2 * attempt)
+                # Multiply base delay by attempt number for exponential backoff
+                delay = base_delay * attempt
+                await asyncio.sleep(delay)
 
     async def run(self) -> None:
         self._per_worker_sem = asyncio.Semaphore(self.cfg.inflight_per_worker)
@@ -96,6 +108,40 @@ class S3Prefetcher(BasePrefetcher):
     def __init__(self, cfg, s3ctx, volume_task: VolumeTask, q_prefetcher_to_decoder: asyncio.Queue[FetchedBytesMsg]):
         super().__init__(cfg, volume_task, q_prefetcher_to_decoder)
         self.s3 = s3ctx
+
+    def _is_retryable(self, exc: Exception) -> Union[bool, float]:
+        """Mark credential errors as retryable with longer delay.
+        
+        On EC2 instances with IAM roles, credential retrieval from the instance
+        metadata service can intermittently fail under high concurrency due to:
+        - Rate limiting on the metadata service
+        - Network timeouts
+        - Race conditions during credential refresh
+        
+        These errors are typically transient and should be retried with a longer
+        delay to allow the metadata service to respond.
+        
+        Returns:
+            False: Not a credential error, not retryable
+            0.5: Credential error, retryable with 0.5s delay per attempt
+        """
+        error_type = type(exc).__name__
+        error_module = type(exc).__module__
+        
+        # Check for botocore credential errors
+        if error_module.startswith("botocore") and error_type in (
+            "NoCredentialsError",
+            "CredentialRetrievalError",
+            "PartialCredentialsError",
+        ):
+            return 0.5  # 0.5s delay per attempt for credential errors
+        
+        # Also check by error message as fallback for edge cases
+        error_msg = str(exc).lower()
+        if "unable to locate credentials" in error_msg:
+            return 0.5  # 0.5s delay per attempt for credential errors
+        
+        return False
 
     async def _fetch_impl(self, task: ImageTask) -> tuple[Optional[str], bytes]:
         bucket, key = _parse_s3_uri(task.source_uri)
