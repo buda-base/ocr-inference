@@ -58,10 +58,11 @@ def make_progress_hook(q: asyncio.Queue[Dict[str, Any]]):
 def render_queue_table(worker) -> Table:
     rows = [
         ("prefetch→decode", worker.q_prefetcher_to_decoder),
-        ("decode→gpu1", worker.q_decoder_to_gpu_pass_1),
-        ("gpu1→post", worker.q_gpu_pass_1_to_post_processor),
-        ("post→gpu2", worker.q_post_processor_to_gpu_pass_2),
-        ("gpu2→post", worker.q_gpu_pass_2_to_post_processor),
+        ("decode→tile", worker.q_decoder_to_tilebatcher),
+        ("post→tile", worker.q_postprocessor_to_tilebatcher),
+        ("tile→infer", worker.q_tilebatcher_to_inference),
+        ("infer1→post", worker.q_gpu_pass_1_to_post_processor),
+        ("infer2→post", worker.q_gpu_pass_2_to_post_processor),
         ("post→writer", worker.q_post_processor_to_writer),
     ]
 
