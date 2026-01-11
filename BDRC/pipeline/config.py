@@ -36,12 +36,12 @@ class PipelineConfig:
 
     # GPU batching
     use_gpu: bool = True
-    compile_model: bool = True
+    compile_model: bool = False
     precision: Precision = "fp16" # bf16, fp16, fp32 or auto
     # Optional cap for the internal tile pool to limit peak memory under backpressure.
     # 0 disables throttling.
     max_tiles_in_pool: int = 2048
-    batch_size: int = 16
+    batch_size: int = 32
     batch_timeout_ms: int = 25
     cuda_streams: int = 2
     binarize_block_size: int = 31

@@ -307,7 +307,19 @@ class LDGpuBatcher:
                 # Avoid blocking the event loop thread.
                 await asyncio.to_thread(done_evt.synchronize)
 
-            packed_np = packed_host.numpy()
+            # Convert to numpy: packed_host is already on CPU and uint8, so this should be efficient.
+            # Use detach() to ensure no gradient tracking, then convert to numpy.
+            # Since packed was already contiguous uint8 on GPU, the CPU copy should be too.
+            packed_np = packed_host.detach().numpy()
+            
+            # Only convert if dtype is wrong (shouldn't happen, but defensive)
+            if packed_np.dtype != np.uint8:
+                packed_np = packed_np.astype(np.uint8, copy=False)
+            
+            # Only make contiguous if needed (shouldn't happen for contiguous source, but defensive)
+            if not packed_np.flags['C_CONTIGUOUS']:
+                packed_np = np.ascontiguousarray(packed_np, dtype=np.uint8)
+            
             line_mask_packed = ("packedbits", packed_np, int(h), int(w), int(pad))
 
             out = InferredFrame(

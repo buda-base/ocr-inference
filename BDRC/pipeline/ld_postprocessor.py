@@ -24,10 +24,40 @@ def _decode_line_mask(line_mask):
     """
     if isinstance(line_mask, tuple) and len(line_mask) == 5 and line_mask[0] == "packedbits":
         _tag, packed, h, w, pad = line_mask
+        
+        # Validate input type
         if not isinstance(packed, np.ndarray):
-            packed = np.asarray(packed, dtype=np.uint8)
+            raise TypeError(
+                f"Expected numpy.ndarray for packed bits, got type: {type(packed)}. "
+                f"If you received a torch.Tensor, it should be converted to numpy in the GPU batcher."
+            )
+        
+        # Validate dtype before unpacking (np.unpackbits requires uint8)
+        if packed.dtype != np.uint8:
+            raise TypeError(
+                f"Expected uint8 dtype for packed bits, got dtype: {packed.dtype}, "
+                f"shape: {packed.shape}, type: {type(packed)}. "
+                f"Array should be converted to uint8 in the GPU batcher."
+            )
+        
+        # Validate shape
+        if packed.ndim != 2:
+            raise ValueError(
+                f"Expected 2D packed bits array, got shape: {packed.shape}, ndim: {packed.ndim}, "
+                f"dtype: {packed.dtype}, type: {type(packed)}"
+            )
+        
         # Unpack little-endian to match packing in GPU stage.
-        unpacked01 = np.unpackbits(packed, axis=1, bitorder="little")
+        try:
+            unpacked01 = np.unpackbits(packed, axis=1, bitorder="little")
+        except TypeError as e:
+            raise TypeError(
+                f"np.unpackbits failed. Array dtype: {packed.dtype}, shape: {packed.shape}, "
+                f"ndim: {packed.ndim}, type: {type(packed)}, "
+                f"is_contiguous: {packed.flags['C_CONTIGUOUS']}, "
+                f"original error: {e}"
+            ) from e
+        
         if pad:
             unpacked01 = unpacked01[:, :w]
         # Convert {0,1} -> {0,255} for existing invariants.
@@ -243,13 +273,9 @@ class LDPostProcessor:
 
         input_pts = output_pts = None
         alpha = None
-        tps_data = None
         if tps_points is not None:
             input_pts, output_pts = tps_points
             alpha = self.cfg.tps_alpha
-            # Only construct tps_data when we have valid TPS points
-            if input_pts is not None and output_pts is not None:
-                tps_data = (input_pts, output_pts, alpha)
 
         transformed_frame = apply_transform_1(inf_frame.frame, rotation_angle, input_pts, output_pts, alpha)
         
@@ -275,7 +301,7 @@ class LDPostProcessor:
                 is_binary=False, # we don't map to binary after processing binary images
                 first_pass=False,
                 rotation_angle=rotation_angle,
-                tps_data=tps_data,
+                tps_data=(input_pts, output_pts, alpha),
             )
         )
 
@@ -304,11 +330,12 @@ class LDPostProcessor:
         contours = scale_contours(contours, line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
         # scale tps_data to original image dimensions
         tps_data = inf_frame.tps_data
-        if tps_data is not None:
-            # tps_data should only be a tuple if we have valid TPS points
-            input_pts, output_pts, alpha = tps_data
+        if tps_data and tps_data[0] is not None and tps_data[1] is not None:
+            # Ensure input and output points are numpy arrays before scaling
+            input_pts = np.asarray(tps_data[0], dtype=np.float64) if not isinstance(tps_data[0], np.ndarray) else tps_data[0]
+            output_pts = np.asarray(tps_data[1], dtype=np.float64) if not isinstance(tps_data[1], np.ndarray) else tps_data[1]
             scaled_tps_points = scale_tps_points(input_pts, output_pts, line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
-            tps_data = (scaled_tps_points[0], scaled_tps_points[1], alpha)
+            tps_data = (scaled_tps_points[0], scaled_tps_points[1], tps_data[2])
         contours_bboxes = get_contour_bboxes(contours)
         h, w = line_mask.shape[:2]
         rec = Record(
