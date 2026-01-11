@@ -10,6 +10,30 @@ import cv2
 import numpy as np
 import numpy.typing as npt
 
+# -----------------------------
+# Packed-bits mask transport (GPU->CPU bandwidth optimization)
+# -----------------------------
+def _decode_line_mask(line_mask):
+    """Accepts either:
+    - a regular uint8 HxW numpy mask in {0,255}
+    - or a tagged tuple ("packedbits", packed_u8[H,W8], H, W, pad)
+      where packed bits are little-endian along width.
+
+    Returns:
+        uint8 HxW mask in {0,255}
+    """
+    if isinstance(line_mask, tuple) and len(line_mask) == 5 and line_mask[0] == "packedbits":
+        _tag, packed, h, w, pad = line_mask
+        if not isinstance(packed, np.ndarray):
+            packed = np.asarray(packed, dtype=np.uint8)
+        # Unpack little-endian to match packing in GPU stage.
+        unpacked01 = np.unpackbits(packed, axis=1, bitorder="little")
+        if pad:
+            unpacked01 = unpacked01[:, :w]
+        # Convert {0,1} -> {0,255} for existing invariants.
+        return (unpacked01.astype(np.uint8) * 255)
+    return line_mask
+
 class LDPostProcessor:
     """
     Consumes InferredFrame from GPU pass 1 and pass 2, decides rotation/TPS, routes.
@@ -153,6 +177,8 @@ class LDPostProcessor:
                 await asyncio.sleep(0)
 
     async def _handle_pass1(self, inf_frame: InferredFrame) -> None:
+        # Decode packed-bit masks if GPU stage sent them
+        line_mask = _decode_line_mask(inf_frame.line_mask)
         # Check debug mode once and reuse
         debug_this_image = should_debug_image(self.cfg, inf_frame.task.img_filename)
         
@@ -164,17 +190,17 @@ class LDPostProcessor:
                 pass  # Silently ignore debug save errors
         
         if debug_this_image:
-            asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "10_pass1_line_mask", inf_frame.line_mask))
+            asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "10_pass1_line_mask", line_mask))
         
         # 1. detect contours
-        contours = get_filtered_contours(inf_frame.line_mask)
+        contours = get_filtered_contours(line_mask)
 
         # Debug: save pass1 contours
         if debug_this_image:
             asyncio.create_task(_save_debug_safe(save_debug_contours, self.cfg, inf_frame.task.img_filename, "11_pass1_contours", inf_frame.frame, contours))
 
         # 2. rotation angle
-        h, w = inf_frame.line_mask.shape
+        h, w = line_mask.shape
         rotation_angle = get_rotation_angle(
             contours, h, w,
             max_angle_deg=self.cfg.max_angle_deg,
@@ -201,7 +227,7 @@ class LDPostProcessor:
         # 4. either finalize or enqueue decoded frame to reprocess
         if tps_points is None and rotation_angle == 0.0:
             # scale contours to original image dimensions (inf_frame.orig_h, inf_frame.orig_w)
-            contours = scale_contours(contours, inf_frame.line_mask.shape[0], inf_frame.line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
+            contours = scale_contours(contours, line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
             contours_bboxes = get_contour_bboxes(contours)
             rec = Record(
                 task=inf_frame.task,
@@ -250,6 +276,8 @@ class LDPostProcessor:
         )
 
     async def _finalize_record(self, inf_frame: InferredFrame) -> None:
+        # Decode packed-bit masks if GPU stage sent them
+        line_mask = _decode_line_mask(inf_frame.line_mask)
         # Debug: save pass2 line mask (fire-and-forget, errors won't affect pipeline)
         async def _save_debug_safe(func, *args):
             try:
@@ -258,10 +286,10 @@ class LDPostProcessor:
                 pass  # Silently ignore debug save errors
         
         if should_debug_image(self.cfg, inf_frame.task.img_filename):
-            asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "20_pass2_line_mask", inf_frame.line_mask))
+            asyncio.create_task(_save_debug_safe(save_debug_image, self.cfg, inf_frame.task.img_filename, "20_pass2_line_mask", line_mask))
         
         # Cheap pass2 finalization: just contours
-        contours = get_filtered_contours(inf_frame.line_mask)
+        contours = get_filtered_contours(line_mask)
         
         # Debug: save pass2 contours (on the transformed frame if available)
         if should_debug_image(self.cfg, inf_frame.task.img_filename):
@@ -269,11 +297,11 @@ class LDPostProcessor:
             asyncio.create_task(_save_debug_safe(save_debug_contours, self.cfg, inf_frame.task.img_filename, "21_pass2_contours", inf_frame.frame, contours))
         
         # scale contours to original image dimensions (frame.orig_h, frame.orig_w)
-        contours = scale_contours(contours, inf_frame.line_mask.shape[0], inf_frame.line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
+        contours = scale_contours(contours, line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
         # scale tps_data to original image dimensions
         tps_data = inf_frame.tps_data
         if tps_data:
-            scaled_tps_points = scale_tps_points(tps_data[0], tps_data[1], inf_frame.line_mask.shape[0], inf_frame.line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
+            scaled_tps_points = scale_tps_points(tps_data[0], tps_data[1], line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
             tps_data = (scaled_tps_points[0], scaled_tps_points[1], tps_data[2])
         contours_bboxes = get_contour_bboxes(contours)
         h, w = inf_frame.line_mask.shape[:2]

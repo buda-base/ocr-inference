@@ -149,9 +149,9 @@ def _compute_downscale(
     scaled_h = h * s
 
     # -----------------------------
-    # Step 2) Ensure at least one patch in height
+    # Step 2) Ensure at least one patch in height (if close)
     # -----------------------------
-    if scaled_h < patch_size:
+    if scaled_h < patch_size and scaled_h > 0.75 * patch_size:
         s = patch_size / float(h)
         scaled_h = patch_size
 
