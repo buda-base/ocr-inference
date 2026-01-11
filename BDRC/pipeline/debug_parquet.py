@@ -34,7 +34,7 @@ except ImportError:
 try:
     # Try relative import first (when used as module)
     from .img_helpers import _apply_rotation_3, _apply_tps_3
-    from .main import (
+    from .utils import (
         get_s3_folder_prefix,
         gets3blob,
         get_image_list_and_version_s3,
@@ -52,7 +52,7 @@ except ImportError:
     if str(script_dir) not in sys.path:
         sys.path.insert(0, str(script_dir))
     from img_helpers import _apply_rotation_3, _apply_tps_3
-    from main import (
+    from utils import (
         get_s3_folder_prefix,
         gets3blob,
         get_image_list_and_version_s3,
