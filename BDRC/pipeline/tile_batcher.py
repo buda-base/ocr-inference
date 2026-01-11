@@ -68,12 +68,40 @@ def tile_image(img: torch.Tensor, patch_size: int = 512) -> Tuple[torch.Tensor, 
 
 
 # -----------------------------------------------------------------------------
+# Precision helpers
+# -----------------------------------------------------------------------------
+
+def get_tile_dtype(precision: str) -> torch.dtype:
+    """
+    Get torch dtype from precision string.
+    
+    Args:
+        precision: "fp32", "fp16", "bf16", or "auto"
+    
+    Returns:
+        torch.dtype
+    """
+    if precision == "fp16":
+        return torch.float16
+    elif precision == "bf16":
+        return torch.bfloat16
+    elif precision == "auto":
+        # Auto: use fp16 if CUDA available, else fp32
+        if torch.cuda.is_available():
+            return torch.float16
+        return torch.float32
+    else:  # fp32 or default
+        return torch.float32
+
+
+# -----------------------------------------------------------------------------
 # Synchronous tiling function (can run in thread pool)
 # -----------------------------------------------------------------------------
 
 def tile_frame_sync(
     gray: np.ndarray,
     patch_size: int,
+    dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, int, int, int, int]:
     """
     Tile a grayscale frame.
@@ -81,12 +109,13 @@ def tile_frame_sync(
     Args:
         gray: [H, W] uint8 numpy array
         patch_size: tile size
+        dtype: torch dtype for output tiles (fp32, fp16, bf16)
     
     Returns:
         (tiles, x_steps, y_steps, pad_x, pad_y)
-        - tiles: [N, 3, patch_size, patch_size] float32 tensor (on CPU)
+        - tiles: [N, 3, patch_size, patch_size] tensor in specified dtype (on CPU)
     """
-    # Convert to torch [1, H, W]
+    # Convert to torch [1, H, W] - start with float32 for precision in padding/normalize
     img = torch.from_numpy(gray).unsqueeze(0).float()
     
     # Pad to multiple of patch_size (white background = 255)
@@ -101,6 +130,10 @@ def tile_frame_sync(
     # Expand grayscale to 3 channels for model input
     # tiles shape: [N, 1, H, W] -> [N, 3, H, W]
     tiles = tiles.expand(-1, 3, -1, -1).contiguous()
+    
+    # Convert to target dtype (fp16/bf16 saves memory)
+    if dtype != torch.float32:
+        tiles = tiles.to(dtype)
     
     return tiles, x_steps, y_steps, pad_x, pad_y
 
@@ -138,6 +171,10 @@ class TileBatcher:
         self.batch_timeout_s: float = cfg.batch_timeout_ms / 1000.0
         self.patch_size: int = getattr(cfg, "patch_size", 512)
         self.tile_workers: int = getattr(cfg, "tile_workers", 4)
+        
+        # Tile precision (fp16/bf16 saves ~50% memory)
+        precision = getattr(cfg, "precision", "fp32")
+        self.tile_dtype: torch.dtype = get_tile_dtype(precision)
 
         # State tracking
         self._decoder_done = False
@@ -230,9 +267,10 @@ class TileBatcher:
                 tile_frame_sync,
                 gray,
                 self.patch_size,
+                self.tile_dtype,
             )
         else:
-            return tile_frame_sync(gray, self.patch_size)
+            return tile_frame_sync(gray, self.patch_size, self.tile_dtype)
 
     # -------------------------------------------------------------------------
     # Batch preparation (multi_image_collate_fn logic)

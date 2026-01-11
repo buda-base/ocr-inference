@@ -49,7 +49,6 @@ class PipelineConfig:
     binarize_block_size: int = 31
     binarize_c: int = 15
     batch_type: str = "tiles" # "tiles" for batching tiles (images batch mode removed)
-    tiles_batch_n: int = 16 # number of tiles / patches in a tile batch
     class_threshold: float = 0.85
     gpu_reinit_on_error = False
     gpu_reinit_on_oom = True
