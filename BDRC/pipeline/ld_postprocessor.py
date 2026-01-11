@@ -304,7 +304,7 @@ class LDPostProcessor:
             scaled_tps_points = scale_tps_points(tps_data[0], tps_data[1], line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
             tps_data = (scaled_tps_points[0], scaled_tps_points[1], tps_data[2])
         contours_bboxes = get_contour_bboxes(contours)
-        h, w = inf_frame.line_mask.shape[:2]
+        h, w = line_mask.shape[:2]
         rec = Record(
             task=inf_frame.task,
             source_etag=inf_frame.source_etag,
