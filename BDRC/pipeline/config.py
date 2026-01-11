@@ -24,15 +24,21 @@ class PipelineConfig:
 
     # Queues (bounded)
     max_q_prefetcher_to_decoder: int = 256
-    max_q_decoder_to_gpu_pass_1: int = 128
+    max_q_decoder_to_tilebatcher: int = 64
+    max_q_tilebatcher_to_inference: int = 8  # Short queue for GPU - batches ready for inference
     max_q_gpu_pass_1_to_post_processor: int = 256
-    max_q_post_processor_to_gpu_pass_2: int = 64
+    max_q_post_processor_to_tilebatcher: int = 32
     max_q_gpu_pass_2_to_post_processor: int = 128
     max_q_post_processor_to_writer: int = 256
+    # Legacy names (kept for backwards compatibility)
+    max_q_decoder_to_gpu_pass_1: int = 128
+    max_q_post_processor_to_gpu_pass_2: int = 64
 
 
     # CPU decode threads
     decode_threads: int = 8
+    tile_workers: int = 4  # ThreadPoolExecutor workers for parallel tiling
+    parallel_tiling: bool = True  # Enable parallel tiling in TileBatcher
 
     # GPU batching
     use_gpu: bool = True
@@ -40,7 +46,6 @@ class PipelineConfig:
     precision: Precision = "fp16" # bf16, fp16, fp32 or auto
     # Optional cap for the internal tile pool to limit peak memory under backpressure.
     # 0 disables throttling.
-    max_tiles_in_pool: int = 2048
     batch_size: int = 32
     batch_timeout_ms: int = 25
     cuda_streams: int = 2

@@ -10,7 +10,7 @@ class EndOfStream:
     """
     Explicit end-of-stream marker for multi-lane pipelines.
     """
-    stream: Literal["prefetched", "decoded", "gpu_pass_1", "transformed_pass_1", "gpu_pass_2", "transformed_pass_2", "record"]
+    stream: Literal["prefetched", "decoded", "tiled", "gpu_pass_1", "transformed_pass_1", "gpu_pass_2", "transformed_pass_2", "record"]
     producer: Optional[str] = None
 
 
@@ -86,12 +86,24 @@ class Record:
     nb_contours: int
     contours_bboxes: Optional[Any] # bboxes (x, y, w, h) of the contours, scaled to original image dimensions
 
+@dataclass
+class TiledBatch:
+    """
+    Output of TileBatcher, input to LDInferenceRunner.
+    
+    Contains pre-tiled frames ready for GPU inference.
+    Not frozen because it contains mutable tensors.
+    """
+    all_tiles: Any  # torch.Tensor [total_tiles, 3, patch_size, patch_size] on CPU
+    tile_ranges: List[Tuple[int, int]]  # (start, end) indices for each frame
+    metas: List[Dict[str, Any]]  # Metadata per frame (includes original DecodedFrame, gray, second_pass, etc.)
+
 # --- Error envelope ---------------------------------------------------------
 
 @dataclass(frozen=True)
 class PipelineError:
     """Error message that can flow through queues."""
-    stage: Literal["Prefetcher", "Decoder", "LDGpuBatcher", "LDPostProcessor", "ParquetWriter"]
+    stage: Literal["Prefetcher", "Decoder", "TileBatcher", "LDInferenceRunner", "LDGpuBatcher", "LDPostProcessor", "ParquetWriter"]
     task: ImageTask
     source_etag: Optional[str]
     error_type: str
@@ -105,6 +117,7 @@ class PipelineError:
 
 FetchedBytesMsg = Union[FetchedBytes, PipelineError, EndOfStream]
 DecodedFrameMsg = Union[DecodedFrame, PipelineError, EndOfStream]
+TiledBatchMsg = Union[TiledBatch, PipelineError, EndOfStream]
 InferredFrameMsg = Union[InferredFrame, PipelineError, EndOfStream]
 RecordMsg = Union[Record, PipelineError, EndOfStream]
 
