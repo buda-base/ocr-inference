@@ -95,11 +95,7 @@ class PipelineConfig:
     
     def __post_init__(self):
         """Validate configuration values."""
-        
-        # Batch size validations
-        if self.tiles_batch_n <= 0:
-            raise ValueError(f"tiles_batch_n must be > 0, got {self.tiles_batch_n}")
-        
+
         # GPU settings
         if self.use_gpu:
             try:
