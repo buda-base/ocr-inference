@@ -654,7 +654,9 @@ class LDGpuBatcher:
         tile_index = 0
         for y0 in y_starts:
             for x0 in x_starts:
-                tile_1ch = t_pad[:, y0 : y0 + self.cfg.patch_size, x0 : x0 + self.cfg.patch_size]  # [1,512,512]
+                # TODO: is the cloning really necessary? let's keep it for debug purposes
+                tile_view = t_pad[:, y0 : y0 + self.cfg.patch_size, x0 : x0 + self.cfg.patch_size]  # [1,512,512]
+                tile_1ch = tile_view.clone()  # Create independent copy to prevent buffer reuse issues
                 self._tile_pool.append(
                     _TileWorkItem(
                         frame_id=frame_id,
@@ -791,7 +793,25 @@ class LDGpuBatcher:
             for i, it in enumerate(items):
                 pending = self._pending_frames.get(it.frame_id)
                 if pending is None:
+                    # Frame was dropped (e.g., due to error), skip this tile
                     continue
+                
+                # CRITICAL: Verify frame_id consistency to catch reference corruption.
+                # The tile should belong to this pending frame.
+                if it.frame_id != pending.frame_id:
+                    raise RuntimeError(
+                        f"Frame ID mismatch: tile.frame_id={it.frame_id} != pending.frame_id={pending.frame_id}. "
+                        f"This indicates reference corruption - tile belongs to wrong frame."
+                    )
+                
+                # Verify accumulator dimensions match expected geometry
+                if pending.accum_soft.shape[0] != 1 or pending.accum_soft.shape[1] < it.y0 + pending.patch_size or pending.accum_soft.shape[2] < it.x0 + pending.patch_size:
+                    raise RuntimeError(
+                        f"Accumulator dimension mismatch for frame_id={it.frame_id}: "
+                        f"accum shape={pending.accum_soft.shape}, but tile at y0={it.y0}, x0={it.x0}, "
+                        f"patch_size={pending.patch_size} would exceed bounds. This suggests wrong frame association."
+                    )
+                
                 x0, y0 = it.x0, it.y0
                 ps = pending.patch_size
                 pending.accum_soft[:, y0:y0+ps, x0:x0+ps] = torch.maximum(
@@ -898,6 +918,28 @@ class LDGpuBatcher:
                 if pending.pad_x > 0:
                     mask_soft = mask_soft[:, :, : pending.orig_w]
 
+                # CRITICAL: Verify mask dimensions match the stored frame dimensions.
+                # This catches dimension mismatches that could cause wrong results or corruption.
+                mask_h, mask_w = int(mask_soft.shape[1]), int(mask_soft.shape[2])
+                frame_h, frame_w = int(pending.frame.shape[0]), int(pending.frame.shape[1])
+                
+                if mask_h != frame_h or mask_w != frame_w:
+                    raise ValueError(
+                        f"Line mask dimensions mismatch for {pending.task.img_filename if pending.task else 'unknown'}: "
+                        f"mask shape=({mask_h}, {mask_w}), frame shape=({frame_h}, {frame_w}). "
+                        f"Frame ID={pending.frame_id}, expected tiles={pending.expected_tiles}, "
+                        f"received tiles={pending.received_tiles}, orig_h={pending.orig_h}, orig_w={pending.orig_w}, "
+                        f"h_pad={pending.h_pad}, w_pad={pending.w_pad}, pad_y={pending.pad_y}, pad_x={pending.pad_x}. "
+                        f"This indicates a critical bug: mask does not match decoded frame dimensions."
+                    )
+                
+                # Also verify against orig_h/orig_w for extra safety
+                if mask_h != pending.orig_h or mask_w != pending.orig_w:
+                    raise ValueError(
+                        f"Line mask dimensions mismatch for {pending.task.img_filename if pending.task else 'unknown'}: "
+                        f"mask shape=({mask_h}, {mask_w}), orig dimensions=({pending.orig_h}, {pending.orig_w}). "
+                        f"Frame ID={pending.frame_id}. This indicates accumulator was incorrectly sized or accumulated."
+                    )
 
                 with torch.profiler.record_function("threshold_to_packedbits"):
                     # Boolean mask on GPU
