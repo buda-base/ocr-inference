@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 from collections import deque
+import logging
 import os
 import time
 from pathlib import Path
@@ -415,6 +416,15 @@ def main():
         help="Enable debug output only for specified image filename(s). Can be specified multiple times. Implies --debug.",
     )
     
+    # Logging
+    p.add_argument(
+        "--log-level",
+        type=str,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="WARNING",
+        help="Set logging level (default: WARNING). Use INFO to see timing logs.",
+    )
+    
     args = p.parse_args()
     
     # Validate input mode arguments
@@ -431,6 +441,14 @@ def main():
     # Handle debug flags
     if args.debug_folder or args.debug_image:
         args.debug = True
+    
+    # Configure logging
+    log_level = getattr(logging, args.log_level.upper(), logging.WARNING)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
     asyncio.run(run_one_volume(args))
 

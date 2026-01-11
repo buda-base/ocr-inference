@@ -40,7 +40,7 @@ class PipelineConfig:
     # GPU batching
     use_gpu: bool = True
     compile_model: bool = False
-    precision: Precision = "fp32" # bf16, fp16, fp32 or auto
+    precision: Precision = "fp16" # bf16, fp16, fp32 or auto
     # Optional cap for the internal tile pool to limit peak memory under backpressure.
     # 0 disables throttling.
     batch_size: int = 8  # Number of images per batch (8 images × ~8 tiles = ~64 tiles = ~200MB)

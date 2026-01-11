@@ -9,6 +9,8 @@ component is straightforward: receive batch → GPU forward → stitch → emit.
 """
 
 import asyncio
+import logging
+import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +24,8 @@ from .types_common import (
     InferredFrame,
     TiledBatch,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # -----------------------------------------------------------------------------
@@ -291,19 +295,30 @@ class LDInferenceRunner:
         This is intentionally simple - all the batching complexity
         is handled by TileBatcher.
         """
-        import logging
-        logger = logging.getLogger(__name__)
+        # Timing stats
+        batches_processed = 0
+        total_wait_time = 0.0
+        total_infer_time = 0.0
+        total_tiles = 0
         
         try:
             while True:
-                # Receive from TileBatcher
+                # Wait for batch from TileBatcher
+                wait_start = time.perf_counter()
                 msg = await self.q_in.get()
+                wait_time = time.perf_counter() - wait_start
+                total_wait_time += wait_time
+                
+                if wait_time > 0.5:
+                    logger.warning(
+                        f"[InferenceRunner] Long wait for batch: {wait_time:.2f}s, "
+                        f"queue_size={self.q_in.qsize()}"
+                    )
 
                 # Handle different message types
                 if isinstance(msg, EndOfStream):
                     if msg.stream == "tiled_pass_1":
-                        # Pass-1 is done - forward EOS to PostProcessor
-                        # This allows PostProcessor to finish pass-1 and send transformed_pass_1 EOS
+                        logger.info(f"[InferenceRunner] Received tiled_pass_1 EOS, forwarding gpu_pass_1")
                         if not self._p1_eos_sent:
                             await self.q_gpu_pass_1_to_post_processor.put(
                                 EndOfStream(stream="gpu_pass_1", producer="LDInferenceRunner")
@@ -311,44 +326,55 @@ class LDInferenceRunner:
                             self._p1_eos_sent = True
                     
                     elif msg.stream == "tiled_pass_2":
-                        # Pass-2 is done - send final EOS and exit
+                        logger.info(
+                            f"[InferenceRunner] DONE - batches={batches_processed}, tiles={total_tiles}, "
+                            f"total_wait={total_wait_time:.2f}s, total_infer={total_infer_time:.2f}s"
+                        )
                         self._done = True
-                        # Send pass-1 EOS if not already sent (edge case)
                         if not self._p1_eos_sent:
                             await self.q_gpu_pass_1_to_post_processor.put(
                                 EndOfStream(stream="gpu_pass_1", producer="LDInferenceRunner")
                             )
                             self._p1_eos_sent = True
-                        # Send pass-2 EOS
                         await self.q_gpu_pass_2_to_post_processor.put(
                             EndOfStream(stream="gpu_pass_2", producer="LDInferenceRunner")
                         )
                         break
                 
                 elif isinstance(msg, PipelineError):
-                    # Forward errors from TileBatcher to appropriate queue
-                    # We don't know which lane, so send to pass-1 by default
-                    # (TileBatcher should have set the lane info in the error)
                     await self.q_gpu_pass_1_to_post_processor.put(msg)
                 
                 elif isinstance(msg, TiledBatch):
-                    # Process the batch
+                    infer_start = time.perf_counter()
+                    n_tiles = msg.all_tiles.shape[0]
+                    n_frames = len(msg.metas)
+                    
                     await self._process_batch(msg)
+                    
+                    infer_time = time.perf_counter() - infer_start
+                    total_infer_time += infer_time
+                    total_tiles += n_tiles
+                    batches_processed += 1
+                    
+                    tiles_per_sec = n_tiles / infer_time if infer_time > 0 else 0
+                    logger.info(
+                        f"[InferenceRunner] Batch #{batches_processed}: {n_frames} frames, {n_tiles} tiles, "
+                        f"infer={infer_time:.3f}s ({tiles_per_sec:.1f} tiles/s), wait_before={wait_time:.3f}s"
+                    )
                 
                 else:
-                    logger.warning(f"LDInferenceRunner received unexpected message type: {type(msg)}")
+                    logger.warning(f"[InferenceRunner] Unexpected message type: {type(msg)}")
 
                 # Yield to event loop
                 await asyncio.sleep(0)
 
         except asyncio.CancelledError:
-            logger.info("LDInferenceRunner cancelled, cleaning up...")
+            logger.info("[InferenceRunner] Cancelled, cleaning up...")
             raise
         except KeyboardInterrupt:
-            logger.info("LDInferenceRunner interrupted by user")
+            logger.info("[InferenceRunner] Interrupted by user")
             raise
         finally:
-            # Clear GPU cache on exit
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
