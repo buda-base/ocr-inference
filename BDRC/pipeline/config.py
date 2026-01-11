@@ -96,12 +96,6 @@ class PipelineConfig:
     
     def __post_init__(self):
         """Validate configuration values."""
-        # Queue size validations - ensure queues are large enough for batch sizes
-        if self.max_q_decoder_to_gpu_pass_1 < self.tiles_batch_n * 2:
-            raise ValueError(
-                f"max_q_decoder_to_gpu_pass_1 ({self.max_q_decoder_to_gpu_pass_1}) "
-                f"must be at least 2x tiles_batch_n ({self.tiles_batch_n}) to avoid blocking"
-            )
         
         # Batch size validations
         if self.tiles_batch_n <= 0:
