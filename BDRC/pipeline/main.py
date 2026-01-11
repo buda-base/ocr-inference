@@ -341,12 +341,26 @@ async def run_one_volume(args):
     from .model_utils import load_model
     from .ld_volume_worker import LDVolumeWorker
     
-    model = load_model(args.checkpoint, classes=1)
-    
-    # Build PipelineConfig with model
+    # Build PipelineConfig first to get config values for model loading
     cfg = PipelineConfig(
         s3_bucket="archive.tbrc.org",  # Default for S3 operations
         s3_region="us-east-1",
+    )
+    
+    # Determine device for model loading
+    device = None
+    if cfg.use_gpu:
+        import torch
+        if torch.cuda.is_available():
+            device = "cuda"
+    
+    # Load model with config options
+    model = load_model(
+        args.checkpoint,
+        classes=1,
+        device=device,
+        precision=cfg.precision,
+        compile_model=cfg.compile_model,
     )
     cfg.model = model
     

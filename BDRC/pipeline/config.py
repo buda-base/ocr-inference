@@ -1,6 +1,8 @@
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Literal, Optional
+
+Precision = Literal["fp32", "fp16", "bf16", "auto"]
 
 @dataclass
 class PipelineConfig:
@@ -34,6 +36,8 @@ class PipelineConfig:
 
     # GPU batching
     use_gpu: bool = True
+    compile_model: bool = True
+    precision: Precision = "fp16" # bf16, fp16, fp32 or auto
     # Optional cap for the internal tile pool to limit peak memory under backpressure.
     # 0 disables throttling.
     max_tiles_in_pool: int = 2048
