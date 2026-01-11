@@ -108,11 +108,21 @@ def infer_batch(
     Returns:
         List of (meta, mask_np) tuples where mask_np is uint8 [H, W] with values {0, 255}
     """
+    # Transfer tiles to GPU (non-blocking for overlap with CPU work)
     all_tiles = batch.all_tiles.to(device, non_blocking=True)
+    
+    # Synchronize before inference to ensure transfer is complete
+    # This gives more accurate timing measurements
+    if device == "cuda":
+        torch.cuda.synchronize()
     
     with torch.inference_mode():
         preds = model(all_tiles)
         soft = torch.sigmoid(preds)
+
+    # Synchronize after inference to ensure it's complete before stitching
+    if device == "cuda":
+        torch.cuda.synchronize()
 
     results = []
     for (start, end), meta in zip(batch.tile_ranges, batch.metas):
@@ -126,6 +136,9 @@ def infer_batch(
         mask_np = binary.squeeze(0).cpu().numpy()
         
         results.append((meta, mask_np))
+    
+    # Explicitly delete GPU tensors to free memory immediately
+    del all_tiles, preds, soft
     
     return results
 
@@ -176,6 +189,56 @@ class LDInferenceRunner:
         self._done = False
         self._p1_eos_sent = False
         self._p2_eos_sent = False
+        
+        # Warmup the model on first init (eliminates 5s JIT compilation on first batch)
+        self._warmup_model()
+
+    # -------------------------------------------------------------------------
+    # Model warmup
+    # -------------------------------------------------------------------------
+
+    def _warmup_model(self) -> None:
+        """
+        Run a dummy forward pass to trigger CUDA JIT compilation.
+        
+        This eliminates the ~5s warmup penalty on the first real batch.
+        The warmup uses a small tensor to minimize memory usage.
+        """
+        logger.info(f"[InferenceRunner] Warming up model on {self.device}...")
+        warmup_start = time.perf_counter()
+        
+        try:
+            # Create a small dummy batch (1 tile, 3 channels, patch_size x patch_size)
+            # Use the configured tile dtype for accurate warmup
+            precision = getattr(self.cfg, "precision", "fp32")
+            if precision == "fp16":
+                dtype = torch.float16
+            elif precision == "bf16":
+                dtype = torch.bfloat16
+            else:
+                dtype = torch.float32
+            
+            dummy_input = torch.zeros(
+                1, 3, self.patch_size, self.patch_size,
+                dtype=dtype, device=self.device
+            )
+            
+            with torch.inference_mode():
+                _ = self.model(dummy_input)
+                # Synchronize to ensure compilation is complete
+                if self.device == "cuda":
+                    torch.cuda.synchronize()
+            
+            warmup_time = time.perf_counter() - warmup_start
+            logger.info(f"[InferenceRunner] Model warmup complete in {warmup_time:.2f}s")
+            
+            # Clean up
+            del dummy_input
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logger.warning(f"[InferenceRunner] Model warmup failed: {e}")
 
     # -------------------------------------------------------------------------
     # Error handling
@@ -361,6 +424,12 @@ class LDInferenceRunner:
                         f"[InferenceRunner] Batch #{batches_processed}: {n_frames} frames, {n_tiles} tiles, "
                         f"infer={infer_time:.3f}s ({tiles_per_sec:.1f} tiles/s), wait_before={wait_time:.3f}s"
                     )
+                    
+                    # Periodic memory cleanup to prevent fragmentation
+                    # (every 10 batches or after slow batches)
+                    if batches_processed % 10 == 0 or infer_time > 1.0:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                 
                 else:
                     logger.warning(f"[InferenceRunner] Unexpected message type: {type(msg)}")

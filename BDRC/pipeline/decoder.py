@@ -2,7 +2,9 @@ import asyncio
 import concurrent.futures as futures
 from .config import PipelineConfig
 import io
+import logging
 import os
+import time
 from typing import Tuple, Optional
 import numpy as np
 import cv2
@@ -11,6 +13,8 @@ import math
 
 from .types_common import ImageTask, DecodedFrame, FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, DecodedFrame, PipelineError, EndOfStream
 from .debug_helpers import save_debug_bytes_sync, save_debug_image_sync
+
+logger = logging.getLogger(__name__)
 
 
 class ImageDecodeError(RuntimeError):
@@ -58,12 +62,34 @@ class Decoder:
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
+        
+        # Timing stats
+        decoded_count = 0
+        error_count = 0
+        total_decode_time = 0.0
+        total_wait_time = 0.0
+        run_start = time.perf_counter()
+        
+        logger.info(f"[Decoder] Starting with {self.cfg.decode_threads} threads")
 
         try:
             while True:
+                wait_start = time.perf_counter()
                 msg = await self.q_prefetcher_to_decoder.get()
+                wait_time = time.perf_counter() - wait_start
+                total_wait_time += wait_time
 
                 if isinstance(msg, EndOfStream):
+                    run_time = time.perf_counter() - run_start
+                    avg_decode = total_decode_time / max(1, decoded_count)
+                    throughput = decoded_count / run_time if run_time > 0 else 0
+                    
+                    logger.info(
+                        f"[Decoder] DONE - {decoded_count} decoded, {error_count} errors, "
+                        f"run_time={run_time:.2f}s ({throughput:.1f} img/s), "
+                        f"avg_decode={avg_decode*1000:.1f}ms, total_wait={total_wait_time:.2f}s"
+                    )
+                    
                     # Forward sentinel downstream and stop
                     await self.q_decoder_to_gpu_pass_1.put(EndOfStream(stream="decoded", producer="Decoder"))
                     return
@@ -71,15 +97,28 @@ class Decoder:
                 if isinstance(msg, PipelineError):
                     # Pass-through errors unchanged
                     await self.q_decoder_to_gpu_pass_1.put(msg)
+                    error_count += 1
                     continue
 
                 # Otherwise it must be FetchedBytes
                 try:
+                    decode_start = time.perf_counter()
                     fut = loop.run_in_executor(self.pool, self._decode_one, msg)
                     decoded = await fut
+                    decode_time = time.perf_counter() - decode_start
+                    total_decode_time += decode_time
+                    decoded_count += 1
+                    
+                    # Log slow decodes
+                    if decode_time > 0.5:
+                        logger.warning(
+                            f"[Decoder] Slow decode: {msg.task.img_filename} took {decode_time:.2f}s"
+                        )
+                    
                     await self.q_decoder_to_gpu_pass_1.put(decoded)
                 except Exception as e:
                     import traceback
+                    error_count += 1
                     await self.q_decoder_to_gpu_pass_1.put(
                         PipelineError(
                             stage="Decoder",

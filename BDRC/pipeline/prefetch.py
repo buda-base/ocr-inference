@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import time
 import traceback
 from typing import Iterable, Optional
 
@@ -7,6 +9,8 @@ from typing import List, Optional, Union
 from urllib.parse import urlparse, unquote
 
 from .types_common import *
+
+logger = logging.getLogger(__name__)
 
 class BasePrefetcher:
     """
@@ -78,6 +82,19 @@ class BasePrefetcher:
             work_q.put_nowait(t)
 
         n_workers = min(len(self.image_tasks), max(1, self.cfg.inflight_per_worker))
+        n_images = len(self.image_tasks)
+        
+        # Timing stats (shared across workers)
+        stats = {
+            "fetched": 0,
+            "errors": 0,
+            "total_fetch_time": 0.0,
+            "total_bytes": 0,
+        }
+        stats_lock = asyncio.Lock()
+        
+        run_start = time.perf_counter()
+        logger.info(f"[Prefetcher] Starting {n_workers} workers for {n_images} images")
 
         async def worker() -> None:
             while True:
@@ -85,9 +102,28 @@ class BasePrefetcher:
                 if task is None:
                     work_q.task_done()
                     return
+                
+                fetch_start = time.perf_counter()
                 msg = await self._fetch_one(task)
+                fetch_time = time.perf_counter() - fetch_start
+                
                 await self.q_prefetcher_to_decoder.put(msg)
                 work_q.task_done()
+                
+                # Update stats
+                async with stats_lock:
+                    if isinstance(msg, FetchedBytes):
+                        stats["fetched"] += 1
+                        stats["total_bytes"] += len(msg.file_bytes)
+                    else:
+                        stats["errors"] += 1
+                    stats["total_fetch_time"] += fetch_time
+                    
+                    # Log slow fetches
+                    if fetch_time > 1.0:
+                        logger.warning(
+                            f"[Prefetcher] Slow fetch: {task.img_filename} took {fetch_time:.2f}s"
+                        )
 
         workers = [asyncio.create_task(worker()) for _ in range(n_workers)]
         for _ in range(n_workers):
@@ -96,6 +132,17 @@ class BasePrefetcher:
         await work_q.join()
         for w in workers:
             await w
+        
+        run_time = time.perf_counter() - run_start
+        avg_fetch = stats["total_fetch_time"] / max(1, stats["fetched"])
+        mb_fetched = stats["total_bytes"] / (1024 * 1024)
+        throughput = mb_fetched / run_time if run_time > 0 else 0
+        
+        logger.info(
+            f"[Prefetcher] DONE - {stats['fetched']} fetched, {stats['errors']} errors, "
+            f"{mb_fetched:.1f}MB in {run_time:.2f}s ({throughput:.1f}MB/s), "
+            f"avg_fetch={avg_fetch*1000:.1f}ms"
+        )
 
         await self.q_prefetcher_to_decoder.put(
             EndOfStream(stream="prefetched", producer=type(self).__name__)

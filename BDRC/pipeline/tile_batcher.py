@@ -189,8 +189,16 @@ class TileBatcher:
         self._use_parallel_tiling = getattr(cfg, "parallel_tiling", True)
         if self._use_parallel_tiling:
             self._tile_executor = ThreadPoolExecutor(max_workers=self.tile_workers)
+            logger.info(
+                f"[TileBatcher] Initialized with parallel tiling ({self.tile_workers} workers), "
+                f"batch_size={self.batch_size}, patch_size={self.patch_size}, dtype={self.tile_dtype}"
+            )
         else:
             self._tile_executor = None
+            logger.info(
+                f"[TileBatcher] Initialized with sequential tiling, "
+                f"batch_size={self.batch_size}, patch_size={self.patch_size}, dtype={self.tile_dtype}"
+            )
 
         # Buffer for accumulating tiled frames before emitting a batch
         # Each entry: dict with tiles, metadata, etc.
