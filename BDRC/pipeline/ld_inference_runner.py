@@ -92,6 +92,7 @@ def infer_batch(
     class_threshold: float,
     device: str,
     patch_size: int = 512,
+    detailed_timing: bool = False,
 ) -> List[Tuple[Dict[str, Any], np.ndarray]]:
     """
     Run inference on a TiledBatch and stitch results.
@@ -104,17 +105,21 @@ def infer_batch(
         class_threshold: threshold for binary mask
         device: "cuda" or "cpu"
         patch_size: tile size
+        detailed_timing: if True, log detailed timing breakdown
     
     Returns:
         List of (meta, mask_np) tuples where mask_np is uint8 [H, W] with values {0, 255}
     """
+    n_tiles = batch.all_tiles.shape[0]
+    
     # Transfer tiles to GPU (non-blocking for overlap with CPU work)
+    t0 = time.perf_counter()
     all_tiles = batch.all_tiles.to(device, non_blocking=True)
     
     # Synchronize before inference to ensure transfer is complete
-    # This gives more accurate timing measurements
     if device == "cuda":
         torch.cuda.synchronize()
+    t1 = time.perf_counter()
     
     with torch.inference_mode():
         preds = model(all_tiles)
@@ -123,6 +128,7 @@ def infer_batch(
     # Synchronize after inference to ensure it's complete before stitching
     if device == "cuda":
         torch.cuda.synchronize()
+    t2 = time.perf_counter()
 
     results = []
     for (start, end), meta in zip(batch.tile_ranges, batch.metas):
@@ -137,8 +143,23 @@ def infer_batch(
         
         results.append((meta, mask_np))
     
+    t3 = time.perf_counter()
+    
     # Explicitly delete GPU tensors to free memory immediately
     del all_tiles, preds, soft
+    
+    # Log detailed timing for slow batches or when requested
+    transfer_time = t1 - t0
+    forward_time = t2 - t1
+    stitch_time = t3 - t2
+    total_time = t3 - t0
+    
+    if detailed_timing or total_time > 0.5:
+        logger.info(
+            f"[infer_batch] {n_tiles} tiles: transfer={transfer_time*1000:.1f}ms, "
+            f"forward={forward_time*1000:.1f}ms, stitch={stitch_time*1000:.1f}ms, "
+            f"total={total_time*1000:.1f}ms"
+        )
     
     return results
 
@@ -199,17 +220,18 @@ class LDInferenceRunner:
 
     def _warmup_model(self) -> None:
         """
-        Run a dummy forward pass to trigger CUDA JIT compilation.
+        Run dummy forward passes to trigger CUDA JIT compilation and memory allocation.
         
-        This eliminates the ~5s warmup penalty on the first real batch.
-        The warmup uses a small tensor to minimize memory usage.
+        This eliminates the warmup penalty by:
+        1. Running inference with multiple batch sizes (forces CUDA to pre-allocate memory pools)
+        2. Running multiple passes to ensure all CUDA kernels are compiled
+        3. Testing both large and small batches to warm up different code paths
         """
         logger.info(f"[InferenceRunner] Warming up model on {self.device}...")
         warmup_start = time.perf_counter()
         
         try:
-            # Create a small dummy batch (1 tile, 3 channels, patch_size x patch_size)
-            # Use the configured tile dtype for accurate warmup
+            # Use the configured tile dtype
             precision = getattr(self.cfg, "precision", "fp32")
             if precision == "fp16":
                 dtype = torch.float16
@@ -218,22 +240,37 @@ class LDInferenceRunner:
             else:
                 dtype = torch.float32
             
-            dummy_input = torch.zeros(
-                1, 3, self.patch_size, self.patch_size,
-                dtype=dtype, device=self.device
-            )
+            # Calculate batch sizes to warm up
+            batch_size = getattr(self.cfg, "batch_size", 8)
+            tiles_per_frame = 5  # Conservative estimate
+            max_tiles = batch_size * tiles_per_frame  # e.g., 8 * 5 = 40 tiles
+            
+            # Warm up with different batch sizes to pre-allocate CUDA memory pools
+            # This prevents slowdowns when batch size varies (e.g., last batch, pass-2 batches)
+            warmup_sizes = [max_tiles, max_tiles // 2, max_tiles // 4, 1]
             
             with torch.inference_mode():
-                _ = self.model(dummy_input)
-                # Synchronize to ensure compilation is complete
-                if self.device == "cuda":
-                    torch.cuda.synchronize()
+                for n_tiles in warmup_sizes:
+                    if n_tiles < 1:
+                        continue
+                    dummy_input = torch.zeros(
+                        n_tiles, 3, self.patch_size, self.patch_size,
+                        dtype=dtype, device=self.device
+                    )
+                    # Run twice per size
+                    for _ in range(2):
+                        _ = self.model(dummy_input)
+                        if self.device == "cuda":
+                            torch.cuda.synchronize()
+                    del dummy_input
             
             warmup_time = time.perf_counter() - warmup_start
-            logger.info(f"[InferenceRunner] Model warmup complete in {warmup_time:.2f}s")
+            logger.info(
+                f"[InferenceRunner] Model warmup complete in {warmup_time:.2f}s "
+                f"(sizes={warmup_sizes}, dtype={dtype})"
+            )
             
             # Clean up
-            del dummy_input
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 
