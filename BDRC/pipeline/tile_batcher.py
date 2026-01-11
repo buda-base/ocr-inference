@@ -142,6 +142,7 @@ class TileBatcher:
         # State tracking
         self._decoder_done = False
         self._postprocessor_done = False
+        self._pass1_eos_sent = False  # Track if we've sent pass-1 EOS
 
         # Thread pool for parallel tiling (optional, can be disabled)
         self._use_parallel_tiling = getattr(cfg, "parallel_tiling", True)
@@ -290,6 +291,32 @@ class TileBatcher:
         except asyncio.TimeoutError:
             return None
 
+    async def _maybe_emit_pass1_eos(self) -> None:
+        """
+        Emit pass-1 EOS when decoder lane is fully drained.
+        
+        This breaks the EOS cycle between TileBatcher and PostProcessor:
+        - TileBatcher sends tiled_pass_1 EOS
+        - LDInferenceRunner forwards as gpu_pass_1 EOS
+        - PostProcessor receives gpu_pass_1 EOS, can finish pass-1 processing
+        - PostProcessor sends transformed_pass_1 EOS back to TileBatcher
+        - TileBatcher can now finish
+        """
+        if self._pass1_eos_sent:
+            return
+        if not self._decoder_done:
+            return
+        
+        # Check if any frames in buffer are from pass-1
+        has_pass1_frames = any(not entry["second_pass"] for entry in self._buffer)
+        if has_pass1_frames:
+            return
+
+        await self.q_to_inference.put(
+            EndOfStream(stream="tiled_pass_1", producer="TileBatcher")
+        )
+        self._pass1_eos_sent = True
+
     # -------------------------------------------------------------------------
     # Main run loop
     # -------------------------------------------------------------------------
@@ -312,9 +339,16 @@ class TileBatcher:
                         batch = self._prepare_batch()
                         await self.q_to_inference.put(batch)
                     
-                    # Send EOS
+                    # Send pass-1 EOS if not already sent
+                    if not self._pass1_eos_sent:
+                        await self.q_to_inference.put(
+                            EndOfStream(stream="tiled_pass_1", producer="TileBatcher")
+                        )
+                        self._pass1_eos_sent = True
+                    
+                    # Send final pass-2 EOS
                     await self.q_to_inference.put(
-                        EndOfStream(stream="tiled", producer="TileBatcher")
+                        EndOfStream(stream="tiled_pass_2", producer="TileBatcher")
                     )
                     break
 
@@ -392,6 +426,11 @@ class TileBatcher:
                     # Timeout with no new messages: flush partial batch
                     batch = self._prepare_batch()
                     await self.q_to_inference.put(batch)
+
+                # --- Check if we should send pass-1 EOS ---
+                # This breaks the EOS cycle: allows PostProcessor to finish pass-1
+                # and send transformed_pass_1 EOS back to us
+                await self._maybe_emit_pass1_eos()
 
                 # Yield to event loop
                 await asyncio.sleep(0)

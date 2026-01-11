@@ -301,12 +301,25 @@ class LDInferenceRunner:
 
                 # Handle different message types
                 if isinstance(msg, EndOfStream):
-                    if msg.stream == "tiled":
+                    if msg.stream == "tiled_pass_1":
+                        # Pass-1 is done - forward EOS to PostProcessor
+                        # This allows PostProcessor to finish pass-1 and send transformed_pass_1 EOS
+                        if not self._p1_eos_sent:
+                            await self.q_gpu_pass_1_to_post_processor.put(
+                                EndOfStream(stream="gpu_pass_1", producer="LDInferenceRunner")
+                            )
+                            self._p1_eos_sent = True
+                    
+                    elif msg.stream == "tiled_pass_2":
+                        # Pass-2 is done - send final EOS and exit
                         self._done = True
-                        # Send EOS to both output queues
-                        await self.q_gpu_pass_1_to_post_processor.put(
-                            EndOfStream(stream="gpu_pass_1", producer="LDInferenceRunner")
-                        )
+                        # Send pass-1 EOS if not already sent (edge case)
+                        if not self._p1_eos_sent:
+                            await self.q_gpu_pass_1_to_post_processor.put(
+                                EndOfStream(stream="gpu_pass_1", producer="LDInferenceRunner")
+                            )
+                            self._p1_eos_sent = True
+                        # Send pass-2 EOS
                         await self.q_gpu_pass_2_to_post_processor.put(
                             EndOfStream(stream="gpu_pass_2", producer="LDInferenceRunner")
                         )
