@@ -243,9 +243,13 @@ class LDPostProcessor:
 
         input_pts = output_pts = None
         alpha = None
+        tps_data = None
         if tps_points is not None:
             input_pts, output_pts = tps_points
             alpha = self.cfg.tps_alpha
+            # Only construct tps_data when we have valid TPS points
+            if input_pts is not None and output_pts is not None:
+                tps_data = (input_pts, output_pts, alpha)
 
         transformed_frame = apply_transform_1(inf_frame.frame, rotation_angle, input_pts, output_pts, alpha)
         
@@ -271,7 +275,7 @@ class LDPostProcessor:
                 is_binary=False, # we don't map to binary after processing binary images
                 first_pass=False,
                 rotation_angle=rotation_angle,
-                tps_data=(input_pts, output_pts, alpha),
+                tps_data=tps_data,
             )
         )
 
@@ -300,9 +304,11 @@ class LDPostProcessor:
         contours = scale_contours(contours, line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
         # scale tps_data to original image dimensions
         tps_data = inf_frame.tps_data
-        if tps_data:
-            scaled_tps_points = scale_tps_points(tps_data[0], tps_data[1], line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
-            tps_data = (scaled_tps_points[0], scaled_tps_points[1], tps_data[2])
+        if tps_data is not None:
+            # tps_data should only be a tuple if we have valid TPS points
+            input_pts, output_pts, alpha = tps_data
+            scaled_tps_points = scale_tps_points(input_pts, output_pts, line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
+            tps_data = (scaled_tps_points[0], scaled_tps_points[1], alpha)
         contours_bboxes = get_contour_bboxes(contours)
         h, w = line_mask.shape[:2]
         rec = Record(
