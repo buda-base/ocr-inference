@@ -206,10 +206,6 @@ class TileBatcher:
         
         # Pending tiling tasks (for parallel tiling)
         self._pending_tiles: List[asyncio.Task] = []
-        
-        # Output buffer for batches waiting to be emitted (non-blocking emission)
-        self._output_batches: List[TiledBatch] = []
-        self._max_output_batches = 4  # Max batches to buffer before blocking
 
     # -------------------------------------------------------------------------
     # Error handling
@@ -474,42 +470,25 @@ class TileBatcher:
         # Max frames to have in-flight (tiling) at once
         max_inflight = self.tile_workers * 2  # 2x workers for good overlap
         
-        total_output_wait_time = 0.0
-        
         try:
             while True:
                 loop_start = time.perf_counter()
                 loop_count += 1
-                
-                # --- Drain output buffer first (non-blocking) ---
-                while self._output_batches:
-                    try:
-                        self.q_to_inference.put_nowait(self._output_batches[0])
-                        batch = self._output_batches.pop(0)
-                        batches_emitted += 1
-                        logger.info(
-                            f"[TileBatcher] Emitted batch #{batches_emitted}: {len(batch.metas)} frames, "
-                            f"{batch.all_tiles.shape[0]} tiles, reason=full, output_buf={len(self._output_batches)}"
-                        )
-                    except asyncio.QueueFull:
-                        break  # Queue full, try again later
                 
                 # --- Collect completed tiling tasks ---
                 n_completed, tile_time = self._collect_completed_tiles()
                 total_tile_time += tile_time
                 
                 # --- Check termination ---
-                # Only terminate when both inputs are done AND no pending work AND output buffer empty
+                # Only terminate when both inputs are done AND no pending work
                 all_done = self._decoder_done and self._postprocessor_done
                 no_pending = len(self._pending_tiles) == 0
-                no_output = len(self._output_batches) == 0
                 
-                if all_done and no_pending and no_output:
+                if all_done and no_pending:
                     logger.info(
                         f"[TileBatcher] DONE - loops={loop_count}, frames_submitted={frames_submitted}, "
                         f"batches={batches_emitted}, total_wait={total_wait_time:.2f}s, "
-                        f"total_tile={total_tile_time:.2f}s, total_emit={total_batch_emit_time:.2f}s, "
-                        f"output_wait={total_output_wait_time:.2f}s"
+                        f"total_tile={total_tile_time:.2f}s, total_emit={total_batch_emit_time:.2f}s"
                     )
                     # Flush remaining buffer
                     if self._buffer:
@@ -534,23 +513,26 @@ class TileBatcher:
                     )
                     break
 
-                # --- Prepare batch when buffer is full ---
-                # Add to output buffer instead of blocking on put
+                # --- Emit batch when full ---
+                # Do this early so GPU gets work ASAP
                 if len(self._buffer) >= self.batch_size:
                     emit_start = time.perf_counter()
+                    n_frames = len(self._buffer)
                     batch = self._prepare_batch()
-                    self._output_batches.append(batch)
-                    total_batch_emit_time += time.perf_counter() - emit_start
-                
-                # --- If output buffer is getting full, wait for space ---
-                if len(self._output_batches) >= self._max_output_batches:
-                    wait_start = time.perf_counter()
-                    await self.q_to_inference.put(self._output_batches.pop(0))
-                    total_output_wait_time += time.perf_counter() - wait_start
+                    n_tiles = batch.all_tiles.shape[0]
+                    
+                    put_start = time.perf_counter()
+                    await self.q_to_inference.put(batch)
+                    put_time = time.perf_counter() - put_start
+                    
+                    emit_time = time.perf_counter() - emit_start
+                    total_batch_emit_time += emit_time
                     batches_emitted += 1
+                    
                     logger.info(
-                        f"[TileBatcher] Emitted batch #{batches_emitted} (waited for space), "
-                        f"output_buf={len(self._output_batches)}"
+                        f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles, "
+                        f"reason=full, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s, "
+                        f"pending={len(self._pending_tiles)}"
                     )
 
                 # --- Fetch more frames if we have capacity ---
@@ -640,7 +622,7 @@ class TileBatcher:
                                 attempt=1,
                             )
 
-                # --- Timeout flush: prepare partial batch if nothing is coming ---
+                # --- Timeout flush: emit partial batch if nothing is coming ---
                 # Only flush if we have frames AND we couldn't fetch any new ones
                 # AND we have no pending tiles (everything that was in-flight is now in buffer)
                 if (frames_fetched_this_loop == 0 and 
@@ -648,11 +630,22 @@ class TileBatcher:
                     len(self._pending_tiles) == 0):
                     
                     emit_start = time.perf_counter()
+                    n_frames = len(self._buffer)
                     batch = self._prepare_batch()
-                    self._output_batches.append(batch)
-                    total_batch_emit_time += time.perf_counter() - emit_start
+                    n_tiles = batch.all_tiles.shape[0]
                     
-                    logger.debug(f"[TileBatcher] Prepared timeout_flush batch, output_buf={len(self._output_batches)}")
+                    put_start = time.perf_counter()
+                    await self.q_to_inference.put(batch)
+                    put_time = time.perf_counter() - put_start
+                    
+                    emit_time = time.perf_counter() - emit_start
+                    total_batch_emit_time += emit_time
+                    batches_emitted += 1
+                    
+                    logger.info(
+                        f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles, "
+                        f"reason=timeout_flush, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s"
+                    )
 
                 # --- Check if we should send pass-1 EOS ---
                 await self._maybe_emit_pass1_eos()
@@ -663,7 +656,7 @@ class TileBatcher:
                     logger.debug(
                         f"[TileBatcher] Loop #{loop_count}: {loop_time*1000:.1f}ms, "
                         f"buffer={len(self._buffer)}, pending={len(self._pending_tiles)}, "
-                        f"output_buf={len(self._output_batches)}, submitted={frames_submitted}"
+                        f"submitted={frames_submitted}"
                     )
 
                 # Yield to event loop (allow pending tasks to progress)
