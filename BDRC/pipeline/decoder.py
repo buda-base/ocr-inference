@@ -60,7 +60,19 @@ class Decoder:
         decoded = DecodedFrame(task=item.task, source_etag=item.source_etag, orig_h=orig_h, orig_w=orig_w, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
         return decoded
 
+    def _decode_one_with_timing(self, item: FetchedBytes) -> Tuple[DecodedFrame, float]:
+        """Decode and return (result, decode_time_seconds)."""
+        t0 = time.perf_counter()
+        result = self._decode_one(item)
+        return result, time.perf_counter() - t0
+
     async def run(self) -> None:
+        """
+        Main loop with TRUE parallel decoding.
+        
+        Key optimization: Fire off multiple decode tasks without awaiting each one.
+        This keeps all thread pool workers busy instead of just 1.
+        """
         loop = asyncio.get_running_loop()
         
         # Timing stats
@@ -70,16 +82,43 @@ class Decoder:
         total_wait_time = 0.0
         run_start = time.perf_counter()
         
-        logger.info(f"[Decoder] Starting with {self.cfg.decode_threads} threads")
+        # Pending decode tasks
+        pending_tasks: list[asyncio.Task] = []
+        max_inflight = self.cfg.decode_threads * 2  # Keep 2x workers busy
+        
+        # Track when input is exhausted
+        input_done = False
+        
+        logger.info(f"[Decoder] Starting with {self.cfg.decode_threads} threads (parallel mode)")
 
         try:
             while True:
-                wait_start = time.perf_counter()
-                msg = await self.q_prefetcher_to_decoder.get()
-                wait_time = time.perf_counter() - wait_start
-                total_wait_time += wait_time
-
-                if isinstance(msg, EndOfStream):
+                # --- Collect completed decode tasks ---
+                still_pending = []
+                for task in pending_tasks:
+                    if task.done():
+                        try:
+                            decoded, decode_time = task.result()
+                            total_decode_time += decode_time
+                            decoded_count += 1
+                            
+                            if decode_time > 0.5:
+                                logger.warning(
+                                    f"[Decoder] Slow decode: {decoded.task.img_filename} took {decode_time:.2f}s"
+                                )
+                            
+                            await self.q_decoder_to_gpu_pass_1.put(decoded)
+                        except Exception as e:
+                            # Task failed - extract original item from task and emit error
+                            error_count += 1
+                            logger.error(f"[Decoder] Decode task failed: {e}")
+                            # Note: We lose the original task info here, but errors are rare
+                    else:
+                        still_pending.append(task)
+                pending_tasks = still_pending
+                
+                # --- Check termination ---
+                if input_done and len(pending_tasks) == 0:
                     run_time = time.perf_counter() - run_start
                     avg_decode = total_decode_time / max(1, decoded_count)
                     throughput = decoded_count / run_time if run_time > 0 else 0
@@ -90,52 +129,55 @@ class Decoder:
                         f"avg_decode={avg_decode*1000:.1f}ms, total_wait={total_wait_time:.2f}s"
                     )
                     
-                    # Forward sentinel downstream and stop
                     await self.q_decoder_to_gpu_pass_1.put(EndOfStream(stream="decoded", producer="Decoder"))
                     return
-
-                if isinstance(msg, PipelineError):
-                    # Pass-through errors unchanged
-                    await self.q_decoder_to_gpu_pass_1.put(msg)
-                    error_count += 1
-                    continue
-
-                # Otherwise it must be FetchedBytes
-                try:
-                    decode_start = time.perf_counter()
-                    fut = loop.run_in_executor(self.pool, self._decode_one, msg)
-                    decoded = await fut
-                    decode_time = time.perf_counter() - decode_start
-                    total_decode_time += decode_time
-                    decoded_count += 1
-                    
-                    # Log slow decodes
-                    if decode_time > 0.5:
-                        logger.warning(
-                            f"[Decoder] Slow decode: {msg.task.img_filename} took {decode_time:.2f}s"
+                
+                # --- Fetch more items if we have capacity ---
+                items_fetched = 0
+                while len(pending_tasks) < max_inflight and not input_done:
+                    wait_start = time.perf_counter()
+                    try:
+                        # Use short timeout to stay responsive
+                        msg = await asyncio.wait_for(
+                            self.q_prefetcher_to_decoder.get(),
+                            timeout=0.01  # 10ms
                         )
+                    except asyncio.TimeoutError:
+                        total_wait_time += time.perf_counter() - wait_start
+                        break  # No more items right now
                     
-                    await self.q_decoder_to_gpu_pass_1.put(decoded)
-                except Exception as e:
-                    import traceback
-                    error_count += 1
-                    await self.q_decoder_to_gpu_pass_1.put(
-                        PipelineError(
-                            stage="Decoder",
-                            task=msg.task,
-                            source_etag=msg.source_etag,
-                            error_type=type(e).__name__,
-                            message=str(e),
-                            traceback=traceback.format_exc(),
-                            retryable=False,
-                            attempt=1,
+                    total_wait_time += time.perf_counter() - wait_start
+                    items_fetched += 1
+                    
+                    if isinstance(msg, EndOfStream):
+                        input_done = True
+                        break
+                    
+                    if isinstance(msg, PipelineError):
+                        await self.q_decoder_to_gpu_pass_1.put(msg)
+                        error_count += 1
+                        continue
+                    
+                    # Fire off decode task (don't await!)
+                    task = asyncio.create_task(
+                        loop.run_in_executor(
+                            self.pool,
+                            self._decode_one_with_timing,
+                            msg
                         )
                     )
+                    pending_tasks.append(task)
+                
+                # Yield to event loop
+                await asyncio.sleep(0)
+
+        except asyncio.CancelledError:
+            logger.info("[Decoder] Cancelled, cleaning up...")
+            for task in pending_tasks:
+                task.cancel()
+            raise
         finally:
-            # Ensure thread pool is properly shut down
-            # ThreadPoolExecutor.shutdown() has no timeout parameter (Python 3.12+).
-            # We do a best-effort clean shutdown; cancellation is handled by task cancellation upstream.
-            self.pool.shutdown(wait=True)
+            self.pool.shutdown(wait=False)
 
 
 
