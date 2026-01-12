@@ -92,6 +92,7 @@ class PipelineConfig:
     # GPU profiling
     enable_pytorch_profiler: bool = False  # Enable PyTorch profiler for GPU timing analysis
     profiler_trace_output: Optional[str] = None  # Output path for profiler trace (default: pytorch_trace.json)
+    detailed_inference_timing: bool = True  # Log H2D/forward/stitch/D2H breakdown for each batch
     
     def __post_init__(self):
         """Validate configuration values."""

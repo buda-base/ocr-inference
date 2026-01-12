@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 import traceback
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -86,14 +87,38 @@ def crop_padding(mask: torch.Tensor, pad_x: int, pad_y: int) -> torch.Tensor:
 # Inference function (from utils_alt.py infer_batch)
 # -----------------------------------------------------------------------------
 
+@dataclass
+class InferTiming:
+    """Detailed timing breakdown for a single batch inference."""
+    n_tiles: int
+    n_frames: int
+    h2d_ms: float      # Host-to-device transfer
+    forward_ms: float  # Model forward pass
+    stitch_ms: float   # Stitching on GPU
+    d2h_ms: float      # Device-to-host transfer
+    
+    @property
+    def total_ms(self) -> float:
+        return self.h2d_ms + self.forward_ms + self.stitch_ms + self.d2h_ms
+    
+    @property
+    def gpu_ms(self) -> float:
+        """Time spent on GPU (forward + stitch)."""
+        return self.forward_ms + self.stitch_ms
+    
+    @property
+    def transfer_ms(self) -> float:
+        """Time spent on PCIe transfers (H2D + D2H)."""
+        return self.h2d_ms + self.d2h_ms
+
+
 def infer_batch(
     model: torch.nn.Module,
     batch: TiledBatch,
     class_threshold: float,
     device: str,
     patch_size: int = 512,
-    detailed_timing: bool = False,
-) -> List[Tuple[Dict[str, Any], np.ndarray]]:
+) -> Tuple[List[Tuple[Dict[str, Any], np.ndarray]], InferTiming]:
     """
     Run inference on a TiledBatch and stitch results.
     
@@ -105,63 +130,85 @@ def infer_batch(
         class_threshold: threshold for binary mask
         device: "cuda" or "cpu"
         patch_size: tile size
-        detailed_timing: if True, log detailed timing breakdown
     
     Returns:
-        List of (meta, mask_np) tuples where mask_np is uint8 [H, W] with values {0, 255}
+        Tuple of:
+        - List of (meta, mask_np) tuples where mask_np is uint8 [H, W] with values {0, 255}
+        - InferTiming with detailed timing breakdown
     """
     n_tiles = batch.all_tiles.shape[0]
+    n_frames = len(batch.metas)
     
-    # Transfer tiles to GPU (non-blocking for overlap with CPU work)
+    # -------------------------------------------------------------------------
+    # Phase 1: H2D Transfer
+    # -------------------------------------------------------------------------
     t0 = time.perf_counter()
     all_tiles = batch.all_tiles.to(device, non_blocking=True)
     
-    # Synchronize before inference to ensure transfer is complete
+    # Synchronize to ensure transfer is complete before timing forward pass
     if device == "cuda":
         torch.cuda.synchronize()
     t1 = time.perf_counter()
     
+    # -------------------------------------------------------------------------
+    # Phase 2: Forward pass
+    # -------------------------------------------------------------------------
     with torch.inference_mode():
         preds = model(all_tiles)
         soft = torch.sigmoid(preds)
 
-    # Synchronize after inference to ensure it's complete before stitching
+    # Synchronize to get accurate forward time
     if device == "cuda":
         torch.cuda.synchronize()
     t2 = time.perf_counter()
 
-    results = []
+    # -------------------------------------------------------------------------
+    # Phase 3: Stitching (on GPU)
+    # -------------------------------------------------------------------------
+    stitched_tensors = []  # Keep on GPU, batch the D2H
     for (start, end), meta in zip(batch.tile_ranges, batch.metas):
         preds_img = soft[start:end]
         
         stitched = stitch_tiles(preds_img, meta["x_steps"], meta["y_steps"], patch_size)
         stitched = crop_padding(stitched, meta["pad_x"], meta["pad_y"])
         
-        # Output as grayscale uint8 {0, 255}
+        # Threshold on GPU
         binary = (stitched > class_threshold).to(torch.uint8) * 255
-        mask_np = binary.squeeze(0).cpu().numpy()
-        
-        results.append((meta, mask_np))
+        stitched_tensors.append((meta, binary.squeeze(0)))
     
+    # Synchronize to get accurate stitch time
+    if device == "cuda":
+        torch.cuda.synchronize()
     t3 = time.perf_counter()
     
-    # Explicitly delete GPU tensors to free memory immediately
-    del all_tiles, preds, soft
+    # -------------------------------------------------------------------------
+    # Phase 4: D2H Transfer (batch all at once)
+    # -------------------------------------------------------------------------
+    results = []
+    for meta, binary_gpu in stitched_tensors:
+        mask_np = binary_gpu.cpu().numpy()
+        results.append((meta, mask_np))
     
-    # Log detailed timing for slow batches or when requested
-    transfer_time = t1 - t0
-    forward_time = t2 - t1
-    stitch_time = t3 - t2
-    total_time = t3 - t0
+    # Synchronize to get accurate D2H time
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t4 = time.perf_counter()
     
-    if detailed_timing or total_time > 0.5:
-        logger.info(
-            f"[infer_batch] {n_tiles} tiles: transfer={transfer_time*1000:.1f}ms, "
-            f"forward={forward_time*1000:.1f}ms, stitch={stitch_time*1000:.1f}ms, "
-            f"total={total_time*1000:.1f}ms"
-        )
+    # -------------------------------------------------------------------------
+    # Cleanup
+    # -------------------------------------------------------------------------
+    del all_tiles, preds, soft, stitched_tensors
     
-    return results
+    timing = InferTiming(
+        n_tiles=n_tiles,
+        n_frames=n_frames,
+        h2d_ms=(t1 - t0) * 1000,
+        forward_ms=(t2 - t1) * 1000,
+        stitch_ms=(t3 - t2) * 1000,
+        d2h_ms=(t4 - t3) * 1000,
+    )
+    
+    return results, timing
 
 
 # -----------------------------------------------------------------------------
@@ -354,12 +401,15 @@ class LDInferenceRunner:
     # Batch processing
     # -------------------------------------------------------------------------
 
-    async def _process_batch(self, batch: TiledBatch) -> None:
+    async def _process_batch(self, batch: TiledBatch) -> Optional[InferTiming]:
         """
         Process a TiledBatch: run GPU inference, stitch, emit results.
+        
+        Returns:
+            InferTiming if successful, None on error.
         """
         try:
-            results = infer_batch(
+            results, timing = infer_batch(
                 self.model,
                 batch,
                 self.class_threshold,
@@ -369,6 +419,8 @@ class LDInferenceRunner:
 
             for meta, mask_np in results:
                 await self._emit_result(meta, mask_np)
+            
+            return timing
 
         except Exception as e:
             # On error, emit PipelineError for each frame in the batch
@@ -383,6 +435,7 @@ class LDInferenceRunner:
                     retryable=retryable,
                     attempt=1,
                 )
+            return None
 
     # -------------------------------------------------------------------------
     # Main run loop
@@ -398,8 +451,16 @@ class LDInferenceRunner:
         # Timing stats
         batches_processed = 0
         total_wait_time = 0.0
-        total_infer_time = 0.0
         total_tiles = 0
+        total_frames = 0
+        
+        # Detailed timing accumulators
+        total_h2d_ms = 0.0
+        total_forward_ms = 0.0
+        total_stitch_ms = 0.0
+        total_d2h_ms = 0.0
+        
+        detailed_timing = getattr(self.cfg, "detailed_inference_timing", False)
         
         try:
             while True:
@@ -426,10 +487,32 @@ class LDInferenceRunner:
                             self._p1_eos_sent = True
                     
                     elif msg.stream == "tiled_pass_2":
+                        # Log detailed summary
+                        total_infer_ms = total_h2d_ms + total_forward_ms + total_stitch_ms + total_d2h_ms
+                        total_transfer_ms = total_h2d_ms + total_d2h_ms
+                        total_gpu_ms = total_forward_ms + total_stitch_ms
+                        
                         logger.info(
-                            f"[InferenceRunner] DONE - batches={batches_processed}, tiles={total_tiles}, "
-                            f"total_wait={total_wait_time:.2f}s, total_infer={total_infer_time:.2f}s"
+                            f"[InferenceRunner] DONE - batches={batches_processed}, frames={total_frames}, tiles={total_tiles}"
                         )
+                        logger.info(
+                            f"[InferenceRunner] TIMING SUMMARY: "
+                            f"total={total_infer_ms:.0f}ms, "
+                            f"h2d={total_h2d_ms:.0f}ms ({100*total_h2d_ms/total_infer_ms:.1f}%), "
+                            f"forward={total_forward_ms:.0f}ms ({100*total_forward_ms/total_infer_ms:.1f}%), "
+                            f"stitch={total_stitch_ms:.0f}ms ({100*total_stitch_ms/total_infer_ms:.1f}%), "
+                            f"d2h={total_d2h_ms:.0f}ms ({100*total_d2h_ms/total_infer_ms:.1f}%)"
+                        ) if total_infer_ms > 0 else None
+                        logger.info(
+                            f"[InferenceRunner] GPU busy={total_gpu_ms:.0f}ms, PCIe transfers={total_transfer_ms:.0f}ms, "
+                            f"queue_wait={total_wait_time*1000:.0f}ms"
+                        )
+                        if total_infer_ms > 0:
+                            logger.info(
+                                f"[InferenceRunner] Throughput: {total_tiles/(total_infer_ms/1000):.1f} tiles/s, "
+                                f"{total_frames/(total_infer_ms/1000):.1f} frames/s"
+                            )
+                        
                         self._done = True
                         if not self._p1_eos_sent:
                             await self.q_gpu_pass_1_to_post_processor.put(
@@ -445,26 +528,40 @@ class LDInferenceRunner:
                     await self.q_gpu_pass_1_to_post_processor.put(msg)
                 
                 elif isinstance(msg, TiledBatch):
-                    infer_start = time.perf_counter()
                     n_tiles = msg.all_tiles.shape[0]
                     n_frames = len(msg.metas)
                     
-                    await self._process_batch(msg)
+                    timing = await self._process_batch(msg)
                     
-                    infer_time = time.perf_counter() - infer_start
-                    total_infer_time += infer_time
-                    total_tiles += n_tiles
-                    batches_processed += 1
-                    
-                    tiles_per_sec = n_tiles / infer_time if infer_time > 0 else 0
-                    logger.info(
-                        f"[InferenceRunner] Batch #{batches_processed}: {n_frames} frames, {n_tiles} tiles, "
-                        f"infer={infer_time:.3f}s ({tiles_per_sec:.1f} tiles/s), wait_before={wait_time:.3f}s"
-                    )
+                    if timing:
+                        total_tiles += n_tiles
+                        total_frames += n_frames
+                        batches_processed += 1
+                        
+                        # Accumulate detailed timing
+                        total_h2d_ms += timing.h2d_ms
+                        total_forward_ms += timing.forward_ms
+                        total_stitch_ms += timing.stitch_ms
+                        total_d2h_ms += timing.d2h_ms
+                        
+                        tiles_per_sec = n_tiles / (timing.total_ms / 1000) if timing.total_ms > 0 else 0
+                        
+                        if detailed_timing:
+                            logger.info(
+                                f"[InferenceRunner] Batch #{batches_processed}: {n_frames} frames, {n_tiles} tiles, "
+                                f"total={timing.total_ms:.1f}ms ({tiles_per_sec:.0f} t/s) | "
+                                f"h2d={timing.h2d_ms:.1f}ms, fwd={timing.forward_ms:.1f}ms, "
+                                f"stitch={timing.stitch_ms:.1f}ms, d2h={timing.d2h_ms:.1f}ms | "
+                                f"wait={wait_time*1000:.0f}ms"
+                            )
+                        else:
+                            logger.info(
+                                f"[InferenceRunner] Batch #{batches_processed}: {n_frames} frames, {n_tiles} tiles, "
+                                f"infer={timing.total_ms:.0f}ms ({tiles_per_sec:.0f} t/s), wait={wait_time*1000:.0f}ms"
+                            )
                     
                     # Periodic memory cleanup to prevent fragmentation
-                    # (every 10 batches or after slow batches)
-                    if batches_processed % 10 == 0 or infer_time > 1.0:
+                    if batches_processed % 10 == 0:
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                 

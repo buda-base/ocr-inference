@@ -98,9 +98,12 @@ def load_model(
     if device is not None:
         device = torch.device(device)
 
-        # Enable cuDNN benchmarking for conv-heavy fixed-shape workloads.
+        # cuDNN benchmarking: when True, benchmarks different algorithms for each
+        # input shape and caches the fastest. HOWEVER, this causes multi-second
+        # delays when batch size varies (e.g., last batch of a volume).
+        # Set to False for consistent performance with variable batch sizes.
         if device.type == "cuda":
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = False
 
             # TF32 is Ampere+ only; harmless to set on T4.
             try:
