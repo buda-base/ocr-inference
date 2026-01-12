@@ -406,16 +406,17 @@ class LDInferenceRunner:
     async def _emit_result(self, meta: Dict[str, Any], mask_np: np.ndarray) -> None:
         """Emit InferredFrame to appropriate output queue."""
         dec_frame: DecodedFrame = meta["dec_frame"]
-        gray: np.ndarray = meta["gray"]
         second_pass: bool = meta["second_pass"]
 
+        # Use original grayscale frame from decoder, not the binarized version
+        # (binarization in TileBatcher is only for tiling, not for downstream)
         out = InferredFrame(
             task=dec_frame.task,
             source_etag=dec_frame.source_etag,
-            frame=gray,
+            frame=dec_frame.frame,  # Original grayscale from decoder
             orig_h=dec_frame.orig_h,
             orig_w=dec_frame.orig_w,
-            is_binary=True,  # After binarization in TileBatcher
+            is_binary=dec_frame.is_binary,  # Preserve original binary flag
             first_pass=dec_frame.first_pass,
             rotation_angle=dec_frame.rotation_angle,
             tps_data=dec_frame.tps_data,

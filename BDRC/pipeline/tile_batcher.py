@@ -255,9 +255,12 @@ class TileBatcher:
     # Frame preprocessing
     # -------------------------------------------------------------------------
 
-    def _preprocess_frame(self, dec_frame: DecodedFrame) -> np.ndarray:
+    def _preprocess_frame_sync(self, dec_frame: DecodedFrame) -> np.ndarray:
         """
         Preprocess a decoded frame: validate and optionally binarize.
+        
+        WARNING: This runs adaptive_binarize which is CPU-intensive!
+        Should be called from thread pool, not main async loop.
         
         Returns grayscale uint8 numpy array [H, W].
         """
@@ -265,7 +268,7 @@ class TileBatcher:
         if not isinstance(gray, np.ndarray) or gray.ndim != 2 or gray.dtype != np.uint8:
             raise ValueError("DecodedFrame.frame must be a 2D numpy uint8 array (H, W)")
 
-        # Optional binarization
+        # Optional binarization (CPU-intensive!)
         is_binary = bool(dec_frame.is_binary)
         if not is_binary:
             gray = adaptive_binarize(
@@ -276,47 +279,30 @@ class TileBatcher:
         
         return gray
 
-    async def _tile_frame(self, gray: np.ndarray) -> Tuple[torch.Tensor, int, int, int, int]:
-        """
-        Tile a frame, optionally using thread pool for parallelism.
-        """
-        if self._use_parallel_tiling and self._tile_executor is not None:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                self._tile_executor,
-                tile_frame_sync,
-                gray,
-                self.patch_size,
-                self.tile_dtype,
-                self.pin_tile_memory,
-            )
-        else:
-            return tile_frame_sync(gray, self.patch_size, self.tile_dtype, self.pin_tile_memory)
-
     async def _tile_frame_async(
         self,
         dec_frame: DecodedFrame,
-        gray: np.ndarray,
         is_pass2: bool,
     ) -> Dict[str, Any]:
         """
-        Tile a frame and return the complete entry for the buffer.
+        Binarize and tile a frame, running CPU-intensive work in thread pool.
         
-        This is designed to be run as a task for parallel tiling.
+        This combines preprocessing (binarization) and tiling into a single
+        thread pool operation to avoid blocking the async event loop.
         """
         t0 = time.perf_counter()
         
         if self._use_parallel_tiling and self._tile_executor is not None:
             loop = asyncio.get_event_loop()
-            tiles, x_steps, y_steps, pad_x, pad_y = await loop.run_in_executor(
+            # Run BOTH binarization and tiling in thread pool
+            gray, tiles, x_steps, y_steps, pad_x, pad_y = await loop.run_in_executor(
                 self._tile_executor,
-                tile_frame_sync,
-                gray,
-                self.patch_size,
-                self.tile_dtype,
-                self.pin_tile_memory,
+                self._preprocess_and_tile_sync,
+                dec_frame,
             )
         else:
+            # Fallback: run synchronously (will block)
+            gray = self._preprocess_frame_sync(dec_frame)
             tiles, x_steps, y_steps, pad_x, pad_y = tile_frame_sync(
                 gray, self.patch_size, self.tile_dtype, self.pin_tile_memory
             )
@@ -334,6 +320,25 @@ class TileBatcher:
             "pad_y": pad_y,
             "tile_time": tile_time,
         }
+    
+    def _preprocess_and_tile_sync(
+        self,
+        dec_frame: DecodedFrame,
+    ) -> Tuple[np.ndarray, torch.Tensor, int, int, int, int]:
+        """
+        Combined binarization + tiling, designed to run in thread pool.
+        
+        Returns (gray, tiles, x_steps, y_steps, pad_x, pad_y).
+        """
+        # Step 1: Binarize (CPU-intensive)
+        gray = self._preprocess_frame_sync(dec_frame)
+        
+        # Step 2: Tile (also CPU work + memory ops)
+        tiles, x_steps, y_steps, pad_x, pad_y = tile_frame_sync(
+            gray, self.patch_size, self.tile_dtype, self.pin_tile_memory
+        )
+        
+        return gray, tiles, x_steps, y_steps, pad_x, pad_y
 
     def _collect_completed_tiles(self) -> Tuple[int, float]:
         """
@@ -654,27 +659,13 @@ class TileBatcher:
                     
                     # --- Start tiling task (don't await!) ---
                     if isinstance(msg, DecodedFrame):
-                        try:
-                            # Preprocess synchronously (fast)
-                            gray = self._preprocess_frame(msg)
-                            
-                            # Fire off async tiling task
-                            task = asyncio.create_task(
-                                self._tile_frame_async(msg, gray, is_pass2)
-                            )
-                            self._pending_tiles.append(task)
-                            frames_submitted += 1
-                            
-                        except Exception as e:
-                            await self._emit_pipeline_error(
-                                internal_stage="preprocess",
-                                exc=e,
-                                lane_second_pass=is_pass2,
-                                task=msg.task,
-                                source_etag=msg.source_etag,
-                                retryable=False,
-                                attempt=1,
-                            )
+                        # Fire off async task that does BOTH binarization and tiling
+                        # in thread pool (avoids blocking the event loop)
+                        task = asyncio.create_task(
+                            self._tile_frame_async(msg, is_pass2)
+                        )
+                        self._pending_tiles.append(task)
+                        frames_submitted += 1
 
                 # --- Timeout flush: emit partial batch if nothing is coming ---
                 # Only flush if:
@@ -730,23 +721,12 @@ class TileBatcher:
                             elif isinstance(msg, PipelineError):
                                 await self.q_to_inference.put(msg)
                             elif isinstance(msg, DecodedFrame):
-                                try:
-                                    gray = self._preprocess_frame(msg)
-                                    task = asyncio.create_task(
-                                        self._tile_frame_async(msg, gray, False)
-                                    )
-                                    self._pending_tiles.append(task)
-                                    frames_submitted += 1
-                                except Exception as e:
-                                    await self._emit_pipeline_error(
-                                        internal_stage="preprocess",
-                                        exc=e,
-                                        lane_second_pass=False,
-                                        task=msg.task,
-                                        source_etag=msg.source_etag,
-                                        retryable=False,
-                                        attempt=1,
-                                    )
+                                # Fire off async task that does BOTH binarization and tiling
+                                task = asyncio.create_task(
+                                    self._tile_frame_async(msg, False)
+                                )
+                                self._pending_tiles.append(task)
+                                frames_submitted += 1
 
                 # --- Check if we should send pass-1 EOS ---
                 await self._maybe_emit_pass1_eos()
