@@ -405,6 +405,13 @@ class TileBatcher:
     # Queue helpers
     # -------------------------------------------------------------------------
 
+    def _try_get_nowait(self, q: asyncio.Queue):
+        """Try to get an item from queue without waiting. Returns None if empty."""
+        try:
+            return q.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+    
     async def _pop_one(self, q: asyncio.Queue, timeout_s: float):
         """Pop one item from queue with timeout. Returns None on timeout."""
         try:
@@ -539,14 +546,14 @@ class TileBatcher:
                     msg = None
                     is_pass2 = False
                     
-                    wait_start = time.perf_counter()
+                    # --- First try NON-BLOCKING gets from both queues ---
+                    # This avoids wasting 25ms on empty queues
                     
-                    # --- Prefer pass-2 (from PostProcessor) ---
+                    # Prefer pass-2 (from PostProcessor)
                     if not self._postprocessor_done:
-                        msg = await self._pop_one(self.q_from_postprocessor, self.batch_timeout_s)
+                        msg = self._try_get_nowait(self.q_from_postprocessor)
                         if msg is not None:
                             is_pass2 = True
-                            
                             if isinstance(msg, EndOfStream) and msg.stream == "transformed_pass_1":
                                 self._postprocessor_done = True
                                 logger.debug("[TileBatcher] Received transformed_pass_1 EOS")
@@ -555,12 +562,11 @@ class TileBatcher:
                                 await self.q_to_inference.put(msg)
                                 msg = None
 
-                    # --- Then pass-1 (from Decoder) ---
+                    # Then pass-1 (from Decoder)
                     if msg is None and not self._decoder_done:
-                        msg = await self._pop_one(self.q_from_decoder, self.batch_timeout_s)
+                        msg = self._try_get_nowait(self.q_from_decoder)
                         if msg is not None:
                             is_pass2 = False
-                            
                             if isinstance(msg, EndOfStream) and msg.stream == "decoded":
                                 self._decoder_done = True
                                 logger.debug("[TileBatcher] Received decoded EOS")
@@ -569,8 +575,22 @@ class TileBatcher:
                                 await self.q_to_inference.put(msg)
                                 msg = None
                     
-                    wait_time = time.perf_counter() - wait_start
-                    total_wait_time += wait_time
+                    # --- If both queues empty, wait briefly on decoder queue ---
+                    if msg is None and not self._decoder_done:
+                        wait_start = time.perf_counter()
+                        msg = await self._pop_one(self.q_from_decoder, self.batch_timeout_s)
+                        wait_time = time.perf_counter() - wait_start
+                        total_wait_time += wait_time
+                        
+                        if msg is not None:
+                            is_pass2 = False
+                            if isinstance(msg, EndOfStream) and msg.stream == "decoded":
+                                self._decoder_done = True
+                                logger.debug("[TileBatcher] Received decoded EOS")
+                                msg = None
+                            elif isinstance(msg, PipelineError):
+                                await self.q_to_inference.put(msg)
+                                msg = None
                     
                     if msg is None:
                         # No frame available, break out of fetch loop

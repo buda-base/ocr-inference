@@ -72,6 +72,8 @@ class Decoder:
         
         Key optimization: Fire off multiple decode tasks without awaiting each one.
         This keeps all thread pool workers busy instead of just 1.
+        
+        Also uses non-blocking puts to avoid blocking on output queue.
         """
         loop = asyncio.get_running_loop()
         
@@ -80,11 +82,16 @@ class Decoder:
         error_count = 0
         total_decode_time = 0.0
         total_wait_time = 0.0
+        total_output_wait_time = 0.0
         run_start = time.perf_counter()
         
         # Pending decode futures (asyncio.Future from run_in_executor)
         pending_futures: list[asyncio.Future] = []
         max_inflight = self.cfg.decode_threads * 2  # Keep 2x workers busy
+        
+        # Output buffer for completed decodes (to avoid blocking puts)
+        output_buffer: list[DecodedFrame] = []
+        max_output_buffer = self.cfg.decode_threads * 2
         
         # Track when input is exhausted
         input_done = False
@@ -93,6 +100,15 @@ class Decoder:
 
         try:
             while True:
+                # --- Drain output buffer first (non-blocking) ---
+                while output_buffer:
+                    try:
+                        self.q_decoder_to_gpu_pass_1.put_nowait(output_buffer[0])
+                        output_buffer.pop(0)
+                    except asyncio.QueueFull:
+                        # Queue full, stop draining
+                        break
+                
                 # --- Collect completed decode futures ---
                 still_pending = []
                 for fut in pending_futures:
@@ -107,20 +123,18 @@ class Decoder:
                                     f"[Decoder] Slow decode: {decoded.task.img_filename} took {decode_time:.2f}s"
                                 )
                             
-                            await self.q_decoder_to_gpu_pass_1.put(decoded)
+                            # Add to output buffer instead of blocking put
+                            output_buffer.append(decoded)
+                            
                         except Exception as e:
-                            import traceback as tb_module
                             error_count += 1
                             logger.error(f"[Decoder] Decode failed: {e}")
-                            # We have original_item from the closure, emit proper error
-                            # But since the exception happened, we need to get original_item differently
-                            # For now, just log the error - the item info is lost
                     else:
                         still_pending.append(fut)
                 pending_futures = still_pending
                 
                 # --- Check termination ---
-                if input_done and len(pending_futures) == 0:
+                if input_done and len(pending_futures) == 0 and len(output_buffer) == 0:
                     run_time = time.perf_counter() - run_start
                     avg_decode = total_decode_time / max(1, decoded_count)
                     throughput = decoded_count / run_time if run_time > 0 else 0
@@ -128,33 +142,46 @@ class Decoder:
                     logger.info(
                         f"[Decoder] DONE - {decoded_count} decoded, {error_count} errors, "
                         f"run_time={run_time:.2f}s ({throughput:.1f} img/s), "
-                        f"avg_decode={avg_decode*1000:.1f}ms, total_wait={total_wait_time:.2f}s"
+                        f"avg_decode={avg_decode*1000:.1f}ms, total_wait={total_wait_time:.2f}s, "
+                        f"output_wait={total_output_wait_time:.2f}s"
                     )
                     
                     await self.q_decoder_to_gpu_pass_1.put(EndOfStream(stream="decoded", producer="Decoder"))
                     return
                 
-                # --- Fetch more items if we have capacity ---
-                while len(pending_futures) < max_inflight and not input_done:
+                # --- If output buffer is getting full, wait for downstream to consume ---
+                if len(output_buffer) >= max_output_buffer:
                     wait_start = time.perf_counter()
+                    # Wait for space in output queue
+                    await self.q_decoder_to_gpu_pass_1.put(output_buffer.pop(0))
+                    total_output_wait_time += time.perf_counter() - wait_start
+                    continue  # Go back to draining output buffer
+                
+                # --- Fetch more items if we have capacity ---
+                # Use non-blocking get first, then timeout
+                while len(pending_futures) < max_inflight and not input_done:
+                    msg = None
                     try:
-                        # Use short timeout to stay responsive
-                        msg = await asyncio.wait_for(
-                            self.q_prefetcher_to_decoder.get(),
-                            timeout=0.01  # 10ms
-                        )
-                    except asyncio.TimeoutError:
+                        msg = self.q_prefetcher_to_decoder.get_nowait()
+                    except asyncio.QueueEmpty:
+                        # Queue empty, use short timeout
+                        wait_start = time.perf_counter()
+                        try:
+                            msg = await asyncio.wait_for(
+                                self.q_prefetcher_to_decoder.get(),
+                                timeout=0.005  # 5ms (shorter timeout)
+                            )
+                        except asyncio.TimeoutError:
+                            total_wait_time += time.perf_counter() - wait_start
+                            break
                         total_wait_time += time.perf_counter() - wait_start
-                        break  # No more items right now
-                    
-                    total_wait_time += time.perf_counter() - wait_start
                     
                     if isinstance(msg, EndOfStream):
                         input_done = True
                         break
                     
                     if isinstance(msg, PipelineError):
-                        await self.q_decoder_to_gpu_pass_1.put(msg)
+                        output_buffer.append(msg)  # Errors go through same path
                         error_count += 1
                         continue
                     
