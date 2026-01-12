@@ -444,12 +444,16 @@ class LDInferenceRunner:
     # Main run loop
     # -------------------------------------------------------------------------
 
+    async def _fetch_next_batch(self) -> Any:
+        """Fetch next message from queue (runs as background task)."""
+        return await self.q_in.get()
+
     async def run(self) -> None:
         """
-        Main loop: receive TiledBatch, run inference, emit results.
+        Main loop with batch pre-fetching for pipeline overlap.
         
-        This is intentionally simple - all the batching complexity
-        is handled by TileBatcher.
+        Key optimization: Start fetching batch N+1 while GPU processes batch N.
+        This overlaps queue wait time with GPU compute time, reducing idle gaps.
         """
         # Timing stats
         batches_processed = 0
@@ -468,13 +472,22 @@ class LDInferenceRunner:
         
         # Track time from GPU perspective
         run_start_time = time.perf_counter()
-        last_batch_end_time = None  # Time when last batch finished (including emission)
+        
+        # Pre-fetch task for batch pipelining
+        prefetch_task: Optional[asyncio.Task] = None
         
         try:
+            # Start pre-fetching the first batch
+            prefetch_task = asyncio.create_task(self._fetch_next_batch())
+            
             while True:
-                # Wait for batch from TileBatcher
+                # Wait for the pre-fetched batch (measure actual blocking time)
                 wait_start = time.perf_counter()
-                msg = await self.q_in.get()
+                if prefetch_task is not None:
+                    msg = await prefetch_task
+                    prefetch_task = None
+                else:
+                    msg = await self.q_in.get()
                 wait_time = time.perf_counter() - wait_start
                 total_wait_time += wait_time
                 
@@ -493,6 +506,9 @@ class LDInferenceRunner:
                                 EndOfStream(stream="gpu_pass_1", producer="LDInferenceRunner")
                             )
                             self._p1_eos_sent = True
+                        # Continue processing - there may be more pass-2 batches
+                        prefetch_task = asyncio.create_task(self._fetch_next_batch())
+                        continue
                     
                     elif msg.stream == "tiled_pass_2":
                         # Log detailed summary
@@ -544,11 +560,17 @@ class LDInferenceRunner:
                 
                 elif isinstance(msg, PipelineError):
                     await self.q_gpu_pass_1_to_post_processor.put(msg)
+                    # Continue fetching
+                    prefetch_task = asyncio.create_task(self._fetch_next_batch())
                 
                 elif isinstance(msg, TiledBatch):
                     n_tiles = msg.all_tiles.shape[0]
                     n_frames = len(msg.metas)
                     
+                    # START FETCHING NEXT BATCH NOW - runs in background during GPU work
+                    prefetch_task = asyncio.create_task(self._fetch_next_batch())
+                    
+                    # Process current batch on GPU (this takes ~430ms)
                     timing, emit_time = await self._process_batch(msg)
                     total_emit_time += emit_time
                     
@@ -586,17 +608,25 @@ class LDInferenceRunner:
                 
                 else:
                     logger.warning(f"[InferenceRunner] Unexpected message type: {type(msg)}")
+                    # Continue fetching
+                    prefetch_task = asyncio.create_task(self._fetch_next_batch())
 
-                # Yield to event loop
+                # Yield to event loop (allows prefetch task to progress)
                 await asyncio.sleep(0)
 
         except asyncio.CancelledError:
             logger.info("[InferenceRunner] Cancelled, cleaning up...")
+            if prefetch_task and not prefetch_task.done():
+                prefetch_task.cancel()
             raise
         except KeyboardInterrupt:
             logger.info("[InferenceRunner] Interrupted by user")
+            if prefetch_task and not prefetch_task.done():
+                prefetch_task.cancel()
             raise
         finally:
+            if prefetch_task and not prefetch_task.done():
+                prefetch_task.cancel()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
