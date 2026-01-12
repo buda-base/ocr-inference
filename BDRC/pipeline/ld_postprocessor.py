@@ -125,14 +125,33 @@ class LDPostProcessor:
             return None  # no item right now
 
     async def run(self):
+        import time
+        import logging
+        logger = logging.getLogger(__name__)
+        
         # Pass2 is cheap; prioritize it, but don't starve pass1 entirely.
         p2_budget = getattr(self.cfg, "reprocess_budget", 3)
         p1_budget = 1
         timeout_s = getattr(self.cfg, "controller_poll_ms", 5) / 1000.0
+        
+        # Timing stats
+        run_start = time.perf_counter()
+        p1_count = 0
+        p2_count = 0
+        total_p1_time = 0.0
+        total_p2_time = 0.0
 
         while True:
             # Terminate only after both GPU streams have ended.
             if self._p1_done and self._p2_done:
+                run_time = time.perf_counter() - run_start
+                avg_p1 = total_p1_time / max(1, p1_count)
+                avg_p2 = total_p2_time / max(1, p2_count)
+                logger.info(
+                    f"[PostProcessor] DONE - p1={p1_count} ({total_p1_time:.2f}s, avg={avg_p1*1000:.1f}ms), "
+                    f"p2={p2_count} ({total_p2_time:.2f}s, avg={avg_p2*1000:.1f}ms), "
+                    f"run_time={run_time:.2f}s"
+                )
                 await self.q_post_processor_to_writer.put(EndOfStream(stream="record", producer="LDPostProcessor"))
                 return
 
@@ -156,7 +175,10 @@ class LDPostProcessor:
 
                     frame: InferredFrame = msg
                     try:
+                        t0 = time.perf_counter()
                         await self._finalize_record(frame)  # cheap path
+                        total_p2_time += time.perf_counter() - t0
+                        p2_count += 1
                     except Exception as e:
                         await self._emit_pipeline_error(
                             internal_stage="run.finalize_pass2",
@@ -192,7 +214,10 @@ class LDPostProcessor:
 
                     frame: InferredFrame = msg
                     try:
+                        t0 = time.perf_counter()
                         await self._handle_pass1(frame)
+                        total_p1_time += time.perf_counter() - t0
+                        p1_count += 1
                     except Exception as e:
                         await self._emit_pipeline_error(
                             internal_stage="run.handle_pass1",
