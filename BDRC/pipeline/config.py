@@ -81,6 +81,10 @@ class PipelineConfig:
     # Best for S3 sources where images fit in RAM (~2GB max volume)
     bulk_prefetch: bool = True
     bulk_prefetch_concurrency: int = 64  # Higher concurrency for bulk mode (no queue backpressure)
+    
+    # Warmup: wait for decoder queue to fill before starting GPU inference
+    # This ensures consistent batch sizes at the start (helps with S3's bursty behavior)
+    inference_warmup_frames: int = 64  # Wait for this many decoded frames before starting GPU
     tps_add_corners: bool = True
     tps_alpha: float = 0.5
     legacy_tps_detect: bool = False

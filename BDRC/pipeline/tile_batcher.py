@@ -470,6 +470,11 @@ class TileBatcher:
         # Max frames to have in-flight (tiling) at once
         max_inflight = self.tile_workers * 2  # 2x workers for good overlap
         
+        # Warmup: wait for buffer to fill before emitting first batch
+        # This ensures consistent batch sizes when upstream (S3) is bursty
+        warmup_frames = getattr(self.cfg, "inference_warmup_frames", 0)
+        warmup_complete = (warmup_frames == 0)  # Skip warmup if disabled
+        
         try:
             while True:
                 loop_start = time.perf_counter()
@@ -513,9 +518,22 @@ class TileBatcher:
                     )
                     break
 
-                # --- Emit batch when full ---
-                # Do this early so GPU gets work ASAP
-                if len(self._buffer) >= self.batch_size:
+                # --- Warmup phase: wait for buffer to fill ---
+                if not warmup_complete:
+                    total_ready = len(self._buffer) + len(self._pending_tiles)
+                    if total_ready >= warmup_frames or self._decoder_done:
+                        warmup_complete = True
+                        logger.info(
+                            f"[TileBatcher] Warmup complete: {len(self._buffer)} frames ready, "
+                            f"{len(self._pending_tiles)} pending"
+                        )
+                    else:
+                        # Still warming up - don't emit, just collect more frames
+                        # Continue to the fetch section below
+                        pass
+                
+                # --- Emit batch when full (only after warmup) ---
+                if warmup_complete and len(self._buffer) >= self.batch_size:
                     emit_start = time.perf_counter()
                     n_frames = len(self._buffer)
                     batch = self._prepare_batch()
@@ -624,10 +642,12 @@ class TileBatcher:
 
                 # --- Timeout flush: emit partial batch if nothing is coming ---
                 # Only flush if:
-                # 1. We have frames AND couldn't fetch any new ones AND no pending tiles
-                # 2. AND either: decoder is done OR batch is at least 75% full
+                # 1. Warmup is complete
+                # 2. We have frames AND couldn't fetch any new ones AND no pending tiles
+                # 3. AND either: decoder is done OR batch is at least 75% full
                 # This prevents tiny batches when S3 fetches are slow/bursty
-                if (frames_fetched_this_loop == 0 and 
+                if (warmup_complete and
+                    frames_fetched_this_loop == 0 and 
                     self._buffer and 
                     len(self._pending_tiles) == 0):
                     
