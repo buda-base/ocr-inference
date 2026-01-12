@@ -77,6 +77,7 @@ class PipelineConfig:
     max_angle_deg: float = 5.0
     min_angle_deg: float = 0.3
     skip_pass2_rotation_threshold: float = 3.0  # Skip GPU pass-2 for rotations below this (just rotate contours)
+    max_concurrent_transforms: int = 8  # Max concurrent rotation/TPS transforms (fire-and-forget)
     
     # Prefetch mode: bulk fetches ALL images into memory before processing
     # Best for S3 sources where images fit in RAM (~2GB max volume)
