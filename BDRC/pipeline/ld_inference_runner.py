@@ -118,6 +118,8 @@ def infer_batch(
     class_threshold: float,
     device: str,
     patch_size: int = 512,
+    staged_tiles: Optional[torch.Tensor] = None,
+    compute_stream: Optional[torch.cuda.Stream] = None,
 ) -> Tuple[List[Tuple[Dict[str, Any], np.ndarray]], InferTiming]:
     """
     Run inference on a TiledBatch and stitch results.
@@ -130,6 +132,8 @@ def infer_batch(
         class_threshold: threshold for binary mask
         device: "cuda" or "cpu"
         patch_size: tile size
+        staged_tiles: Optional pre-staged GPU tensor (if using CUDA streams)
+        compute_stream: Optional CUDA stream for compute operations
     
     Returns:
         Tuple of:
@@ -140,44 +144,54 @@ def infer_batch(
     n_frames = len(batch.metas)
     
     # -------------------------------------------------------------------------
-    # Phase 1: H2D Transfer
+    # Phase 1: H2D Transfer (skip if tiles already staged)
     # -------------------------------------------------------------------------
     t0 = time.perf_counter()
-    all_tiles = batch.all_tiles.to(device, non_blocking=True)
-    
-    # Synchronize to ensure transfer is complete before timing forward pass
-    if device == "cuda":
-        torch.cuda.synchronize()
+    if staged_tiles is not None:
+        all_tiles = staged_tiles
+        h2d_time = 0.0  # Already transferred
+    else:
+        all_tiles = batch.all_tiles.to(device, non_blocking=True)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        h2d_time = (time.perf_counter() - t0) * 1000
     t1 = time.perf_counter()
     
     # -------------------------------------------------------------------------
-    # Phase 2: Forward pass
+    # Phase 2: Forward pass (on compute stream if provided)
     # -------------------------------------------------------------------------
-    with torch.inference_mode():
-        preds = model(all_tiles)
-        soft = torch.sigmoid(preds)
+    stream_ctx = torch.cuda.stream(compute_stream) if compute_stream else nullcontext()
+    with stream_ctx:
+        with torch.inference_mode():
+            preds = model(all_tiles)
+            soft = torch.sigmoid(preds)
 
-    # Synchronize to get accurate forward time
-    if device == "cuda":
+    # Synchronize compute stream
+    if compute_stream:
+        compute_stream.synchronize()
+    elif device == "cuda":
         torch.cuda.synchronize()
     t2 = time.perf_counter()
 
     # -------------------------------------------------------------------------
-    # Phase 3: Stitching (on GPU)
+    # Phase 3: Stitching (on GPU, same stream as compute)
     # -------------------------------------------------------------------------
-    stitched_tensors = []  # Keep on GPU, batch the D2H
-    for (start, end), meta in zip(batch.tile_ranges, batch.metas):
-        preds_img = soft[start:end]
-        
-        stitched = stitch_tiles(preds_img, meta["x_steps"], meta["y_steps"], patch_size)
-        stitched = crop_padding(stitched, meta["pad_x"], meta["pad_y"])
-        
-        # Threshold on GPU
-        binary = (stitched > class_threshold).to(torch.uint8) * 255
-        stitched_tensors.append((meta, binary.squeeze(0)))
+    with stream_ctx:
+        stitched_tensors = []  # Keep on GPU, batch the D2H
+        for (start, end), meta in zip(batch.tile_ranges, batch.metas):
+            preds_img = soft[start:end]
+            
+            stitched = stitch_tiles(preds_img, meta["x_steps"], meta["y_steps"], patch_size)
+            stitched = crop_padding(stitched, meta["pad_x"], meta["pad_y"])
+            
+            # Threshold on GPU
+            binary = (stitched > class_threshold).to(torch.uint8) * 255
+            stitched_tensors.append((meta, binary.squeeze(0)))
     
-    # Synchronize to get accurate stitch time
-    if device == "cuda":
+    # Synchronize stitch
+    if compute_stream:
+        compute_stream.synchronize()
+    elif device == "cuda":
         torch.cuda.synchronize()
     t3 = time.perf_counter()
     
@@ -189,7 +203,7 @@ def infer_batch(
         mask_np = binary_gpu.cpu().numpy()
         results.append((meta, mask_np))
     
-    # Synchronize to get accurate D2H time
+    # Synchronize D2H
     if device == "cuda":
         torch.cuda.synchronize()
     t4 = time.perf_counter()
@@ -202,13 +216,17 @@ def infer_batch(
     timing = InferTiming(
         n_tiles=n_tiles,
         n_frames=n_frames,
-        h2d_ms=(t1 - t0) * 1000,
+        h2d_ms=h2d_time if staged_tiles is not None else (t1 - t0) * 1000,
         forward_ms=(t2 - t1) * 1000,
         stitch_ms=(t3 - t2) * 1000,
         d2h_ms=(t4 - t3) * 1000,
     )
     
     return results, timing
+
+
+# Context manager helper for optional stream
+from contextlib import nullcontext
 
 
 # -----------------------------------------------------------------------------
@@ -257,6 +275,18 @@ class LDInferenceRunner:
         self._done = False
         self._p1_eos_sent = False
         self._p2_eos_sent = False
+        
+        # CUDA streams for overlapping H2D with compute
+        self._use_streams = self.device == "cuda" and getattr(cfg, "cuda_streams", 2) >= 2
+        self._h2d_stream: Optional[torch.cuda.Stream] = None
+        self._compute_stream: Optional[torch.cuda.Stream] = None
+        self._staged_tiles: Optional[torch.Tensor] = None  # Pre-staged batch on GPU
+        self._staged_batch: Optional[TiledBatch] = None    # Metadata for staged batch
+        
+        if self._use_streams:
+            self._h2d_stream = torch.cuda.Stream()
+            self._compute_stream = torch.cuda.Stream()
+            logger.info("[InferenceRunner] CUDA streams enabled for H2D/compute overlap")
         
         # Warmup the model on first init (eliminates 5s JIT compilation on first batch)
         self._warmup_model()
@@ -398,12 +428,49 @@ class LDInferenceRunner:
             await self.q_gpu_pass_1_to_post_processor.put(out)
 
     # -------------------------------------------------------------------------
-    # Batch processing
+    # Batch processing with CUDA streams
     # -------------------------------------------------------------------------
 
-    async def _process_batch(self, batch: TiledBatch) -> Tuple[Optional[InferTiming], float]:
+    def _stage_batch_h2d(self, batch: TiledBatch) -> None:
+        """
+        Stage a batch's tiles on GPU using H2D stream (non-blocking).
+        Call this BEFORE processing the current batch to overlap H2D with compute.
+        """
+        if not self._use_streams or self._h2d_stream is None:
+            return
+        
+        with torch.cuda.stream(self._h2d_stream):
+            self._staged_tiles = batch.all_tiles.to(self.device, non_blocking=True)
+            self._staged_batch = batch
+
+    def _wait_for_staged(self) -> Tuple[Optional[torch.Tensor], Optional[TiledBatch]]:
+        """
+        Wait for staged H2D transfer to complete and return the staged data.
+        """
+        if not self._use_streams or self._staged_tiles is None:
+            return None, None
+        
+        # Sync H2D stream to ensure transfer is complete
+        if self._h2d_stream is not None:
+            self._h2d_stream.synchronize()
+        
+        tiles = self._staged_tiles
+        batch = self._staged_batch
+        self._staged_tiles = None
+        self._staged_batch = None
+        return tiles, batch
+
+    async def _process_batch(
+        self,
+        batch: TiledBatch,
+        staged_tiles: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[InferTiming], float]:
         """
         Process a TiledBatch: run GPU inference, stitch, emit results.
+        
+        Args:
+            batch: TiledBatch to process
+            staged_tiles: Optional pre-staged GPU tensor (from H2D stream)
         
         Returns:
             Tuple of (InferTiming if successful else None, emit_time_seconds).
@@ -416,6 +483,8 @@ class LDInferenceRunner:
                 self.class_threshold,
                 self.device,
                 self.patch_size,
+                staged_tiles=staged_tiles,
+                compute_stream=self._compute_stream,
             )
 
             emit_start = time.perf_counter()
@@ -567,11 +636,35 @@ class LDInferenceRunner:
                     n_tiles = msg.all_tiles.shape[0]
                     n_frames = len(msg.metas)
                     
-                    # START FETCHING NEXT BATCH NOW - runs in background during GPU work
-                    prefetch_task = asyncio.create_task(self._fetch_next_batch())
+                    # DOUBLE BUFFERING WITH CUDA STREAMS:
+                    # 1. Stage current batch to GPU (H2D stream, non-blocking)
+                    # 2. Start prefetching next batch from queue
+                    # 3. Wait for H2D to complete
+                    # 4. Process current batch (compute stream) while next batch prefetches
                     
-                    # Process current batch on GPU (this takes ~430ms)
-                    timing, emit_time = await self._process_batch(msg)
+                    h2d_start = time.perf_counter()
+                    staged_tiles: Optional[torch.Tensor] = None
+                    
+                    if self._use_streams:
+                        # Stage current batch on H2D stream (async)
+                        self._stage_batch_h2d(msg)
+                        
+                        # Start prefetching next batch while H2D runs
+                        prefetch_task = asyncio.create_task(self._fetch_next_batch())
+                        
+                        # Yield to let prefetch start
+                        await asyncio.sleep(0)
+                        
+                        # Wait for H2D to complete and get staged tiles
+                        staged_tiles, _ = self._wait_for_staged()
+                    else:
+                        # No streams - just prefetch next batch
+                        prefetch_task = asyncio.create_task(self._fetch_next_batch())
+                    
+                    h2d_overlap_time = time.perf_counter() - h2d_start
+                    
+                    # Process current batch on GPU (using staged tiles if available)
+                    timing, emit_time = await self._process_batch(msg, staged_tiles=staged_tiles)
                     total_emit_time += emit_time
                     
                     if timing:
