@@ -709,8 +709,10 @@ class TileBatcher:
                 # Only flush if:
                 # 1. Warmup is complete
                 # 2. We have frames AND couldn't fetch any new ones AND no pending tiles
-                # 3. AND either: decoder is done OR batch is at least 75% full
+                # 3. AND either: postprocessor is done OR batch is at least 75% full
                 # This prevents tiny batches when S3 fetches are slow/bursty
+                # IMPORTANT: Don't force-flush just because decoder is done - pass 2 frames
+                # may still be coming from PostProcessor transforms. Wait until postprocessor_done.
                 if (warmup_complete and
                     frames_fetched_this_loop == 0 and 
                     self._buffer and 
@@ -721,11 +723,26 @@ class TileBatcher:
                     tile_fullness = buffer_tiles / max_tiles
                     min_flush_ratio = 0.75  # Only flush if at least 75% full
                     
-                    should_flush = (
-                        self._decoder_done or  # Decoder done, flush what we have
-                        frame_fullness >= min_flush_ratio or  # Nearly full by frames
-                        tile_fullness >= min_flush_ratio  # Nearly full by tiles
-                    )
+                    # Check if buffer contains any pass 2 frames
+                    has_pass2_in_buffer = any(entry["second_pass"] for entry in self._buffer)
+                    
+                    # After decoder done but before postprocessor done, be patient with pass 2 frames
+                    # They're still trickling in from transforms - wait for a reasonable batch
+                    if self._decoder_done and not self._postprocessor_done and has_pass2_in_buffer:
+                        # Only flush if we have enough pass 2 frames OR waited too long
+                        min_pass2_batch = max(4, self.batch_size // 4)  # At least 4 frames or 25% of batch
+                        should_flush = (
+                            len(self._buffer) >= min_pass2_batch or
+                            frame_fullness >= min_flush_ratio or
+                            tile_fullness >= min_flush_ratio
+                        )
+                    else:
+                        should_flush = (
+                            self._postprocessor_done or  # All pass 2 frames submitted, flush remaining
+                            self._decoder_done or  # Decoder done and no pass 2 in buffer
+                            frame_fullness >= min_flush_ratio or  # Nearly full by frames
+                            tile_fullness >= min_flush_ratio  # Nearly full by tiles
+                        )
                     
                     if should_flush:
                         emit_start = time.perf_counter()
@@ -750,7 +767,15 @@ class TileBatcher:
                         if p1_count == 0 and p2_count > 0:
                             p2_only_batches += 1
                         
-                        reason = "decoder_done" if self._decoder_done else "nearly_full"
+                        # Determine flush reason for logging
+                        if self._postprocessor_done:
+                            reason = "postprocessor_done"
+                        elif self._decoder_done and has_pass2_in_buffer:
+                            reason = "pass2_batch_ready"
+                        elif self._decoder_done:
+                            reason = "decoder_done"
+                        else:
+                            reason = "nearly_full"
                         composition = f", p1={p1_count}/p2={p2_count}" if p2_count > 0 else ""
                         logger.info(
                             f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles{composition}, "
