@@ -84,51 +84,59 @@ class BasePrefetcher:
 
     async def _run_bulk(self) -> None:
         """
-        Bulk prefetch mode: fetch ALL images into memory first, then emit.
+        Bulk prefetch mode: high-parallelism fetch with streaming emit.
         
         This maximizes S3 throughput by:
-        1. Running all fetches in parallel without queue backpressure
-        2. Eliminating per-item latency from downstream processing
+        1. Running many fetches in parallel (64 concurrent)
+        2. Emitting results immediately as each fetch completes
+        3. Downstream pipeline starts processing while fetches continue
         
-        Best for: S3 sources where all images fit in memory (~2GB max)
+        Best for: S3 sources where network is the bottleneck
         """
-        # Use higher concurrency for bulk mode (no queue backpressure to worry about)
+        # Use higher concurrency for bulk mode
         bulk_concurrency = getattr(self.cfg, "bulk_prefetch_concurrency", 64)
         self._per_worker_sem = asyncio.Semaphore(bulk_concurrency)
         n_images = len(self.image_tasks)
         
         run_start = time.perf_counter()
-        logger.info(f"[Prefetcher] BULK MODE: fetching all {n_images} images into memory...")
+        logger.info(f"[Prefetcher] BULK MODE: {n_images} images with {bulk_concurrency} concurrent fetches")
         
-        # Phase 1: Fetch all images in parallel
-        fetch_tasks = [self._fetch_one(task) for task in self.image_tasks]
-        results: List[FetchedBytesMsg] = await asyncio.gather(*fetch_tasks)
+        # Create all fetch tasks
+        fetch_tasks = [
+            asyncio.create_task(self._fetch_one(task)) 
+            for task in self.image_tasks
+        ]
         
-        fetch_time = time.perf_counter() - run_start
+        # Emit results as they complete (streaming, not batched)
+        fetched = 0
+        errors = 0
+        total_bytes = 0
         
-        # Count stats
-        fetched = sum(1 for r in results if isinstance(r, FetchedBytes))
-        errors = sum(1 for r in results if isinstance(r, PipelineError))
-        total_bytes = sum(len(r.file_bytes) for r in results if isinstance(r, FetchedBytes))
-        mb_fetched = total_bytes / (1024 * 1024)
-        throughput = mb_fetched / fetch_time if fetch_time > 0 else 0
-        
-        logger.info(
-            f"[Prefetcher] BULK FETCH complete: {fetched} images, {errors} errors, "
-            f"{mb_fetched:.1f}MB in {fetch_time:.2f}s ({throughput:.1f}MB/s)"
-        )
-        
-        # Phase 2: Emit all results to queue (fast, from memory)
-        emit_start = time.perf_counter()
-        for msg in results:
+        for coro in asyncio.as_completed(fetch_tasks):
+            msg = await coro
+            
+            if isinstance(msg, FetchedBytes):
+                fetched += 1
+                total_bytes += len(msg.file_bytes)
+            else:
+                errors += 1
+            
             await self.q_prefetcher_to_decoder.put(msg)
+            
+            # Log progress every 100 images
+            if (fetched + errors) % 100 == 0:
+                elapsed = time.perf_counter() - run_start
+                logger.info(
+                    f"[Prefetcher] Progress: {fetched + errors}/{n_images} images in {elapsed:.1f}s"
+                )
         
-        emit_time = time.perf_counter() - emit_start
         total_time = time.perf_counter() - run_start
+        mb_fetched = total_bytes / (1024 * 1024)
+        throughput = mb_fetched / total_time if total_time > 0 else 0
         
         logger.info(
             f"[Prefetcher] DONE - {fetched} fetched, {errors} errors, "
-            f"{mb_fetched:.1f}MB in {total_time:.2f}s (fetch={fetch_time:.1f}s, emit={emit_time:.1f}s)"
+            f"{mb_fetched:.1f}MB in {total_time:.2f}s ({throughput:.1f}MB/s)"
         )
         
         await self.q_prefetcher_to_decoder.put(
