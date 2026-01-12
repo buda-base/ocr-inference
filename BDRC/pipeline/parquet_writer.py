@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
 from dataclasses import asdict
@@ -17,6 +18,8 @@ from urllib.parse import urlparse, unquote
 from pathlib import Path
 import numpy as np
 import reprlib
+
+logger = logging.getLogger(__name__)
 
 
 def _truncate(s: Optional[str], max_len: int) -> Optional[str]:
@@ -132,6 +135,10 @@ class ParquetWriter:
 
             # Error sidecar (JSONL)
             self._error_fh = self._err_fs.open_output_stream(self._errors_path)
+            
+            # Log file URLs when successfully opened
+            logger.info(f"Opened parquet file for writing: {self.parquet_uri}")
+            logger.info(f"Opened JSONL error file for writing: {self.errors_jsonl_uri}")
         except Exception as e:
             # Surface the problem to the UI immediately; this is the #1 source of "0 persisted".
             hint = None
@@ -252,6 +259,7 @@ class ParquetWriter:
         if self._writer is not None:
             self._writer.close()
             self._writer = None
+            logger.info(f"Closed and finalized parquet file: {self.parquet_uri}")
         if self._error_fh is not None:
             self._error_fh.close()
             self._error_fh = None
@@ -260,9 +268,13 @@ class ParquetWriter:
         if self._error_count == 0 and self._err_fs is not None and self._errors_path is not None:
             try:
                 self._err_fs.delete_file(self._errors_path)
+                logger.info(f"Removed empty JSONL error file: {self.errors_jsonl_uri}")
             except Exception:
                 # Best-effort: ignore deletion failures (permissions / eventual consistency / etc.)
                 pass
+        elif self._error_count > 0:
+            # Log JSONL file URL if errors were written
+            logger.info(f"Closed JSONL error file (contained {self._error_count} errors): {self.errors_jsonl_uri}")
 
     async def run(self) -> None:
         """
