@@ -519,15 +519,25 @@ class LDInferenceRunner:
 
     async def run(self) -> None:
         """
-        Main loop with batch pre-fetching for pipeline overlap.
+        Main loop with TRUE double-buffering for H2D/compute overlap.
         
-        Key optimization: Start fetching batch N+1 while GPU processes batch N.
-        This overlaps queue wait time with GPU compute time, reducing idle gaps.
+        Key optimization: Stage batch N+1 to GPU WHILE batch N computes.
+        This hides H2D latency behind GPU compute time.
+        
+        Flow:
+          1. Fetch first batch, stage to GPU (no overlap possible)
+          2. Loop:
+             a. Fetch next batch from queue
+             b. Stage next batch to GPU (async, non-blocking)
+             c. Process CURRENT batch on GPU (while H2D of next runs in parallel)
+             d. After compute: next batch is already on GPU
+             e. Swap: next becomes current
         """
         # Timing stats
         batches_processed = 0
         total_wait_time = 0.0
-        total_emit_time = 0.0  # Time emitting results to queues
+        total_emit_time = 0.0
+        total_h2d_time = 0.0  # Time blocked on H2D staging
         total_tiles = 0
         total_frames = 0
         
@@ -537,26 +547,54 @@ class LDInferenceRunner:
         total_stitch_ms = 0.0
         total_d2h_ms = 0.0
         
-        detailed_timing = getattr(self.cfg, "detailed_inference_timing", False)
-        
-        # Track time from GPU perspective
         run_start_time = time.perf_counter()
         
-        # Pre-fetch task for batch pipelining
-        prefetch_task: Optional[asyncio.Task] = None
+        # Double-buffering state
+        current_tiles: Optional[torch.Tensor] = None  # Batch currently on GPU
+        current_batch: Optional[TiledBatch] = None    # Metadata for current batch
         
         try:
-            # Start pre-fetching the first batch
-            prefetch_task = asyncio.create_task(self._fetch_next_batch())
-            
-            while True:
-                # Wait for the pre-fetched batch (measure actual blocking time)
+            # =================================================================
+            # Bootstrap: Get first batch and stage it
+            # =================================================================
+            while current_batch is None:
                 wait_start = time.perf_counter()
-                if prefetch_task is not None:
-                    msg = await prefetch_task
-                    prefetch_task = None
+                msg = await self.q_in.get()
+                total_wait_time += time.perf_counter() - wait_start
+                
+                if isinstance(msg, EndOfStream):
+                    await self._handle_eos(msg)
+                    if msg.stream == "tiled_pass_2":
+                        return
+                    continue
+                elif isinstance(msg, PipelineError):
+                    await self.q_gpu_pass_1_to_post_processor.put(msg)
+                    continue
+                elif isinstance(msg, TiledBatch):
+                    # Stage first batch (must wait - no overlap possible)
+                    h2d_start = time.perf_counter()
+                    if self._use_streams:
+                        self._stage_batch_h2d(msg)
+                        current_tiles, current_batch = self._wait_for_staged()
+                    else:
+                        current_batch = msg
+                        current_tiles = None
+                    total_h2d_time += time.perf_counter() - h2d_start
                 else:
-                    msg = await self.q_in.get()
+                    logger.warning(f"[InferenceRunner] Unexpected message type: {type(msg)}")
+            
+            # =================================================================
+            # Main loop with double-buffering
+            # =================================================================
+            while True:
+                n_tiles = current_batch.all_tiles.shape[0]
+                n_frames = len(current_batch.metas)
+                
+                # ---------------------------------------------------------
+                # Step 1: Fetch NEXT batch from queue (non-blocking if available)
+                # ---------------------------------------------------------
+                wait_start = time.perf_counter()
+                next_msg = await self.q_in.get()
                 wait_time = time.perf_counter() - wait_start
                 total_wait_time += wait_time
                 
@@ -565,51 +603,117 @@ class LDInferenceRunner:
                         f"[InferenceRunner] Long wait for batch: {wait_time:.2f}s, "
                         f"queue_size={self.q_in.qsize()}"
                     )
-
-                # Handle different message types
-                if isinstance(msg, EndOfStream):
-                    if msg.stream == "tiled_pass_1":
+                
+                # ---------------------------------------------------------
+                # Step 2: Stage NEXT batch (async) while we process current
+                # ---------------------------------------------------------
+                next_tiles: Optional[torch.Tensor] = None
+                next_batch: Optional[TiledBatch] = None
+                
+                if self._use_streams and isinstance(next_msg, TiledBatch):
+                    # Launch H2D transfer (non-blocking, runs on H2D stream)
+                    self._stage_batch_h2d(next_msg)
+                    # Don't wait! Let it run while we compute
+                
+                # ---------------------------------------------------------
+                # Step 3: Process CURRENT batch on GPU
+                # (H2D of next batch runs in parallel on H2D stream)
+                # ---------------------------------------------------------
+                timing, emit_time = await self._process_batch(
+                    current_batch, staged_tiles=current_tiles
+                )
+                total_emit_time += emit_time
+                
+                # Accumulate timing stats
+                if timing:
+                    total_tiles += n_tiles
+                    total_frames += n_frames
+                    batches_processed += 1
+                    
+                    total_h2d_ms += timing.h2d_ms
+                    total_forward_ms += timing.forward_ms
+                    total_stitch_ms += timing.stitch_ms
+                    total_d2h_ms += timing.d2h_ms
+                    
+                    tiles_per_sec = n_tiles / (timing.total_ms / 1000) if timing.total_ms > 0 else 0
+                    
+                    logger.info(
+                        f"[InferenceRunner] Batch #{batches_processed}: {n_frames} frames, {n_tiles} tiles, "
+                        f"total={timing.total_ms:.1f}ms ({tiles_per_sec:.0f} t/s) | "
+                        f"h2d={timing.h2d_ms:.1f}ms, fwd={timing.forward_ms:.1f}ms, "
+                        f"stitch={timing.stitch_ms:.1f}ms, d2h={timing.d2h_ms:.1f}ms"
+                    )
+                
+                # ---------------------------------------------------------
+                # Step 4: Handle next_msg (swap or handle control messages)
+                # ---------------------------------------------------------
+                if isinstance(next_msg, TiledBatch):
+                    # Wait for H2D of next batch to complete (should be done by now)
+                    if self._use_streams:
+                        next_tiles, next_batch = self._wait_for_staged()
+                    else:
+                        next_tiles = None
+                        next_batch = next_msg
+                    
+                    # Swap: next becomes current
+                    current_tiles = next_tiles
+                    current_batch = next_batch
+                    
+                elif isinstance(next_msg, EndOfStream):
+                    # No more batches, handle EOS
+                    if next_msg.stream == "tiled_pass_1":
                         logger.info(f"[InferenceRunner] Received tiled_pass_1 EOS, forwarding gpu_pass_1")
                         if not self._p1_eos_sent:
                             await self.q_gpu_pass_1_to_post_processor.put(
                                 EndOfStream(stream="gpu_pass_1", producer="LDInferenceRunner")
                             )
                             self._p1_eos_sent = True
-                        # Continue processing - there may be more pass-2 batches
-                        prefetch_task = asyncio.create_task(self._fetch_next_batch())
-                        continue
+                        # May be more pass-2 batches, keep looping
+                        # Need to get next batch to continue
+                        current_batch = None
+                        current_tiles = None
+                        while current_batch is None:
+                            wait_start = time.perf_counter()
+                            msg = await self.q_in.get()
+                            total_wait_time += time.perf_counter() - wait_start
+                            if isinstance(msg, TiledBatch):
+                                if self._use_streams:
+                                    self._stage_batch_h2d(msg)
+                                    current_tiles, current_batch = self._wait_for_staged()
+                                else:
+                                    current_batch = msg
+                            elif isinstance(msg, EndOfStream) and msg.stream == "tiled_pass_2":
+                                # Final EOS
+                                next_msg = msg
+                                break
+                            elif isinstance(msg, PipelineError):
+                                await self.q_gpu_pass_1_to_post_processor.put(msg)
+                        if current_batch is not None:
+                            continue
                     
-                    elif msg.stream == "tiled_pass_2":
-                        # Log detailed summary
+                    if next_msg.stream == "tiled_pass_2":
+                        # Final EOS - log summary and exit
                         total_infer_ms = total_h2d_ms + total_forward_ms + total_stitch_ms + total_d2h_ms
-                        total_transfer_ms = total_h2d_ms + total_d2h_ms
-                        total_gpu_ms = total_forward_ms + total_stitch_ms
-                        
-                        # Calculate actual GPU utilization
                         run_total_time = time.perf_counter() - run_start_time
                         gpu_utilization = (total_infer_ms / 1000) / run_total_time * 100 if run_total_time > 0 else 0
                         
                         logger.info(
                             f"[InferenceRunner] DONE - batches={batches_processed}, frames={total_frames}, tiles={total_tiles}"
                         )
-                        logger.info(
-                            f"[InferenceRunner] TIMING SUMMARY: "
-                            f"total={total_infer_ms:.0f}ms, "
-                            f"h2d={total_h2d_ms:.0f}ms ({100*total_h2d_ms/total_infer_ms:.1f}%), "
-                            f"forward={total_forward_ms:.0f}ms ({100*total_forward_ms/total_infer_ms:.1f}%), "
-                            f"stitch={total_stitch_ms:.0f}ms ({100*total_stitch_ms/total_infer_ms:.1f}%), "
-                            f"d2h={total_d2h_ms:.0f}ms ({100*total_d2h_ms/total_infer_ms:.1f}%)"
-                        ) if total_infer_ms > 0 else None
-                        
-                        # Key insight: GPU utilization shows if GPU is the bottleneck
-                        # - >80%: GPU is bottleneck (good!)
-                        # - <50%: Pipeline is bottleneck (GPU starved)
+                        if total_infer_ms > 0:
+                            logger.info(
+                                f"[InferenceRunner] TIMING SUMMARY: "
+                                f"total={total_infer_ms:.0f}ms, "
+                                f"h2d={total_h2d_ms:.0f}ms ({100*total_h2d_ms/total_infer_ms:.1f}%), "
+                                f"forward={total_forward_ms:.0f}ms ({100*total_forward_ms/total_infer_ms:.1f}%), "
+                                f"stitch={total_stitch_ms:.0f}ms ({100*total_stitch_ms/total_infer_ms:.1f}%), "
+                                f"d2h={total_d2h_ms:.0f}ms ({100*total_d2h_ms/total_infer_ms:.1f}%)"
+                            )
                         logger.info(
                             f"[InferenceRunner] GPU UTILIZATION: {gpu_utilization:.1f}% "
                             f"(run={run_total_time:.1f}s, gpu_work={total_infer_ms/1000:.1f}s, "
-                            f"queue_wait={total_wait_time:.1f}s, emit={total_emit_time:.1f}s)"
+                            f"queue_wait={total_wait_time:.1f}s, h2d_staging={total_h2d_time:.1f}s, emit={total_emit_time:.1f}s)"
                         )
-                        
                         if total_infer_ms > 0:
                             logger.info(
                                 f"[InferenceRunner] Throughput: {total_tiles/(total_infer_ms/1000):.1f} tiles/s, "
@@ -625,101 +729,59 @@ class LDInferenceRunner:
                         await self.q_gpu_pass_2_to_post_processor.put(
                             EndOfStream(stream="gpu_pass_2", producer="LDInferenceRunner")
                         )
-                        break
+                        return
                 
-                elif isinstance(msg, PipelineError):
-                    await self.q_gpu_pass_1_to_post_processor.put(msg)
-                    # Continue fetching
-                    prefetch_task = asyncio.create_task(self._fetch_next_batch())
-                
-                elif isinstance(msg, TiledBatch):
-                    n_tiles = msg.all_tiles.shape[0]
-                    n_frames = len(msg.metas)
-                    
-                    # DOUBLE BUFFERING WITH CUDA STREAMS:
-                    # 1. Stage current batch to GPU (H2D stream, non-blocking)
-                    # 2. Start prefetching next batch from queue
-                    # 3. Wait for H2D to complete
-                    # 4. Process current batch (compute stream) while next batch prefetches
-                    
-                    h2d_start = time.perf_counter()
-                    staged_tiles: Optional[torch.Tensor] = None
-                    
-                    if self._use_streams:
-                        # Stage current batch on H2D stream (async)
-                        self._stage_batch_h2d(msg)
-                        
-                        # Start prefetching next batch while H2D runs
-                        prefetch_task = asyncio.create_task(self._fetch_next_batch())
-                        
-                        # Yield to let prefetch start
-                        await asyncio.sleep(0)
-                        
-                        # Wait for H2D to complete and get staged tiles
-                        staged_tiles, _ = self._wait_for_staged()
-                    else:
-                        # No streams - just prefetch next batch
-                        prefetch_task = asyncio.create_task(self._fetch_next_batch())
-                    
-                    h2d_overlap_time = time.perf_counter() - h2d_start
-                    
-                    # Process current batch on GPU (using staged tiles if available)
-                    timing, emit_time = await self._process_batch(msg, staged_tiles=staged_tiles)
-                    total_emit_time += emit_time
-                    
-                    if timing:
-                        total_tiles += n_tiles
-                        total_frames += n_frames
-                        batches_processed += 1
-                        
-                        # Accumulate detailed timing
-                        total_h2d_ms += timing.h2d_ms
-                        total_forward_ms += timing.forward_ms
-                        total_stitch_ms += timing.stitch_ms
-                        total_d2h_ms += timing.d2h_ms
-                        
-                        tiles_per_sec = n_tiles / (timing.total_ms / 1000) if timing.total_ms > 0 else 0
-                        
-                        if detailed_timing:
-                            logger.info(
-                                f"[InferenceRunner] Batch #{batches_processed}: {n_frames} frames, {n_tiles} tiles, "
-                                f"total={timing.total_ms:.1f}ms ({tiles_per_sec:.0f} t/s) | "
-                                f"h2d={timing.h2d_ms:.1f}ms, fwd={timing.forward_ms:.1f}ms, "
-                                f"stitch={timing.stitch_ms:.1f}ms, d2h={timing.d2h_ms:.1f}ms | "
-                                f"wait={wait_time*1000:.0f}ms, emit={emit_time*1000:.0f}ms"
-                            )
-                        else:
-                            logger.info(
-                                f"[InferenceRunner] Batch #{batches_processed}: {n_frames} frames, {n_tiles} tiles, "
-                                f"infer={timing.total_ms:.0f}ms ({tiles_per_sec:.0f} t/s), wait={wait_time*1000:.0f}ms"
-                            )
-                    
-                    # Periodic memory cleanup to prevent fragmentation
-                    if batches_processed % 10 == 0:
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                elif isinstance(next_msg, PipelineError):
+                    await self.q_gpu_pass_1_to_post_processor.put(next_msg)
+                    # Need to get actual next batch
+                    current_batch = None
+                    current_tiles = None
+                    while current_batch is None:
+                        wait_start = time.perf_counter()
+                        msg = await self.q_in.get()
+                        total_wait_time += time.perf_counter() - wait_start
+                        if isinstance(msg, TiledBatch):
+                            if self._use_streams:
+                                self._stage_batch_h2d(msg)
+                                current_tiles, current_batch = self._wait_for_staged()
+                            else:
+                                current_batch = msg
+                        elif isinstance(msg, EndOfStream):
+                            next_msg = msg
+                            break
+                        elif isinstance(msg, PipelineError):
+                            await self.q_gpu_pass_1_to_post_processor.put(msg)
+                    if current_batch is None:
+                        # Handle EOS in next iteration
+                        if isinstance(next_msg, EndOfStream):
+                            # Create dummy batch to trigger EOS handling
+                            pass  # Will be handled in next iteration
                 
                 else:
-                    logger.warning(f"[InferenceRunner] Unexpected message type: {type(msg)}")
-                    # Continue fetching
-                    prefetch_task = asyncio.create_task(self._fetch_next_batch())
-
-                # Yield to event loop (allows prefetch task to progress)
+                    logger.warning(f"[InferenceRunner] Unexpected message type: {type(next_msg)}")
+                    current_batch = None
+                    current_tiles = None
+                
+                # Yield to event loop
                 await asyncio.sleep(0)
 
         except asyncio.CancelledError:
             logger.info("[InferenceRunner] Cancelled, cleaning up...")
-            if prefetch_task and not prefetch_task.done():
-                prefetch_task.cancel()
             raise
         except KeyboardInterrupt:
             logger.info("[InferenceRunner] Interrupted by user")
-            if prefetch_task and not prefetch_task.done():
-                prefetch_task.cancel()
             raise
         finally:
-            if prefetch_task and not prefetch_task.done():
-                prefetch_task.cancel()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+    
+    async def _handle_eos(self, msg: EndOfStream) -> None:
+        """Handle EndOfStream message."""
+        if msg.stream == "tiled_pass_1":
+            logger.info(f"[InferenceRunner] Received tiled_pass_1 EOS, forwarding gpu_pass_1")
+            if not self._p1_eos_sent:
+                await self.q_gpu_pass_1_to_post_processor.put(
+                    EndOfStream(stream="gpu_pass_1", producer="LDInferenceRunner")
+                )
+                self._p1_eos_sent = True
 
