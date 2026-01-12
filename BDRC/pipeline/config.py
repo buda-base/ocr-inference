@@ -76,6 +76,11 @@ class PipelineConfig:
     max_angle_deg: float = 5.0
     min_angle_deg: float = 0.3
     skip_pass2_rotation_threshold: float = 3.0  # Skip GPU pass-2 for rotations below this (just rotate contours)
+    
+    # Prefetch mode: bulk fetches ALL images into memory before processing
+    # Best for S3 sources where images fit in RAM (~2GB max volume)
+    bulk_prefetch: bool = True
+    bulk_prefetch_concurrency: int = 64  # Higher concurrency for bulk mode (no queue backpressure)
     tps_add_corners: bool = True
     tps_alpha: float = 0.5
     legacy_tps_detect: bool = False
