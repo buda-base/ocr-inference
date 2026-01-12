@@ -23,7 +23,7 @@ class PipelineConfig:
     s3_get_timeout_s: int = 60
 
     # Queues (bounded)
-    max_q_prefetcher_to_decoder: int = 64
+    max_q_prefetcher_to_decoder: int = 1000  # Large enough to hold entire volume (~200MB raw bytes)
     max_q_decoder_to_tilebatcher: int = 32
     max_q_tilebatcher_to_inference: int = 2  # Short queue - GPU is bottleneck anyway
     max_q_gpu_pass_1_to_post_processor: int = 32
@@ -80,11 +80,11 @@ class PipelineConfig:
     # Prefetch mode: bulk fetches ALL images into memory before processing
     # Best for S3 sources where images fit in RAM (~2GB max volume)
     bulk_prefetch: bool = True
-    bulk_prefetch_concurrency: int = 64  # Higher concurrency for bulk mode (no queue backpressure)
+    bulk_prefetch_concurrency: int = 128  # High concurrency for bulk mode (mimics aws s3 sync)
     
-    # Warmup: wait for decoder queue to fill before starting GPU inference
-    # This ensures consistent batch sizes at the start (helps with S3's bursty behavior)
-    inference_warmup_frames: int = 32  # Wait for this many decoded frames before starting GPU
+    # Warmup: wait for buffer to fill before starting GPU inference
+    # Short warmup helps batch consistency without adding much latency
+    inference_warmup_frames: int = 24  # ~3 batches worth, ~2-3 seconds at S3 speed
     
     # Max tiles per batch to prevent CUDA OOM (images have variable tile counts)
     max_tiles_per_batch: int = 80  # ~80 tiles = ~400MB GPU memory for forward pass

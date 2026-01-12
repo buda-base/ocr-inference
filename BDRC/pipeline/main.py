@@ -321,43 +321,48 @@ async def run_one_volume(args):
     hook = make_progress_hook(progress_events) if args.progress else None
 
     # Use async context manager for proper cleanup
-    async with LDVolumeWorker(cfg, volume_task, s3ctx=s3ctx, progress=hook) as worker:
-        total = len(volume_task.image_tasks)
-        worker_run_t0: Optional[float] = None
-        worker_run_s: Optional[float] = None
+    try:
+        async with LDVolumeWorker(cfg, volume_task, s3ctx=s3ctx, progress=hook) as worker:
+            total = len(volume_task.image_tasks)
+            worker_run_t0: Optional[float] = None
+            worker_run_s: Optional[float] = None
 
-        if args.progress:
-            ui = asyncio.create_task(
-                ui_loop(
-                    events=progress_events,
-                    worker=worker,
-                    total=total,
-                    show_queues=args.progress_queues,
+            if args.progress:
+                ui = asyncio.create_task(
+                    ui_loop(
+                        events=progress_events,
+                        worker=worker,
+                        total=total,
+                        show_queues=args.progress_queues,
+                    )
                 )
-            )
-            try:
+                try:
+                    worker_run_t0 = time.perf_counter()
+                    await worker.run()
+                    worker_run_s = time.perf_counter() - worker_run_t0
+                finally:
+                    if worker_run_s is None and worker_run_t0 is not None:
+                        worker_run_s = time.perf_counter() - worker_run_t0
+                    # If pipeline dies early, unblock UI.
+                    try:
+                        progress_events.put_nowait({"type": "close"})
+                    except asyncio.QueueFull:
+                        pass
+                    await ui
+                    # Logging after Live has exited to avoid mangling the UI.
+                    if worker_run_s is not None:
+                        ips = (float(total) / worker_run_s) if (total and worker_run_s > 0) else 0.0
+                        console.log(f"Volume worker runtime: {worker_run_s:.3f}s (images={total}, {ips:.2f} img/s)")
+            else:
                 worker_run_t0 = time.perf_counter()
                 await worker.run()
                 worker_run_s = time.perf_counter() - worker_run_t0
-            finally:
-                if worker_run_s is None and worker_run_t0 is not None:
-                    worker_run_s = time.perf_counter() - worker_run_t0
-                # If pipeline dies early, unblock UI.
-                try:
-                    progress_events.put_nowait({"type": "close"})
-                except asyncio.QueueFull:
-                    pass
-                await ui
-                # Logging after Live has exited to avoid mangling the UI.
-                if worker_run_s is not None:
-                    ips = (float(total) / worker_run_s) if (total and worker_run_s > 0) else 0.0
-                    console.log(f"Volume worker runtime: {worker_run_s:.3f}s (images={total}, {ips:.2f} img/s)")
-        else:
-            worker_run_t0 = time.perf_counter()
-            await worker.run()
-            worker_run_s = time.perf_counter() - worker_run_t0
-            ips = (float(total) / worker_run_s) if (total and worker_run_s > 0) else 0.0
-            console.log(f"Volume worker runtime: {worker_run_s:.3f}s (images={total}, {ips:.2f} img/s)")
+                ips = (float(total) / worker_run_s) if (total and worker_run_s > 0) else 0.0
+                console.log(f"Volume worker runtime: {worker_run_s:.3f}s (images={total}, {ips:.2f} img/s)")
+    finally:
+        # Close S3 client if used
+        if s3ctx is not None:
+            await s3ctx.close()
 
 
 def main():

@@ -84,30 +84,28 @@ class BasePrefetcher:
 
     async def _run_bulk(self) -> None:
         """
-        Bulk prefetch mode: high-parallelism fetch with streaming emit.
+        Bulk prefetch mode: high-parallelism streaming with large queue.
         
-        This maximizes S3 throughput by:
-        1. Running many fetches in parallel (64 concurrent)
-        2. Emitting results immediately as each fetch completes
-        3. Downstream pipeline starts processing while fetches continue
-        
-        Best for: S3 sources where network is the bottleneck
+        Strategy:
+        1. High concurrency (128) to maximize S3 throughput
+        2. Large queue (1000) so we never block on backpressure
+        3. Emit immediately as fetches complete (overlap I/O with processing)
+        4. Short warmup in TileBatcher handles batch consistency
         """
-        # Use higher concurrency for bulk mode
-        bulk_concurrency = getattr(self.cfg, "bulk_prefetch_concurrency", 64)
+        bulk_concurrency = getattr(self.cfg, "bulk_prefetch_concurrency", 128)
         self._per_worker_sem = asyncio.Semaphore(bulk_concurrency)
         n_images = len(self.image_tasks)
         
         run_start = time.perf_counter()
-        logger.info(f"[Prefetcher] BULK MODE: {n_images} images with {bulk_concurrency} concurrent fetches")
+        logger.info(f"[Prefetcher] BULK MODE: {n_images} images, {bulk_concurrency} concurrent, queue={self.q_prefetcher_to_decoder.maxsize}")
         
-        # Create all fetch tasks
+        # Create all fetch tasks at once
         fetch_tasks = [
             asyncio.create_task(self._fetch_one(task)) 
             for task in self.image_tasks
         ]
         
-        # Emit results as they complete (streaming, not batched)
+        # Emit as they complete (streaming, no blocking with large queue)
         fetched = 0
         errors = 0
         total_bytes = 0
@@ -121,14 +119,14 @@ class BasePrefetcher:
             else:
                 errors += 1
             
+            # With large queue (1000), this should never block
             await self.q_prefetcher_to_decoder.put(msg)
             
-            # Log progress every 100 images
-            if (fetched + errors) % 100 == 0:
+            # Progress every 200 images
+            if (fetched + errors) % 200 == 0:
                 elapsed = time.perf_counter() - run_start
-                logger.info(
-                    f"[Prefetcher] Progress: {fetched + errors}/{n_images} images in {elapsed:.1f}s"
-                )
+                mb = total_bytes / (1024 * 1024)
+                logger.info(f"[Prefetcher] Progress: {fetched + errors}/{n_images} ({mb:.0f}MB in {elapsed:.1f}s)")
         
         total_time = time.perf_counter() - run_start
         mb_fetched = total_bytes / (1024 * 1024)
