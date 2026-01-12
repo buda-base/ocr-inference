@@ -623,29 +623,72 @@ class TileBatcher:
                             )
 
                 # --- Timeout flush: emit partial batch if nothing is coming ---
-                # Only flush if we have frames AND we couldn't fetch any new ones
-                # AND we have no pending tiles (everything that was in-flight is now in buffer)
+                # Only flush if:
+                # 1. We have frames AND couldn't fetch any new ones AND no pending tiles
+                # 2. AND either: decoder is done OR batch is at least 75% full
+                # This prevents tiny batches when S3 fetches are slow/bursty
                 if (frames_fetched_this_loop == 0 and 
                     self._buffer and 
                     len(self._pending_tiles) == 0):
                     
-                    emit_start = time.perf_counter()
-                    n_frames = len(self._buffer)
-                    batch = self._prepare_batch()
-                    n_tiles = batch.all_tiles.shape[0]
+                    # Determine if we should flush or wait for more
+                    buffer_fullness = len(self._buffer) / self.batch_size
+                    min_flush_ratio = 0.75  # Only flush if at least 75% full
                     
-                    put_start = time.perf_counter()
-                    await self.q_to_inference.put(batch)
-                    put_time = time.perf_counter() - put_start
-                    
-                    emit_time = time.perf_counter() - emit_start
-                    total_batch_emit_time += emit_time
-                    batches_emitted += 1
-                    
-                    logger.info(
-                        f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles, "
-                        f"reason=timeout_flush, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s"
+                    should_flush = (
+                        self._decoder_done or  # Decoder done, flush what we have
+                        buffer_fullness >= min_flush_ratio  # Nearly full batch
                     )
+                    
+                    if should_flush:
+                        emit_start = time.perf_counter()
+                        n_frames = len(self._buffer)
+                        batch = self._prepare_batch()
+                        n_tiles = batch.all_tiles.shape[0]
+                        
+                        put_start = time.perf_counter()
+                        await self.q_to_inference.put(batch)
+                        put_time = time.perf_counter() - put_start
+                        
+                        emit_time = time.perf_counter() - emit_start
+                        total_batch_emit_time += emit_time
+                        batches_emitted += 1
+                        
+                        reason = "decoder_done" if self._decoder_done else "nearly_full"
+                        logger.info(
+                            f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles, "
+                            f"reason={reason}, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s"
+                        )
+                    else:
+                        # Wait for more frames with blocking timeout (avoid busy-spin)
+                        # This gives decoder/prefetcher time to provide more data
+                        wait_start = time.perf_counter()
+                        msg = await self._pop_one(self.q_from_decoder, self.batch_timeout_s * 4)  # 100ms wait
+                        total_wait_time += time.perf_counter() - wait_start
+                        
+                        if msg is not None:
+                            if isinstance(msg, EndOfStream) and msg.stream == "prefetched":
+                                self._decoder_done = True
+                            elif isinstance(msg, PipelineError):
+                                await self.q_to_inference.put(msg)
+                            elif isinstance(msg, DecodedFrame):
+                                try:
+                                    gray = self._preprocess_frame(msg)
+                                    task = asyncio.create_task(
+                                        self._tile_frame_async(msg, gray, False)
+                                    )
+                                    self._pending_tiles.append(task)
+                                    frames_submitted += 1
+                                except Exception as e:
+                                    await self._emit_pipeline_error(
+                                        internal_stage="preprocess",
+                                        exc=e,
+                                        lane_second_pass=False,
+                                        task=msg.task,
+                                        source_etag=msg.source_etag,
+                                        retryable=False,
+                                        attempt=1,
+                                    )
 
                 # --- Check if we should send pass-1 EOS ---
                 await self._maybe_emit_pass1_eos()
