@@ -118,6 +118,13 @@ class LDPostProcessor:
         )
         await self.q_post_processor_to_writer.put(err)
 
+    def _try_get_nowait(self, q: asyncio.Queue):
+        """Non-blocking queue get. Returns None if empty."""
+        try:
+            return q.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
     async def _pop_one(self, q: asyncio.Queue, timeout_s: float):
         try:
             return await asyncio.wait_for(q.get(), timeout=timeout_s)
@@ -131,7 +138,7 @@ class LDPostProcessor:
         
         # Pass2 is cheap; prioritize it, but don't starve pass1 entirely.
         p2_budget = getattr(self.cfg, "reprocess_budget", 3)
-        p1_budget = 1
+        p1_budget = 16  # Process up to 16 frames per loop (batch-sized chunks)
         timeout_s = getattr(self.cfg, "controller_poll_ms", 5) / 1000.0
         
         # Timing stats
@@ -157,10 +164,10 @@ class LDPostProcessor:
 
             took = False
 
-            # --- Prefer gpu_pass_2 results (much faster to process) ---
+            # --- Prefer gpu_pass_2 results (non-blocking check since often empty) ---
             if not self._p2_done:
                 for _ in range(p2_budget):
-                    msg = await self._pop_one(self.q_second, timeout_s)
+                    msg = self._try_get_nowait(self.q_second)
                     if msg is None:
                         break
                     took = True
@@ -192,10 +199,16 @@ class LDPostProcessor:
             if took:
                 continue
 
-            # --- Then gpu_pass_1 results ---
+            # --- Then gpu_pass_1 results (non-blocking first, then blocking) ---
             if not self._p1_done:
-                for _ in range(p1_budget):
-                    msg = await self._pop_one(self.q_first, timeout_s)
+                for i in range(p1_budget):
+                    # First try non-blocking, then one blocking attempt at the end
+                    if i < p1_budget - 1:
+                        msg = self._try_get_nowait(self.q_first)
+                    else:
+                        # Last iteration: use blocking to avoid busy-spin
+                        msg = await self._pop_one(self.q_first, timeout_s)
+                    
                     if msg is None:
                         break
                     took = True
