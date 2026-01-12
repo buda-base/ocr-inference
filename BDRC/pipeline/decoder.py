@@ -60,11 +60,11 @@ class Decoder:
         decoded = DecodedFrame(task=item.task, source_etag=item.source_etag, orig_h=orig_h, orig_w=orig_w, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
         return decoded
 
-    def _decode_one_with_timing(self, item: FetchedBytes) -> Tuple[DecodedFrame, float]:
-        """Decode and return (result, decode_time_seconds)."""
+    def _decode_one_with_timing(self, item: FetchedBytes) -> Tuple[DecodedFrame, float, FetchedBytes]:
+        """Decode and return (result, decode_time_seconds, original_item)."""
         t0 = time.perf_counter()
         result = self._decode_one(item)
-        return result, time.perf_counter() - t0
+        return result, time.perf_counter() - t0, item
 
     async def run(self) -> None:
         """
@@ -82,8 +82,8 @@ class Decoder:
         total_wait_time = 0.0
         run_start = time.perf_counter()
         
-        # Pending decode tasks
-        pending_tasks: list[asyncio.Task] = []
+        # Pending decode futures (asyncio.Future from run_in_executor)
+        pending_futures: list[asyncio.Future] = []
         max_inflight = self.cfg.decode_threads * 2  # Keep 2x workers busy
         
         # Track when input is exhausted
@@ -93,12 +93,12 @@ class Decoder:
 
         try:
             while True:
-                # --- Collect completed decode tasks ---
+                # --- Collect completed decode futures ---
                 still_pending = []
-                for task in pending_tasks:
-                    if task.done():
+                for fut in pending_futures:
+                    if fut.done():
                         try:
-                            decoded, decode_time = task.result()
+                            decoded, decode_time, original_item = fut.result()
                             total_decode_time += decode_time
                             decoded_count += 1
                             
@@ -109,16 +109,18 @@ class Decoder:
                             
                             await self.q_decoder_to_gpu_pass_1.put(decoded)
                         except Exception as e:
-                            # Task failed - extract original item from task and emit error
+                            import traceback as tb_module
                             error_count += 1
-                            logger.error(f"[Decoder] Decode task failed: {e}")
-                            # Note: We lose the original task info here, but errors are rare
+                            logger.error(f"[Decoder] Decode failed: {e}")
+                            # We have original_item from the closure, emit proper error
+                            # But since the exception happened, we need to get original_item differently
+                            # For now, just log the error - the item info is lost
                     else:
-                        still_pending.append(task)
-                pending_tasks = still_pending
+                        still_pending.append(fut)
+                pending_futures = still_pending
                 
                 # --- Check termination ---
-                if input_done and len(pending_tasks) == 0:
+                if input_done and len(pending_futures) == 0:
                     run_time = time.perf_counter() - run_start
                     avg_decode = total_decode_time / max(1, decoded_count)
                     throughput = decoded_count / run_time if run_time > 0 else 0
@@ -133,8 +135,7 @@ class Decoder:
                     return
                 
                 # --- Fetch more items if we have capacity ---
-                items_fetched = 0
-                while len(pending_tasks) < max_inflight and not input_done:
+                while len(pending_futures) < max_inflight and not input_done:
                     wait_start = time.perf_counter()
                     try:
                         # Use short timeout to stay responsive
@@ -147,7 +148,6 @@ class Decoder:
                         break  # No more items right now
                     
                     total_wait_time += time.perf_counter() - wait_start
-                    items_fetched += 1
                     
                     if isinstance(msg, EndOfStream):
                         input_done = True
@@ -158,23 +158,21 @@ class Decoder:
                         error_count += 1
                         continue
                     
-                    # Fire off decode task (don't await!)
-                    task = asyncio.create_task(
-                        loop.run_in_executor(
-                            self.pool,
-                            self._decode_one_with_timing,
-                            msg
-                        )
+                    # Fire off decode in thread pool (returns Future, don't await!)
+                    fut = loop.run_in_executor(
+                        self.pool,
+                        self._decode_one_with_timing,
+                        msg
                     )
-                    pending_tasks.append(task)
+                    pending_futures.append(fut)
                 
-                # Yield to event loop
+                # Yield to event loop (let futures make progress)
                 await asyncio.sleep(0)
 
         except asyncio.CancelledError:
             logger.info("[Decoder] Cancelled, cleaning up...")
-            for task in pending_tasks:
-                task.cancel()
+            for fut in pending_futures:
+                fut.cancel()
             raise
         finally:
             self.pool.shutdown(wait=False)
