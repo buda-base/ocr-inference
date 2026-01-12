@@ -66,7 +66,7 @@ class PipelineConfig:
     frame_max_width = 4096
     frame_max_height = 2048
     patch_size = 512
-    patch_vertical_overlap_px = 78 # about 15%
+    patch_vertical_overlap_px = 0 # about 15%
     patch_horizontal_overlap_px = 0
     snap_extra_patch_row_threshold_px = 78 # if a patch row would only have h=78px, downscale to remove the patch row
     max_patch_rows = 2 # resize so it fits into two patch rows (considering vertical overlap)

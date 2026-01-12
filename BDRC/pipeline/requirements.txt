@@ -34,3 +34,5 @@ opencv-python-headless==4.11.0.86 # unfortunately 4.12 would be better (improved
 thin-plate-spline==1.2.1
 
 segmentation_models_pytorch # for line segmentation
+
+pyvips=3.1.1

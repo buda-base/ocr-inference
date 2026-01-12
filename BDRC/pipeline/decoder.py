@@ -23,11 +23,119 @@ except ImportError:
     PILImage = None
     _PIL_AVAILABLE = False
 
+# Optional: pyvips / libvips fast-path (very fast decode + can resize before NumPy materialization)
+try:
+    import pyvips  # type: ignore
+    _VIPS_AVAILABLE = True
+except ImportError:
+    pyvips = None
+    _VIPS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
 class ImageDecodeError(RuntimeError):
     """Raised when an image cannot be decoded or processed safely."""
+
+def _is_likely_binary_u8(gray_u8: np.ndarray) -> bool:
+    """
+    Cheap heuristic: check a small strided sample for values in {0,1,255}.
+    Avoids np.unique() over huge images.
+    """
+    if gray_u8.dtype != np.uint8 or gray_u8.ndim != 2 or gray_u8.size == 0:
+        return False
+    h, w = gray_u8.shape
+    step_y = max(1, h // 512)
+    step_x = max(1, w // 512)
+    sample = gray_u8[::step_y, ::step_x]
+    u = np.unique(sample)
+    if u.size > 2:
+        return False
+    s = set(map(int, u.tolist()))
+    return s.issubset({0, 1, 255})
+
+
+def _decode_via_vips(
+    filename: str,
+    image_bytes: bytes,
+    *,
+    max_width: int,
+    max_height: int,
+    patch_size: int,
+    patch_vertical_overlap_px: int,
+    snap_extra_patch_row_threshold_px: int,
+    max_patch_rows: int,
+) -> tuple[np.ndarray, bool, int, int, bool]:
+    """
+    Decode to 2D uint8 grayscale via libvips, and (critically) downscale BEFORE converting to NumPy.
+
+    Returns: (gray_u8, likely_binary, orig_h, orig_w, did_downscale)
+    """
+    if not _VIPS_AVAILABLE:
+        raise ImageDecodeError("pyvips not available")
+
+    try:
+        # access="sequential" helps throughput on large images
+        img = pyvips.Image.new_from_buffer(image_bytes, "", access="sequential")
+
+        # Multi-page guard (best-effort; not all loaders provide n-pages)
+        try:
+            if img.get_typeof("n-pages") != 0:
+                n_pages = int(img.get("n-pages"))
+                if n_pages != 1:
+                    raise ImageDecodeError(f"Multi-page image not supported ({n_pages} frames)")
+        except ImageDecodeError:
+            raise
+        except Exception:
+            pass
+
+        orig_w, orig_h = int(img.width), int(img.height)
+
+        # Ensure grayscale, 1 band
+        if img.bands > 1:
+            img = img.colourspace("b-w")
+
+        # Track likely-binary from vips pixel format if possible
+        binary_hint = (img.format == "onebit")
+        if binary_hint:
+            img = img.cast("uchar")
+
+        # Compute downscale factor using the same logic as OpenCV path
+        s = _compute_downscale(
+            orig_w,
+            orig_h,
+            max_width,
+            max_height,
+            patch_size,
+            patch_vertical_overlap_px,
+            snap_extra_patch_row_threshold_px,
+            max_patch_rows,
+        )
+
+        did_downscale = False
+        if s < 1.0:
+            # For bilevel docs, nearest preserves 0/255 best; for grayscale, linear is a good speed/quality tradeoff.
+            img = img.resize(s, kernel=("nearest" if binary_hint else "linear"))
+            did_downscale = True
+
+        if img.format != "uchar":
+            # Be strict; fallback lanes will handle exotic formats more predictably.
+            raise ImageDecodeError(f"Unsupported vips pixel format '{img.format}' for '{filename}'")
+
+        mem = img.write_to_memory()
+        gray = np.frombuffer(mem, dtype=np.uint8).reshape(int(img.height), int(img.width))
+
+        likely_binary = binary_hint or _is_likely_binary_u8(gray)
+        if likely_binary and gray.size and int(gray.max()) == 1:
+            gray = gray.copy()
+            gray *= 255  # in-place scale to {0,255}
+
+        return np.ascontiguousarray(gray), bool(likely_binary), orig_h, orig_w, did_downscale
+
+    except ImageDecodeError:
+        raise
+    except Exception as e:
+        raise ImageDecodeError(f"VIPS decode failed for '{filename}': {e}") from e
 
 
 class Decoder:
@@ -221,6 +329,92 @@ class Decoder:
 def _ext_lower(filename: str) -> str:
     return os.path.splitext(filename)[1].lower().lstrip(".")
 
+def _jpeg_dimensions(image_bytes: bytes) -> Optional[tuple[int, int]]:
+    """
+    Best-effort JPEG dimension probe to get (width, height) without full decode.
+
+    Prefer Pillow if available (simple/robust). Note: Pillow may emit/raise a DecompressionBomb
+    warning/error based only on the header dimensions; we suppress the warning and fall back to
+    the header parser if Pillow refuses the image.
+    """
+    if _PIL_AVAILABLE:
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                # We only want dimensions; suppress bomb warning.
+                warnings.simplefilter("ignore", category=getattr(PILImage, "DecompressionBombWarning", Warning))
+                with PILImage.open(io.BytesIO(image_bytes)) as im:
+                    w, h = im.size
+                    if w > 0 and h > 0:
+                        return int(w), int(h)
+        except Exception:
+            # Fall back to header parsing below
+            pass
+
+    # Fallback: minimal JPEG header parse (no full decode).
+    # JPEG starts with SOI 0xFFD8
+    if len(image_bytes) < 4 or image_bytes[0] != 0xFF or image_bytes[1] != 0xD8:
+        return None
+
+    i = 2
+    n = len(image_bytes)
+
+    # Markers that contain width/height (Start Of Frame, excluding DHT/DAC/etc.)
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3,
+        0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB,
+        0xCD, 0xCE, 0xCF,
+    }
+
+    try:
+        while i + 4 <= n:
+            # Find next marker (0xFF ??). Skip fill bytes.
+            if image_bytes[i] != 0xFF:
+                i += 1
+                continue
+            while i < n and image_bytes[i] == 0xFF:
+                i += 1
+            if i >= n:
+                return None
+            marker = image_bytes[i]
+            i += 1
+
+            # Start of Scan: after this, the stream is entropy-coded; stop.
+            if marker == 0xDA:
+                return None
+            # EOI
+            if marker == 0xD9:
+                return None
+            # Restart markers and standalone markers have no length; continue.
+            if 0xD0 <= marker <= 0xD7 or marker == 0x01:
+                continue
+
+            if i + 2 > n:
+                return None
+            seg_len = (image_bytes[i] << 8) | image_bytes[i + 1]
+            i += 2
+            if seg_len < 2 or i + (seg_len - 2) > n:
+                return None
+
+            if marker in sof_markers:
+                # Segment layout: [precision:1][height:2][width:2]...
+                if seg_len < 7:
+                    return None
+                p = i
+                height = (image_bytes[p + 1] << 8) | image_bytes[p + 2]
+                width = (image_bytes[p + 3] << 8) | image_bytes[p + 4]
+                if width <= 0 or height <= 0:
+                    return None
+                return width, height
+
+            # Skip segment payload
+            i += seg_len - 2
+    except Exception:
+        return None
+
+    return None
+
 def _compute_downscale(
     w: int,
     h: int,
@@ -399,7 +593,9 @@ def _decode_via_pil(filename: str, image_bytes: bytes) -> tuple[np.ndarray, bool
 
             # ---- binary-fast-path modes ----
             if mode == "1":
-                arr = np.array(im, dtype=np.uint8) * 255
+                # Avoid an extra temporary for huge bilevel pages
+                arr = np.array(im, dtype=np.uint8)  # 0/1
+                arr *= 255  # in-place -> 0/255
                 return arr, True
 
             if mode == "L":
@@ -522,8 +718,9 @@ def bytes_to_frame(
     Result is either linear light value or binary {0,255}.
 
     Optimized fast paths (99% of the data):
-      - JPEG: OpenCV decode first; PIL fallback for CMYK/odd cases.
-      - TIFF (Group4, already binary): PIL first (more reliable), OpenCV fallback.
+      - VIPS (if available): tried first for all formats (can downscale before NumPy materialization).
+      - JPEG: OpenCV decode; PIL fallback for CMYK/odd cases.
+      - TIFF (Group4, already binary): PIL; OpenCV fallback.
 
     Important notes:
       - (approximately) linearizes channel for intensity math by default
@@ -545,31 +742,94 @@ def bytes_to_frame(
 
     gray: Optional[np.ndarray] = None
     likely_binary = False
+    orig_h = 0
+    orig_w = 0
+    vips_used = False
+    vips_did_downscale = False
 
-    # Decoder lane 1
-    try:
-        if likely_tiff:
-            gray, likely_binary = _decode_via_pil(filename, image_bytes)
-        else:
-            img = _decode_via_cv2(image_bytes, likely_jpeg)
-            gray = _to_gray_cv(img)
-    except Exception as e1:
-        # Decoder lane 2 (fallback)
+    # Decoder lane 0: VIPS first (best-effort), but keep OpenCV's JPEG grayscale fast-path for normal-size JPEGs.
+    # VIPS stays preferred for TIFFs and for any JPEG that would be downscaled (VIPS can resize before NumPy materialization).
+    prefer_vips = _VIPS_AVAILABLE and (not likely_jpeg or likely_tiff)
+    if _VIPS_AVAILABLE and likely_jpeg and not likely_tiff:
+        dims = _jpeg_dimensions(image_bytes)
+        if dims is not None:
+            jw, jh = dims
+            try:
+                s = _compute_downscale(
+                    jw,
+                    jh,
+                    max_width,
+                    max_height,
+                    patch_size,
+                    patch_vertical_overlap_px,
+                    snap_extra_patch_row_threshold_px,
+                    max_patch_rows,
+                )
+                prefer_vips = (s < 1.0)
+            except Exception:
+                # If anything is odd, fall back to OpenCV-first for safety.
+                prefer_vips = False
+
+    if prefer_vips:
         try:
-            if gray is None:
-                if likely_tiff:
-                    # If PIL-first failed, try OpenCV
-                    img = _decode_via_cv2(image_bytes, likely_jpeg)
-                    gray = _to_gray_cv(img)
-                else:
-                    # If OpenCV-first failed, try PIL
-                    gray, likely_binary = _decode_via_pil(filename, image_bytes)
-        except Exception as e2:
-            raise ImageDecodeError(
-                f"Failed to decode '{filename}' via both OpenCV and PIL: "
-                f"primary_error={type(e1).__name__}: {e1}; "
-                f"fallback_error={type(e2).__name__}: {e2}"
-            ) from e2
+            gray, likely_binary, orig_h, orig_w, vips_did_downscale = _decode_via_vips(
+                filename,
+                image_bytes,
+                max_width=max_width,
+                max_height=max_height,
+                patch_size=patch_size,
+                patch_vertical_overlap_px=patch_vertical_overlap_px,
+                snap_extra_patch_row_threshold_px=snap_extra_patch_row_threshold_px,
+                max_patch_rows=max_patch_rows,
+            )
+            vips_used = True
+        except Exception:
+            gray = None
+            likely_binary = False
+            vips_used = False
+
+    # Decoder lanes 1/2: existing OpenCV/PIL logic (fallback)
+    if not vips_used:
+        try:
+            if likely_tiff:
+                gray, likely_binary = _decode_via_pil(filename, image_bytes)
+            else:
+                img = _decode_via_cv2(image_bytes, likely_jpeg)
+                gray = _to_gray_cv(img)
+        except Exception as e1:
+            try:
+                if gray is None:
+                    if likely_tiff:
+                        # If PIL-first failed, try OpenCV
+                        img = _decode_via_cv2(image_bytes, likely_jpeg)
+                        gray = _to_gray_cv(img)
+                    else:
+                        # If OpenCV-first failed, try VIPS (if available), then PIL
+                        if _VIPS_AVAILABLE:
+                            try:
+                                gray, likely_binary, orig_h, orig_w, vips_did_downscale = _decode_via_vips(
+                                    filename,
+                                    image_bytes,
+                                    max_width=max_width,
+                                    max_height=max_height,
+                                    patch_size=patch_size,
+                                    patch_vertical_overlap_px=patch_vertical_overlap_px,
+                                    snap_extra_patch_row_threshold_px=snap_extra_patch_row_threshold_px,
+                                    max_patch_rows=max_patch_rows,
+                                )
+                                vips_used = True
+                            except Exception:
+                                gray = None
+                                likely_binary = False
+                                vips_used = False
+                        if gray is None:
+                            gray, likely_binary = _decode_via_pil(filename, image_bytes)
+            except Exception as e2:
+                raise ImageDecodeError(
+                    f"Failed to decode '{filename}': "
+                    f"primary_error={type(e1).__name__}: {e1}; "
+                    f"fallback_error={type(e2).__name__}: {e2}"
+                ) from e2
 
     if gray is None:
         raise ImageDecodeError("Decoded image is None after decoding attempts")
@@ -582,21 +842,47 @@ def bytes_to_frame(
     if gray.dtype != np.uint8:
         gray = np.clip(gray, 0, 255).astype(np.uint8, copy=False)
 
-    orig_h, orig_w = gray.shape[:2]
+    if orig_h == 0 or orig_w == 0:
+        orig_h, orig_w = gray.shape[:2]
 
     # If already binary, preserve it and just downscale with nearest-neighbor
     if likely_binary:
-        binary = _downscale_binary(gray, max_width, max_height, patch_size, patch_vertical_overlap_px, snap_extra_patch_row_threshold_px, max_patch_rows)
-        # Enforce exactly {0,255}
-        if binary.max() == 1:
-            binary = (binary * 255).astype(np.uint8, copy=False)
-        return np.ascontiguousarray(binary), True, orig_h, orig_w
+        if not vips_used:
+            binary = _downscale_binary(
+                gray,
+                max_width,
+                max_height,
+                patch_size,
+                patch_vertical_overlap_px,
+                snap_extra_patch_row_threshold_px,
+                max_patch_rows,
+            )
+            # Enforce exactly {0,255}
+            if binary.size and binary.max() == 1:
+                binary = (binary * 255).astype(np.uint8, copy=False)
+            return np.ascontiguousarray(binary), True, orig_h, orig_w
+
+        # VIPS path already applied downscale before NumPy materialization (if needed)
+        if gray.size and gray.max() == 1:
+            gray = gray.copy()
+            gray *= 255
+        return np.ascontiguousarray(gray), True, orig_h, orig_w
+
+    # IMPORTANT: downscale BEFORE linearize to avoid huge temporary allocations on very large pages.
+    # (VIPS already downscaled before NumPy materialization when used.)
+    if not vips_used or not vips_did_downscale:
+        gray = _downscale_gray(
+            gray,
+            max_width,
+            max_height,
+            patch_size,
+            patch_vertical_overlap_px,
+            snap_extra_patch_row_threshold_px,
+            max_patch_rows,
+        )
 
     if linearize:
         gray = _srgb_u8_to_linear_u8(gray)
-
-    # Downscale before adaptive threshold (big speed win)
-    gray = _downscale_gray(gray, max_width, max_height, patch_size, patch_vertical_overlap_px, snap_extra_patch_row_threshold_px, max_patch_rows)
 
     if normalize_background:
         gray = _normalize_background_u8(gray)
