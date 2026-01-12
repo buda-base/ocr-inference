@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures as futures
+from collections import deque
 from .config import PipelineConfig
 import io
 import logging
@@ -100,7 +101,8 @@ class Decoder:
         max_inflight = self.cfg.decode_threads * 2  # Keep 2x workers busy
         
         # Output buffer for completed decodes (to avoid blocking puts)
-        output_buffer: list[DecodedFrame] = []
+        # Use deque for O(1) popleft instead of list's O(n) pop(0)
+        output_buffer: deque = deque()
         max_output_buffer = self.cfg.decode_threads * 2
         
         # Track when input is exhausted
@@ -114,7 +116,7 @@ class Decoder:
                 while output_buffer:
                     try:
                         self.q_decoder_to_gpu_pass_1.put_nowait(output_buffer[0])
-                        output_buffer.pop(0)
+                        output_buffer.popleft()  # O(1) with deque
                     except asyncio.QueueFull:
                         # Queue full, stop draining
                         break
@@ -163,7 +165,7 @@ class Decoder:
                 if len(output_buffer) >= max_output_buffer:
                     wait_start = time.perf_counter()
                     # Wait for space in output queue
-                    await self.q_decoder_to_gpu_pass_1.put(output_buffer.pop(0))
+                    await self.q_decoder_to_gpu_pass_1.put(output_buffer.popleft())  # O(1)
                     total_output_wait_time += time.perf_counter() - wait_start
                     continue  # Go back to draining output buffer
                 
