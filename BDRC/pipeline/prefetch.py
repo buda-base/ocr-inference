@@ -262,11 +262,8 @@ class S3Prefetcher(BasePrefetcher):
         bucket, key = _parse_s3_uri(task.source_uri)
 
         async with self.s3.global_sem:
-            async with self.s3.client() as s3c:
-                obj = await s3c.get_object(Bucket=bucket, Key=key)
-                etag = normalize_etag(obj.get("ETag", ""))
-                body: bytes = await obj["Body"].read()
-                return etag, body
+            etag, body = await self.s3.get_object(bucket, key)
+            return normalize_etag(etag), body
 
 
 # --- Local implementation ---

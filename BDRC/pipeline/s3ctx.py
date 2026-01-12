@@ -1,16 +1,20 @@
 import asyncio
 import contextlib
 import logging
-from aiobotocore.session import get_session
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
+
+import boto3
+from botocore.config import Config as BotoConfig
 
 logger = logging.getLogger(__name__)
 
 
 class S3Context:
-    """Holds global S3 settings + concurrency semaphore.
+    """Holds global S3 settings + thread pool for async S3 operations.
 
-    Uses a SINGLE shared S3 client for all requests (connection pooling).
-    This is much more efficient than creating a new client per request.
+    Uses boto3 (standard AWS SDK) with a thread pool for async operations.
+    This is simpler and more reliable than aiobotocore.
     
     Credentials are resolved via the default credential chain:
     - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
@@ -21,10 +25,12 @@ class S3Context:
     def __init__(self, cfg, global_sem: asyncio.Semaphore):
         self.cfg = cfg
         self.global_sem = global_sem
-        self._session = get_session()
         self._client = None
-        self._client_ctx = None
-        self._lock: asyncio.Lock | None = None  # Created lazily
+        self._lock: Optional[asyncio.Lock] = None
+        
+        # Thread pool for S3 operations (boto3 is synchronous)
+        max_workers = getattr(cfg, "bulk_prefetch_concurrency", 128)
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="s3")
 
     def _get_lock(self) -> asyncio.Lock:
         """Get or create the lock (must be in event loop context)."""
@@ -38,41 +44,56 @@ class S3Context:
             return
         
         async with self._get_lock():
-            # Double-check after acquiring lock
             if self._client is not None:
                 return
             
-            client_config = {
-                "region_name": self.cfg.s3_region,
-            }
+            # Configure boto3 for high concurrency
+            boto_config = BotoConfig(
+                max_pool_connections=200,  # High connection pool for parallel fetches
+                retries={"max_attempts": 3, "mode": "adaptive"},
+            )
             
-            # Only use a profile if explicitly set to a non-default value
+            logger.info(f"[S3Context] Creating boto3 S3 client (region={self.cfg.s3_region})")
+            
+            # Create session with optional profile
             aws_profile = getattr(self.cfg, "aws_profile", None)
             if aws_profile and aws_profile != "default":
-                client_config["profile_name"] = aws_profile
+                session = boto3.Session(profile_name=aws_profile)
+            else:
+                session = boto3.Session()
             
-            logger.info(f"[S3Context] Creating shared S3 client (region={self.cfg.s3_region})")
-            self._client_ctx = self._session.create_client("s3", **client_config)
-            self._client = await self._client_ctx.__aenter__()
+            self._client = session.client(
+                "s3",
+                region_name=self.cfg.s3_region,
+                config=boto_config,
+            )
 
     async def close(self):
-        """Close the shared S3 client. Call this when done with all S3 operations."""
+        """Close the S3 client and thread pool."""
         async with self._get_lock():
-            if self._client_ctx is not None:
-                await self._client_ctx.__aexit__(None, None, None)
+            if self._client is not None:
+                self._client.close()
                 self._client = None
-                self._client_ctx = None
-                logger.info("[S3Context] Closed shared S3 client")
+                logger.info("[S3Context] Closed boto3 S3 client")
+        
+        self._executor.shutdown(wait=False)
 
     @contextlib.asynccontextmanager
     async def client(self):
-        """Yield the shared S3 client.
-        
-        This reuses a single client for all requests, which is much more
-        efficient than creating a new client per request.
-        
-        The client uses connection pooling internally, so concurrent
-        requests share connections efficiently.
-        """
+        """Yield the shared S3 client for use in async context."""
         await self._ensure_client()
         yield self._client
+    
+    async def get_object(self, bucket: str, key: str) -> tuple[str, bytes]:
+        """Async wrapper for S3 get_object using thread pool."""
+        await self._ensure_client()
+        
+        loop = asyncio.get_event_loop()
+        
+        def _fetch():
+            response = self._client.get_object(Bucket=bucket, Key=key)
+            etag = response.get("ETag", "").strip('"')
+            body = response["Body"].read()
+            return etag, body
+        
+        return await loop.run_in_executor(self._executor, _fetch)

@@ -26,7 +26,6 @@ opencv-python-headless==4.11.0.86 # unfortunately 4.12 would be better (improved
 # S3 + async S3 (note: botocore already installed on the AMI, aiboto3 should sync)
 # boto3==1.42.21 (pinned)
 # botocore==1.42.21 (pinned)
-aiobotocore # doesn't work too well unfortunately, just slightly too old for botocore 1.42.21 but it doesn't break things too much
 
 # CLI UI
 # rich==14.2.0 (pinned in AMI)
