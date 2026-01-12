@@ -25,7 +25,7 @@ class PipelineConfig:
     # Queues (bounded)
     max_q_prefetcher_to_decoder: int = 1000  # Large enough to hold entire volume (~200MB raw bytes)
     max_q_decoder_to_tilebatcher: int = 32
-    max_q_tilebatcher_to_inference: int = 2  # Short queue - GPU is bottleneck anyway
+    max_q_tilebatcher_to_inference: int = 4  # Allow more batches queued (reduces put_wait)
     max_q_gpu_pass_1_to_post_processor: int = 32
     max_q_post_processor_to_tilebatcher: int = 16
     max_q_gpu_pass_2_to_post_processor: int = 16

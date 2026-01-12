@@ -554,8 +554,8 @@ class TileBatcher:
                 # Emit when: batch_size frames reached OR max_tiles exceeded
                 if warmup_complete and (len(self._buffer) >= self.batch_size or buffer_tiles >= max_tiles):
                     emit_start = time.perf_counter()
-                    n_frames = len(self._buffer)
                     batch = self._prepare_batch()
+                    n_frames = len(batch.metas)  # Actual frames in batch (after max_tiles limit)
                     n_tiles = batch.all_tiles.shape[0]
                     
                     put_start = time.perf_counter()
@@ -569,7 +569,7 @@ class TileBatcher:
                     logger.info(
                         f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles, "
                         f"reason=full, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s, "
-                        f"pending={len(self._pending_tiles)}"
+                        f"pending={len(self._pending_tiles)}, buffer={len(self._buffer)}"
                     )
 
                 # --- Fetch more frames if we have capacity ---
@@ -683,8 +683,8 @@ class TileBatcher:
                     
                     if should_flush:
                         emit_start = time.perf_counter()
-                        n_frames = len(self._buffer)
                         batch = self._prepare_batch()
+                        n_frames = len(batch.metas)  # Actual frames in batch
                         n_tiles = batch.all_tiles.shape[0]
                         
                         put_start = time.perf_counter()
