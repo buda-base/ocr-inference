@@ -43,7 +43,7 @@ class PipelineConfig:
     precision: Precision = "fp16" # bf16, fp16, fp32 or auto
     # Optional cap for the internal tile pool to limit peak memory under backpressure.
     # 0 disables throttling.
-    batch_size: int = 8  # Number of images per batch (8 images × ~8 tiles = ~64 tiles = ~200MB)
+    batch_size: int = 32  # Larger batches = fewer sync points = less overhead
     batch_timeout_ms: int = 25
     cuda_streams: int = 2
     binarize_block_size: int = 31
