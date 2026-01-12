@@ -14,6 +14,14 @@ import math
 from .types_common import ImageTask, DecodedFrame, FetchedBytesMsg, DecodedFrameMsg, FetchedBytes, DecodedFrame, PipelineError, EndOfStream
 from .debug_helpers import save_debug_bytes_sync, save_debug_image_sync
 
+# Pre-import PIL at module level (avoid repeated import overhead)
+try:
+    from PIL import Image as PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    PILImage = None
+    _PIL_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,8 +46,9 @@ class Decoder:
         )
 
     def _decode_one(self, item: FetchedBytes) -> DecodedFrame:
-        # Debug: save original bytes (synchronous, in thread pool - allows early GC of bytes)
-        save_debug_bytes_sync(self.cfg, item.task.img_filename, item.file_bytes)
+        # Debug: save original bytes (only if debug mode enabled - check before call to avoid overhead)
+        if self.cfg.debug_mode:
+            save_debug_bytes_sync(self.cfg, item.task.img_filename, item.file_bytes)
         
         frame, is_binary, orig_h, orig_w = bytes_to_frame(
             item.task.img_filename,
@@ -54,8 +63,9 @@ class Decoder:
             max_patch_rows=self.cfg.max_patch_rows
         )
         
-        # Debug: save decoded image (synchronous, in thread pool)
-        save_debug_image_sync(self.cfg, item.task.img_filename, "01_decoded", frame)
+        # Debug: save decoded image (only if debug mode enabled)
+        if self.cfg.debug_mode:
+            save_debug_image_sync(self.cfg, item.task.img_filename, "01_decoded", frame)
         
         decoded = DecodedFrame(task=item.task, source_etag=item.source_etag, orig_h=orig_h, orig_w=orig_w, frame=frame, is_binary=is_binary, first_pass=True, rotation_angle=None, tps_data=None)
         return decoded
@@ -374,13 +384,11 @@ def _decode_via_pil(filename: str, image_bytes: bytes) -> tuple[np.ndarray, bool
 
     Returns the frame and a boolean True if the image is already binary (no need to re-binarize it)
     """
-    try:
-        from PIL import Image
-    except Exception as e:
-        raise ImageDecodeError(f"PIL not available: {e}") from e
+    if not _PIL_AVAILABLE:
+        raise ImageDecodeError("PIL not available")
 
     try:
-        with Image.open(io.BytesIO(image_bytes)) as im:
+        with PILImage.open(io.BytesIO(image_bytes)) as im:
             n_frames = getattr(im, "n_frames", 1)
             if n_frames != 1:
                 raise ImageDecodeError(f"Multi-page image not supported ({n_frames} frames)")
@@ -392,8 +400,13 @@ def _decode_via_pil(filename: str, image_bytes: bytes) -> tuple[np.ndarray, bool
                 arr = np.array(im, dtype=np.uint8) * 255
                 return arr, True
 
-            if mode in ("P", "L"):
-                # Most Group4 TIFFs land here
+            if mode == "L":
+                # Already grayscale - no conversion needed
+                arr = np.array(im, dtype=np.uint8)
+                return arr, False
+
+            if mode == "P":
+                # Palette mode - convert to grayscale
                 im = im.convert("L")
                 arr = np.array(im, dtype=np.uint8)
                 return arr, False
@@ -586,5 +599,7 @@ def bytes_to_frame(
     if normalize_background:
         gray = _normalize_background_u8(gray)
 
-    # Enforce contiguous uint8 frame
-    return np.ascontiguousarray(gray, dtype=np.uint8), False, orig_h, orig_w
+    # Enforce contiguous uint8 frame (skip if already contiguous - common after cv2 ops)
+    if not gray.flags['C_CONTIGUOUS'] or gray.dtype != np.uint8:
+        gray = np.ascontiguousarray(gray, dtype=np.uint8)
+    return gray, False, orig_h, orig_w
