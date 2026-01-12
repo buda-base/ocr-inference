@@ -106,6 +106,7 @@ def tile_frame_sync(
     gray: np.ndarray,
     patch_size: int,
     dtype: torch.dtype = torch.float32,
+    pin_memory: bool = True,
 ) -> Tuple[torch.Tensor, int, int, int, int]:
     """
     Tile a grayscale frame.
@@ -114,10 +115,11 @@ def tile_frame_sync(
         gray: [H, W] uint8 numpy array
         patch_size: tile size
         dtype: torch dtype for output tiles (fp32, fp16, bf16)
+        pin_memory: if True and CUDA available, pin the output tensor for faster H2D transfer
     
     Returns:
         (tiles, x_steps, y_steps, pad_x, pad_y)
-        - tiles: [N, 3, patch_size, patch_size] tensor in specified dtype (on CPU)
+        - tiles: [N, 3, patch_size, patch_size] tensor in specified dtype (on CPU, optionally pinned)
     """
     # Convert to torch [1, H, W] and normalize in one step
     # Using the target dtype directly if possible to avoid extra conversion
@@ -133,6 +135,11 @@ def tile_frame_sync(
     # Expand grayscale to 3 channels using repeat (single operation)
     # repeat() allocates new memory and copies, but is faster than expand+contiguous
     tiles = tiles.repeat(1, 3, 1, 1)
+    
+    # Pin memory for faster async GPU transfer (requires CUDA)
+    # pin_memory() returns a new tensor backed by page-locked memory
+    if pin_memory and torch.cuda.is_available():
+        tiles = tiles.pin_memory()
     
     return tiles, x_steps, y_steps, pad_x, pad_y
 
@@ -174,6 +181,9 @@ class TileBatcher:
         # Tile precision (fp16/bf16 saves ~50% memory)
         precision = getattr(cfg, "precision", "fp32")
         self.tile_dtype: torch.dtype = get_tile_dtype(precision)
+        
+        # Pin memory for faster H2D transfer
+        self.pin_tile_memory: bool = getattr(cfg, "pin_tile_memory", True)
 
         # State tracking
         self._decoder_done = False
@@ -278,9 +288,10 @@ class TileBatcher:
                 gray,
                 self.patch_size,
                 self.tile_dtype,
+                self.pin_tile_memory,
             )
         else:
-            return tile_frame_sync(gray, self.patch_size, self.tile_dtype)
+            return tile_frame_sync(gray, self.patch_size, self.tile_dtype, self.pin_tile_memory)
 
     async def _tile_frame_async(
         self,
@@ -303,10 +314,11 @@ class TileBatcher:
                 gray,
                 self.patch_size,
                 self.tile_dtype,
+                self.pin_tile_memory,
             )
         else:
             tiles, x_steps, y_steps, pad_x, pad_y = tile_frame_sync(
-                gray, self.patch_size, self.tile_dtype
+                gray, self.patch_size, self.tile_dtype, self.pin_tile_memory
             )
         
         tile_time = time.perf_counter() - t0
@@ -405,6 +417,11 @@ class TileBatcher:
 
         # Stack all tiles into single tensor
         all_tiles_tensor = torch.cat(all_tiles, dim=0)
+        
+        # Pin the concatenated tensor for faster H2D transfer
+        # (torch.cat creates a new tensor, so we need to re-pin)
+        if self.pin_tile_memory and torch.cuda.is_available() and not all_tiles_tensor.is_pinned():
+            all_tiles_tensor = all_tiles_tensor.pin_memory()
         
         # Remove taken frames from buffer
         self._buffer = self._buffer[frames_to_take:]

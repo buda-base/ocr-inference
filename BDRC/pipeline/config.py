@@ -25,7 +25,7 @@ class PipelineConfig:
     # Queues (bounded)
     max_q_prefetcher_to_decoder: int = 1000  # Large enough to hold entire volume (~200MB raw bytes)
     max_q_decoder_to_tilebatcher: int = 32
-    max_q_tilebatcher_to_inference: int = 4  # Allow more batches queued (reduces put_wait)
+    max_q_tilebatcher_to_inference: int = 8  # Allow more batches queued (reduces GPU starvation)
     max_q_gpu_pass_1_to_post_processor: int = 32
     max_q_post_processor_to_tilebatcher: int = 16
     max_q_gpu_pass_2_to_post_processor: int = 16
@@ -34,13 +34,14 @@ class PipelineConfig:
 
     # CPU decode threads
     decode_threads: int = 8
-    tile_workers: int = 16  # ThreadPoolExecutor workers for parallel tiling (tiling must be faster than GPU)
+    tile_workers: int = 24  # ThreadPoolExecutor workers for parallel tiling (must outpace GPU)
     parallel_tiling: bool = True  # Enable parallel tiling in TileBatcher
 
     # GPU batching
     use_gpu: bool = True
     compile_model: bool = False
     precision: Precision = "fp16" # bf16, fp16, fp32 or auto
+    pin_tile_memory: bool = True  # Pin tiled tensors for faster async GPU transfer
     # Optional cap for the internal tile pool to limit peak memory under backpressure.
     # 0 disables throttling.
     batch_size: int = 16  # Number of images per batch (16 images × ~5 tiles = ~80 tiles per batch)
@@ -84,7 +85,7 @@ class PipelineConfig:
     
     # Warmup: wait for buffer to fill before starting GPU inference
     # Short warmup helps batch consistency without adding much latency
-    inference_warmup_frames: int = 24  # ~3 batches worth, ~2-3 seconds at S3 speed
+    inference_warmup_frames: int = 40  # ~5 batches worth, builds larger buffer before GPU starts
     
     # Max tiles per batch to prevent CUDA OOM (images have variable tile counts)
     max_tiles_per_batch: int = 80  # ~80 tiles = ~400MB GPU memory for forward pass
