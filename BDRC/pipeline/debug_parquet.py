@@ -190,8 +190,17 @@ def infer_image_uri(parquet_uri: str, img_filename: str) -> str:
 def deserialize_tps_points(tps_points: list) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """
     Deserialize TPS points from parquet format.
-    Parquet format: list of [in_y, in_x, out_y, out_x]
-    Returns: (input_pts, output_pts) as (N,2) arrays in [y,x] format
+    
+    Parquet format: list of [in_y, in_x, out_y, out_x] (float32)
+    - Points are stored in original image coordinate system (after scaling from processed frame)
+    - Format matches what ld_postprocessor.py stores: [y, x] order
+    
+    Returns: (input_pts, output_pts) as (N,2) arrays in [y,x] format (float64)
+    - input_pts: source points in original image coordinates (where the line is curved)
+    - output_pts: target points in original image coordinates (where we want the line to be straight)
+    
+    Note: These points are meant to be applied to the original image AFTER rotation (if any).
+    The coordinate system matches the rotated original image dimensions.
     """
     if tps_points is None or len(tps_points) == 0:
         return None
@@ -200,8 +209,10 @@ def deserialize_tps_points(tps_points: list) -> Optional[Tuple[np.ndarray, np.nd
     output_pts = []
     for pt in tps_points:
         if len(pt) >= 4:
-            input_pts.append([pt[0], pt[1]])  # [y, x]
-            output_pts.append([pt[2], pt[3]])  # [y, x]
+            # Parquet format: [in_y, in_x, out_y, out_x]
+            # Convert to [y, x] format arrays as expected by _apply_tps_3
+            input_pts.append([pt[0], pt[1]])  # [y, x] - source points
+            output_pts.append([pt[2], pt[3]])  # [y, x] - target points
     
     if len(input_pts) == 0:
         return None
@@ -273,7 +284,7 @@ def draw_contours_on_image(img: np.ndarray, contours: list, color: Tuple[int, in
     return result
 
 
-def process_row(row: dict, parquet_uri: str, output_folder: Path, image_uri_map: Optional[Dict[str, str]] = None) -> None:
+def process_row(row: dict, parquet_uri: str, output_folder: Path, image_uri_map: Optional[Dict[str, str]] = None, tps_only: bool = False) -> None:
     """Process a single row from the parquet file."""
     img_filename = row.get("img_file_name")
     if not img_filename:
@@ -284,6 +295,12 @@ def process_row(row: dict, parquet_uri: str, output_folder: Path, image_uri_map:
     if not row.get("ok", True):
         print(f"Warning: Skipping error row for {img_filename}", file=sys.stderr)
         return
+    
+    # Skip rows without TPS data if --tps-only is set
+    if tps_only:
+        tps_points = row.get("tps_points")
+        if tps_points is None or len(tps_points) == 0:
+            return
     
     # Determine image location
     if image_uri_map and img_filename in image_uri_map:
@@ -346,6 +363,8 @@ def process_row(row: dict, parquet_uri: str, output_folder: Path, image_uri_map:
         if tps_data is not None:
             input_pts, output_pts = tps_data
             alpha = float(tps_alpha) if tps_alpha is not None else 0.5
+            # NOTE: _apply_tps_3 now swaps input_pts and output_pts internally to get
+            # the correct inverse transformation for backward mapping
             current_img = _apply_tps_3(current_img, input_pts, output_pts, alpha)
             transformation_suffix = "_rotated_tps"
     
@@ -390,6 +409,12 @@ def main():
         "--i",
         type=str,
         help="Image group ID (e.g., I0886) for S3 mode"
+    )
+    
+    parser.add_argument(
+        "--tps-only",
+        action="store_true",
+        help="Only output images for rows that have non-null TPS data"
     )
     
     args = parser.parse_args()
@@ -459,7 +484,7 @@ def main():
     errors = []
     for idx, row in df.iterrows():
         try:
-            process_row(row.to_dict(), parquet_uri, output_folder, image_uri_map)
+            process_row(row.to_dict(), parquet_uri, output_folder, image_uri_map, tps_only=args.tps_only)
         except FileNotFoundError as e:
             # Re-raise FileNotFoundError if we don't have explicit input (inference failed)
             if image_uri_map is None:

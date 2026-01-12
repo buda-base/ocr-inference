@@ -64,7 +64,11 @@ def _apply_tps_1(img: npt.NDArray[np.uint8], input_pts, output_pts, alpha=DEFAUL
     output_pts = np.asarray(output_pts, dtype=np.float64)
 
     tps = ThinPlateSpline(alpha)
-    tps.fit(input_pts, output_pts)
+    # For backward mapping (output -> input) needed by map_coordinates, we need to fit
+    # the inverse transformation. If transform() does forward mapping, we swap the arguments.
+    # input_pts = where the line is (curved), output_pts = where we want it (straight)
+    # We need: for each output pixel, where to sample from in input -> fit(output_pts, input_pts)
+    tps.fit(output_pts, input_pts)
 
     out_grid = np.indices((h, w), dtype=np.float64).transpose(1, 2, 0)  # (h,w,2) in [y,x]
     in_coords = tps.transform(out_grid.reshape(-1, 2)).reshape(h, w, 2)  # (h,w,2) [y,x]
@@ -89,7 +93,11 @@ def _apply_tps_3(img: npt.NDArray[np.uint8], input_pts, output_pts, alpha=DEFAUL
     # we consider that corners should be in the list if wanted, no function argument
 
     tps = ThinPlateSpline(alpha)
-    tps.fit(input_pts, output_pts)
+    # For backward mapping (output -> input) needed by map_coordinates, we need to fit
+    # the inverse transformation. If transform() does forward mapping, we swap the arguments.
+    # input_pts = where the line is (curved), output_pts = where we want it (straight)
+    # We need: for each output pixel, where to sample from in input -> fit(output_pts, input_pts)
+    tps.fit(output_pts, input_pts)
 
     out_grid = np.indices((h, w), dtype=np.float64).transpose(1, 2, 0)  # (h,w,2) [y,x]
     in_coords = tps.transform(out_grid.reshape(-1, 2)).reshape(h, w, 2)  # (h,w,2) [y,x]
