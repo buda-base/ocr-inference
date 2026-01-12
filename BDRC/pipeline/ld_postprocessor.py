@@ -280,14 +280,19 @@ class LDPostProcessor:
         )
 
         # 4. either finalize or enqueue decoded frame to reprocess
-        if tps_points is None and rotation_angle == 0.0:
+        # Skip pass-2 if: no TPS needed AND (no rotation OR small rotation < 3 deg)
+        # For small rotations, we just rotate the contours (already done above) without re-running GPU
+        skip_pass2_threshold = getattr(self.cfg, "skip_pass2_rotation_threshold", 3.0)
+        small_rotation = abs(rotation_angle) < skip_pass2_threshold
+        
+        if tps_points is None and (rotation_angle == 0.0 or small_rotation):
             # scale contours to original image dimensions (inf_frame.orig_h, inf_frame.orig_w)
             contours = scale_contours(contours, line_mask.shape[0], line_mask.shape[1], inf_frame.orig_h, inf_frame.orig_w)
             contours_bboxes = get_contour_bboxes(contours)
             rec = Record(
                 task=inf_frame.task,
                 source_etag=inf_frame.source_etag,
-                rotation_angle=None,
+                rotation_angle=rotation_angle if rotation_angle != 0.0 else None,
                 tps_data=None,
                 contours=contours,
                 nb_contours=len(contours),
