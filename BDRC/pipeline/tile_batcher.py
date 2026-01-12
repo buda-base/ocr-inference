@@ -364,13 +364,32 @@ class TileBatcher:
         Combine buffered tiled frames into a single TiledBatch.
         
         This is the collate_fn equivalent from the reference code.
+        Respects batch_size (frames) and max_tiles_per_batch limits.
         """
         all_tiles = []
         tile_ranges = []
         metas = []
         offset = 0
+        
+        max_tiles = getattr(self.cfg, "max_tiles_per_batch", 80)
+        frames_to_take = 0
+        total_tiles = 0
 
+        # First pass: count how many frames we can take
         for entry in self._buffer:
+            n_tiles = entry["tiles"].shape[0]
+            
+            # Stop if adding this frame would exceed limits
+            if frames_to_take >= self.batch_size:
+                break
+            if total_tiles + n_tiles > max_tiles and total_tiles > 0:
+                break  # Don't exceed max_tiles (but always take at least 1)
+            
+            frames_to_take += 1
+            total_tiles += n_tiles
+        
+        # Second pass: collect the frames
+        for entry in self._buffer[:frames_to_take]:
             tiles = entry["tiles"]
             n_tiles = tiles.shape[0]
             
@@ -392,8 +411,8 @@ class TileBatcher:
         # Stack all tiles into single tensor
         all_tiles_tensor = torch.cat(all_tiles, dim=0)
         
-        # Clear buffer
-        self._buffer = []
+        # Remove taken frames from buffer
+        self._buffer = self._buffer[frames_to_take:]
         
         return TiledBatch(
             all_tiles=all_tiles_tensor,
@@ -532,8 +551,13 @@ class TileBatcher:
                         # Continue to the fetch section below
                         pass
                 
+                # --- Calculate current tiles in buffer ---
+                buffer_tiles = sum(entry["tiles"].shape[0] for entry in self._buffer) if self._buffer else 0
+                max_tiles = getattr(self.cfg, "max_tiles_per_batch", 80)
+                
                 # --- Emit batch when full (only after warmup) ---
-                if warmup_complete and len(self._buffer) >= self.batch_size:
+                # Emit when: batch_size frames reached OR max_tiles exceeded
+                if warmup_complete and (len(self._buffer) >= self.batch_size or buffer_tiles >= max_tiles):
                     emit_start = time.perf_counter()
                     n_frames = len(self._buffer)
                     batch = self._prepare_batch()
@@ -652,12 +676,14 @@ class TileBatcher:
                     len(self._pending_tiles) == 0):
                     
                     # Determine if we should flush or wait for more
-                    buffer_fullness = len(self._buffer) / self.batch_size
+                    frame_fullness = len(self._buffer) / self.batch_size
+                    tile_fullness = buffer_tiles / max_tiles
                     min_flush_ratio = 0.75  # Only flush if at least 75% full
                     
                     should_flush = (
                         self._decoder_done or  # Decoder done, flush what we have
-                        buffer_fullness >= min_flush_ratio  # Nearly full batch
+                        frame_fullness >= min_flush_ratio or  # Nearly full by frames
+                        tile_fullness >= min_flush_ratio  # Nearly full by tiles
                     )
                     
                     if should_flush:

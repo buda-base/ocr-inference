@@ -84,7 +84,10 @@ class PipelineConfig:
     
     # Warmup: wait for decoder queue to fill before starting GPU inference
     # This ensures consistent batch sizes at the start (helps with S3's bursty behavior)
-    inference_warmup_frames: int = 64  # Wait for this many decoded frames before starting GPU
+    inference_warmup_frames: int = 32  # Wait for this many decoded frames before starting GPU
+    
+    # Max tiles per batch to prevent CUDA OOM (images have variable tile counts)
+    max_tiles_per_batch: int = 80  # ~80 tiles = ~400MB GPU memory for forward pass
     tps_add_corners: bool = True
     tps_alpha: float = 0.5
     legacy_tps_detect: bool = False
