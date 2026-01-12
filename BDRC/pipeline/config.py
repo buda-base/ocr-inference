@@ -34,7 +34,7 @@ class PipelineConfig:
 
     # CPU decode threads
     decode_threads: int = 8
-    tile_workers: int = 4  # ThreadPoolExecutor workers for parallel tiling
+    tile_workers: int = 8  # ThreadPoolExecutor workers for parallel tiling (increase if CPU-bound)
     parallel_tiling: bool = True  # Enable parallel tiling in TileBatcher
 
     # GPU batching

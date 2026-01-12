@@ -203,6 +203,9 @@ class TileBatcher:
         # Buffer for accumulating tiled frames before emitting a batch
         # Each entry: dict with tiles, metadata, etc.
         self._buffer: List[Dict[str, Any]] = []
+        
+        # Pending tiling tasks (for parallel tiling)
+        self._pending_tiles: List[asyncio.Task] = []
 
     # -------------------------------------------------------------------------
     # Error handling
@@ -283,6 +286,74 @@ class TileBatcher:
             )
         else:
             return tile_frame_sync(gray, self.patch_size, self.tile_dtype)
+
+    async def _tile_frame_async(
+        self,
+        dec_frame: DecodedFrame,
+        gray: np.ndarray,
+        is_pass2: bool,
+    ) -> Dict[str, Any]:
+        """
+        Tile a frame and return the complete entry for the buffer.
+        
+        This is designed to be run as a task for parallel tiling.
+        """
+        t0 = time.perf_counter()
+        
+        if self._use_parallel_tiling and self._tile_executor is not None:
+            loop = asyncio.get_event_loop()
+            tiles, x_steps, y_steps, pad_x, pad_y = await loop.run_in_executor(
+                self._tile_executor,
+                tile_frame_sync,
+                gray,
+                self.patch_size,
+                self.tile_dtype,
+            )
+        else:
+            tiles, x_steps, y_steps, pad_x, pad_y = tile_frame_sync(
+                gray, self.patch_size, self.tile_dtype
+            )
+        
+        tile_time = time.perf_counter() - t0
+        
+        return {
+            "dec_frame": dec_frame,
+            "gray": gray,
+            "second_pass": is_pass2,
+            "tiles": tiles,
+            "x_steps": x_steps,
+            "y_steps": y_steps,
+            "pad_x": pad_x,
+            "pad_y": pad_y,
+            "tile_time": tile_time,
+        }
+
+    def _collect_completed_tiles(self) -> Tuple[int, float]:
+        """
+        Check pending tile tasks and move completed ones to buffer.
+        
+        Returns:
+            (n_completed, total_tile_time)
+        """
+        completed = 0
+        total_time = 0.0
+        still_pending = []
+        
+        for task in self._pending_tiles:
+            if task.done():
+                try:
+                    entry = task.result()
+                    self._buffer.append(entry)
+                    completed += 1
+                    total_time += entry.get("tile_time", 0.0)
+                except Exception as e:
+                    # Task failed - log error but continue
+                    logger.error(f"[TileBatcher] Tile task failed: {e}")
+            else:
+                still_pending.append(task)
+        
+        self._pending_tiles = still_pending
+        return completed, total_time
 
     # -------------------------------------------------------------------------
     # Batch preparation (multi_image_collate_fn logic)
@@ -373,7 +444,11 @@ class TileBatcher:
 
     async def run(self) -> None:
         """
-        Main loop: receive frames, tile them, batch, and emit.
+        Main loop: receive frames, tile them in parallel, batch, and emit.
+        
+        Key optimization: Fire off multiple tiling tasks in parallel instead
+        of awaiting each one sequentially. This keeps the thread pool busy
+        while we fetch more frames.
         
         Load balancing: prefer pass-2 (postprocessor) over pass-1 (decoder).
         """
@@ -382,25 +457,41 @@ class TileBatcher:
         total_wait_time = 0.0
         total_tile_time = 0.0
         total_batch_emit_time = 0.0
-        frames_tiled = 0
+        frames_submitted = 0
         batches_emitted = 0
+        
+        # Max frames to have in-flight (tiling) at once
+        max_inflight = self.tile_workers * 2  # 2x workers for good overlap
         
         try:
             while True:
                 loop_start = time.perf_counter()
                 loop_count += 1
                 
-                # Check termination
-                if self._decoder_done and self._postprocessor_done:
+                # --- Collect completed tiling tasks ---
+                n_completed, tile_time = self._collect_completed_tiles()
+                total_tile_time += tile_time
+                
+                # --- Check termination ---
+                # Only terminate when both inputs are done AND no pending work
+                all_done = self._decoder_done and self._postprocessor_done
+                no_pending = len(self._pending_tiles) == 0
+                
+                if all_done and no_pending:
                     logger.info(
-                        f"[TileBatcher] DONE - loops={loop_count}, frames_tiled={frames_tiled}, "
+                        f"[TileBatcher] DONE - loops={loop_count}, frames_submitted={frames_submitted}, "
                         f"batches={batches_emitted}, total_wait={total_wait_time:.2f}s, "
                         f"total_tile={total_tile_time:.2f}s, total_emit={total_batch_emit_time:.2f}s"
                     )
                     # Flush remaining buffer
                     if self._buffer:
                         batch = self._prepare_batch()
+                        batches_emitted += 1
                         await self.q_to_inference.put(batch)
+                        logger.info(
+                            f"[TileBatcher] Emitted final batch #{batches_emitted}: "
+                            f"{len(batch.metas)} frames, {batch.all_tiles.shape[0]} tiles"
+                        )
                     
                     # Send pass-1 EOS if not already sent
                     if not self._pass1_eos_sent:
@@ -415,115 +506,14 @@ class TileBatcher:
                     )
                     break
 
-                took_any = False
-                msg = None
-                is_pass2 = False
-
-                # --- Prefer pass-2 (from PostProcessor) ---
-                wait_start = time.perf_counter()
-                if not self._postprocessor_done:
-                    msg = await self._pop_one(self.q_from_postprocessor, self.batch_timeout_s)
-                    if msg is not None:
-                        took_any = True
-                        is_pass2 = True
-                        
-                        if isinstance(msg, EndOfStream) and msg.stream == "transformed_pass_1":
-                            self._postprocessor_done = True
-                            logger.debug("[TileBatcher] Received transformed_pass_1 EOS")
-                            msg = None
-                        elif isinstance(msg, PipelineError):
-                            await self.q_to_inference.put(msg)
-                            msg = None
-
-                # --- Then pass-1 (from Decoder) ---
-                if not self._decoder_done and not took_any:
-                    msg = await self._pop_one(self.q_from_decoder, self.batch_timeout_s)
-                    if msg is not None:
-                        took_any = True
-                        is_pass2 = False
-                        
-                        if isinstance(msg, EndOfStream) and msg.stream == "decoded":
-                            self._decoder_done = True
-                            logger.debug("[TileBatcher] Received decoded EOS")
-                            msg = None
-                        elif isinstance(msg, PipelineError):
-                            await self.q_to_inference.put(msg)
-                            msg = None
-                
-                wait_time = time.perf_counter() - wait_start
-                total_wait_time += wait_time
-                
-                # Log if we waited a long time without getting anything
-                if not took_any and wait_time > 0.5:
-                    logger.warning(
-                        f"[TileBatcher] Long wait ({wait_time:.2f}s) with no frame. "
-                        f"decoder_q={self.q_from_decoder.qsize()}, post_q={self.q_from_postprocessor.qsize()}, "
-                        f"buffer={len(self._buffer)}, decoder_done={self._decoder_done}, post_done={self._postprocessor_done}"
-                    )
-
-                # --- Process frame if we got one ---
-                if msg is not None and isinstance(msg, DecodedFrame):
-                    try:
-                        tile_start = time.perf_counter()
-                        
-                        # Preprocess (binarize)
-                        gray = self._preprocess_frame(msg)
-                        
-                        # Tile (possibly in thread pool)
-                        tiles, x_steps, y_steps, pad_x, pad_y = await self._tile_frame(gray)
-                        
-                        tile_time = time.perf_counter() - tile_start
-                        total_tile_time += tile_time
-                        frames_tiled += 1
-                        
-                        if tile_time > 0.5:
-                            logger.warning(f"[TileBatcher] Slow tile: {tile_time:.2f}s for {msg.task.img_filename}")
-                        
-                        # Add to buffer
-                        self._buffer.append({
-                            "dec_frame": msg,
-                            "gray": gray,
-                            "second_pass": is_pass2,
-                            "tiles": tiles,
-                            "x_steps": x_steps,
-                            "y_steps": y_steps,
-                            "pad_x": pad_x,
-                            "pad_y": pad_y,
-                        })
-                        
-                        logger.debug(
-                            f"[TileBatcher] Tiled {msg.task.img_filename} in {tile_time*1000:.1f}ms, "
-                            f"buffer={len(self._buffer)}/{self.batch_size}"
-                        )
-                        
-                    except Exception as e:
-                        await self._emit_pipeline_error(
-                            internal_stage="tile",
-                            exc=e,
-                            lane_second_pass=is_pass2,
-                            task=msg.task,
-                            source_etag=msg.source_etag,
-                            retryable=False,
-                            attempt=1,
-                        )
-
-                # --- Emit batch when full OR on timeout with pending frames ---
-                should_emit = False
-                emit_reason = ""
+                # --- Emit batch when full ---
+                # Do this early so GPU gets work ASAP
                 if len(self._buffer) >= self.batch_size:
-                    should_emit = True
-                    emit_reason = "full"
-                elif not took_any and self._buffer:
-                    should_emit = True
-                    emit_reason = "timeout_flush"
-                
-                if should_emit:
                     emit_start = time.perf_counter()
                     n_frames = len(self._buffer)
                     batch = self._prepare_batch()
                     n_tiles = batch.all_tiles.shape[0]
                     
-                    # This put() can block if inference queue is full!
                     put_start = time.perf_counter()
                     await self.q_to_inference.put(batch)
                     put_time = time.perf_counter() - put_start
@@ -534,28 +524,129 @@ class TileBatcher:
                     
                     logger.info(
                         f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles, "
-                        f"reason={emit_reason}, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s"
+                        f"reason=full, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s, "
+                        f"pending={len(self._pending_tiles)}"
                     )
+
+                # --- Fetch more frames if we have capacity ---
+                # Keep fetching while we have room for more in-flight tasks
+                frames_fetched_this_loop = 0
+                max_fetch_per_loop = max_inflight  # Don't spin forever
+                
+                while (len(self._pending_tiles) < max_inflight and 
+                       frames_fetched_this_loop < max_fetch_per_loop):
                     
-                    if put_time > 0.1:
-                        logger.warning(f"[TileBatcher] Slow put to inference queue: {put_time:.2f}s (queue was full?)")
+                    msg = None
+                    is_pass2 = False
+                    
+                    wait_start = time.perf_counter()
+                    
+                    # --- Prefer pass-2 (from PostProcessor) ---
+                    if not self._postprocessor_done:
+                        msg = await self._pop_one(self.q_from_postprocessor, self.batch_timeout_s)
+                        if msg is not None:
+                            is_pass2 = True
+                            
+                            if isinstance(msg, EndOfStream) and msg.stream == "transformed_pass_1":
+                                self._postprocessor_done = True
+                                logger.debug("[TileBatcher] Received transformed_pass_1 EOS")
+                                msg = None
+                            elif isinstance(msg, PipelineError):
+                                await self.q_to_inference.put(msg)
+                                msg = None
+
+                    # --- Then pass-1 (from Decoder) ---
+                    if msg is None and not self._decoder_done:
+                        msg = await self._pop_one(self.q_from_decoder, self.batch_timeout_s)
+                        if msg is not None:
+                            is_pass2 = False
+                            
+                            if isinstance(msg, EndOfStream) and msg.stream == "decoded":
+                                self._decoder_done = True
+                                logger.debug("[TileBatcher] Received decoded EOS")
+                                msg = None
+                            elif isinstance(msg, PipelineError):
+                                await self.q_to_inference.put(msg)
+                                msg = None
+                    
+                    wait_time = time.perf_counter() - wait_start
+                    total_wait_time += wait_time
+                    
+                    if msg is None:
+                        # No frame available, break out of fetch loop
+                        break
+                    
+                    frames_fetched_this_loop += 1
+                    
+                    # --- Start tiling task (don't await!) ---
+                    if isinstance(msg, DecodedFrame):
+                        try:
+                            # Preprocess synchronously (fast)
+                            gray = self._preprocess_frame(msg)
+                            
+                            # Fire off async tiling task
+                            task = asyncio.create_task(
+                                self._tile_frame_async(msg, gray, is_pass2)
+                            )
+                            self._pending_tiles.append(task)
+                            frames_submitted += 1
+                            
+                        except Exception as e:
+                            await self._emit_pipeline_error(
+                                internal_stage="preprocess",
+                                exc=e,
+                                lane_second_pass=is_pass2,
+                                task=msg.task,
+                                source_etag=msg.source_etag,
+                                retryable=False,
+                                attempt=1,
+                            )
+
+                # --- Timeout flush: emit partial batch if nothing is coming ---
+                # Only flush if we have frames AND we couldn't fetch any new ones
+                # AND we have no pending tiles (everything that was in-flight is now in buffer)
+                if (frames_fetched_this_loop == 0 and 
+                    self._buffer and 
+                    len(self._pending_tiles) == 0):
+                    
+                    emit_start = time.perf_counter()
+                    n_frames = len(self._buffer)
+                    batch = self._prepare_batch()
+                    n_tiles = batch.all_tiles.shape[0]
+                    
+                    put_start = time.perf_counter()
+                    await self.q_to_inference.put(batch)
+                    put_time = time.perf_counter() - put_start
+                    
+                    emit_time = time.perf_counter() - emit_start
+                    total_batch_emit_time += emit_time
+                    batches_emitted += 1
+                    
+                    logger.info(
+                        f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles, "
+                        f"reason=timeout_flush, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s"
+                    )
 
                 # --- Check if we should send pass-1 EOS ---
                 await self._maybe_emit_pass1_eos()
 
-                # Log loop timing periodically
+                # Log progress periodically
                 loop_time = time.perf_counter() - loop_start
                 if loop_count % 100 == 0:
                     logger.debug(
                         f"[TileBatcher] Loop #{loop_count}: {loop_time*1000:.1f}ms, "
-                        f"buffer={len(self._buffer)}, frames_tiled={frames_tiled}"
+                        f"buffer={len(self._buffer)}, pending={len(self._pending_tiles)}, "
+                        f"submitted={frames_submitted}"
                     )
 
-                # Yield to event loop
+                # Yield to event loop (allow pending tasks to progress)
                 await asyncio.sleep(0)
 
         except asyncio.CancelledError:
             logger.info("TileBatcher cancelled, cleaning up...")
+            # Cancel pending tasks
+            for task in self._pending_tiles:
+                task.cancel()
             raise
         except KeyboardInterrupt:
             logger.info("TileBatcher interrupted by user")
