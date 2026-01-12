@@ -406,10 +406,6 @@ MIN_H_PX_DEFAULT = 10           # minimum bbox height in px
 
 # TPS defaults
 TPS_SLICE_WIDTH_DEFAULT = 40
-TPS_MIN_POINTS_PER_WINDOW_DEFAULT = 25
-TPS_Y_LO_PCT_DEFAULT = 10.0
-TPS_Y_HI_PCT_DEFAULT = 90.0
-TPS_MAX_MISSING_WINDOWS_DEFAULT = 2
 TPS_ALPHA_DEFAULT = 0.5
 TPS_ADD_CORNERS_DEFAULT = True
 
@@ -736,107 +732,97 @@ def rotate_contours(
 
 
 # -----------------------------
-# TPS: robust contour-only detection (default)
+# TPS: optimized detection using small local mask (matches legacy accuracy)
 # -----------------------------
-def _robust_window_centerline_from_points(
-    xs: npt.NDArray[np.int32],
-    ys: npt.NDArray[np.int32],
-    *,
-    x0: int,
-    x1: int,
-    fallback_x: int,
-    fallback_y: int,
-    min_points: int,
-    y_lo_pct: float,
-    y_hi_pct: float,
-) -> Tuple[int, int, int, int]:
-    m = (xs >= x0) & (xs < x1)
-    n = int(np.count_nonzero(m))
-    if n < min_points:
-        return int(fallback_x), int(fallback_y), 0, n
-
-    wx = xs[m].astype(np.float32)
-    wy = ys[m].astype(np.float32)
-
-    cx = int(np.median(wx))
-    y_lo = float(np.percentile(wy, y_lo_pct))
-    y_hi = float(np.percentile(wy, y_hi_pct))
-
-    thickness = max(0, int(round(y_hi - y_lo)))
-    cy = int(round((y_lo + y_hi) * 0.5))
-    return cx, cy, thickness, n
-
-
-def _check_line_tps_geom_robust(
+def _check_line_tps_optimized(
     contour: npt.NDArray[np.int32],
     h: int,
     w: int,
     *,
     slice_width: int,
-    min_points_per_window: int,
-    y_lo_pct: float,
-    y_hi_pct: float,
-    max_missing_windows: int,
 ) -> Tuple[bool, Optional[List[List[int]]], Optional[List[List[int]]], float]:
+    """
+    Optimized TPS detection that matches legacy accuracy but avoids:
+    - Full (h,w) mask allocation (uses bbox-sized mask instead)
+    - Multiple findContours calls (computes stats directly on mask)
+    """
     x, y, bw, bh = cv2.boundingRect(contour)
-
-    pts = contour.reshape(-1, 2)  # (N,2) (x,y)
-    xs = pts[:, 0]
-    ys = pts[:, 1]
-
-    win = [
+    
+    # Create small mask just for the bounding box (not full image)
+    local_mask = np.zeros((bh, bw), dtype=np.uint8)
+    
+    # Shift contour to local coordinates
+    local_contour = contour.copy()
+    local_contour = local_contour.reshape(-1, 2)
+    local_contour[:, 0] -= x
+    local_contour[:, 1] -= y
+    local_contour = local_contour.reshape(-1, 1, 2)
+    
+    cv2.drawContours(local_mask, [local_contour], contourIdx=0, color=255, thickness=-1)
+    
+    def clamp(a: int, lo: int, hi: int) -> int:
+        return max(lo, min(hi, a))
+    
+    # 5 slice x-ranges (in global coordinates, then convert to local)
+    slices_global = [
         (x, x + slice_width),
         (x + bw // 4 - slice_width, x + bw // 4),
         (x + bw // 2, x + bw // 2 + slice_width),
         (x + bw // 2 + bw // 4, x + bw // 2 + (bw // 4) + slice_width),
         (x + bw - slice_width, x + bw),
     ]
-
-    def clamp(a: int, lo: int, hi: int) -> int:
-        return max(lo, min(hi, a))
-
-    win = [(clamp(a, 0, w), clamp(b, 0, w)) for (a, b) in win]
-
-    fallback_x = x + bw // 2
-    fallback_y = y + bh // 2
-    fallback_th = max(1, bh)
-
+    slices_global = [(clamp(a, x, x + bw), clamp(b, x, x + bw)) for (a, b) in slices_global]
+    
     centers_xy: List[Tuple[int, int]] = []
     thicknesses: List[int] = []
-    missing = 0
-
-    for (x0, x1) in win:
-        cx, cy, th, _n = _robust_window_centerline_from_points(
-            xs, ys,
-            x0=x0, x1=x1,
-            fallback_x=fallback_x,
-            fallback_y=fallback_y,
-            min_points=min_points_per_window,
-            y_lo_pct=y_lo_pct,
-            y_hi_pct=y_hi_pct,
-        )
-
-        if th <= 0:
-            missing += 1
-            th = fallback_th
-
-        centers_xy.append((cx, cy))
-        thicknesses.append(th)
-
-    if missing > max_missing_windows:
-        return False, None, None, 0.0
-
-    all_centers_y = [cy for (_, cy) in centers_xy]
-    max_ydelta = float(max(all_centers_y) - min(all_centers_y))
+    
+    for (gx0, gx1) in slices_global:
+        # Convert to local mask coordinates
+        lx0, lx1 = gx0 - x, gx1 - x
+        if lx1 <= lx0:
+            # Degenerate slice
+            centers_xy.append((gx0 + slice_width // 2, y + bh // 2))
+            thicknesses.append(bh)
+            continue
+        
+        slice_col = local_mask[:, lx0:lx1]
+        
+        # Find rows with any white pixels in this slice
+        row_has_content = np.any(slice_col > 0, axis=1)
+        rows_with_content = np.where(row_has_content)[0]
+        
+        if len(rows_with_content) == 0:
+            # No content in slice - use fallback
+            centers_xy.append((gx0 + (lx1 - lx0) // 2, y + bh // 2))
+            thicknesses.append(bh)
+            continue
+        
+        # Compute center and thickness from the filled region
+        y_min_local = int(rows_with_content[0])
+        y_max_local = int(rows_with_content[-1])
+        slice_height = y_max_local - y_min_local + 1
+        
+        # Center y in global coordinates
+        cy_local = (y_min_local + y_max_local) // 2
+        cy_global = y + cy_local
+        
+        # Center x: use middle of slice (like legacy does approximately)
+        cx_global = gx0 + (lx1 - lx0) // 2
+        
+        centers_xy.append((cx_global, cy_global))
+        thicknesses.append(slice_height)
+    
+    all_cy = [cy for (_, cy) in centers_xy]
+    max_ydelta = float(max(all_cy) - min(all_cy))
     mean_th = float(np.mean(thicknesses))
-    mean_center_y = float(np.mean(all_centers_y))
-
+    mean_cy = float(np.mean(all_cy))
+    
     if max_ydelta > mean_th:
-        target_y = int(round(mean_center_y))
-        input_pts = [[cy, cx] for (cx, cy) in centers_xy]          # [y,x]
-        output_pts = [[target_y, cx] for (cx, cy) in centers_xy]   # [y,x]
+        target_y = int(round(mean_cy))
+        input_pts = [[cy, cx] for (cx, cy) in centers_xy]
+        output_pts = [[target_y, cx] for (cx, cy) in centers_xy]
         return True, input_pts, output_pts, max_ydelta
-
+    
     return False, None, None, 0.0
 
 
@@ -939,12 +925,8 @@ def get_tps_points(
     h: int,
     w: int,
     *,
-    legacy_tps_detect: bool = False, # same (costly) behavior as v1 app
+    legacy_tps_detect: bool = False,  # uses full-mask approach (slower but original behavior)
     slice_width: int = TPS_SLICE_WIDTH_DEFAULT,
-    min_points_per_window: int = TPS_MIN_POINTS_PER_WINDOW_DEFAULT,
-    y_lo_pct: float = TPS_Y_LO_PCT_DEFAULT,
-    y_hi_pct: float = TPS_Y_HI_PCT_DEFAULT,
-    max_missing_windows: int = TPS_MAX_MISSING_WINDOWS_DEFAULT,
     alpha: float = TPS_ALPHA_DEFAULT,
     add_corners: bool = True,
 ) -> Optional[Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
@@ -967,13 +949,9 @@ def get_tps_points(
                 cnt, h, w, slice_width=slice_width
             )
         else:
-            tps_status, input_pts, output_pts, max_yd = _check_line_tps_geom_robust(
+            tps_status, input_pts, output_pts, max_yd = _check_line_tps_optimized(
                 cnt, h, w,
                 slice_width=slice_width,
-                min_points_per_window=min_points_per_window,
-                y_lo_pct=y_lo_pct,
-                y_hi_pct=y_hi_pct,
-                max_missing_windows=max_missing_windows,
             )
 
         line_data.append(
