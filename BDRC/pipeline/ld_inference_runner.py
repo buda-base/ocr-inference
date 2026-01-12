@@ -401,13 +401,14 @@ class LDInferenceRunner:
     # Batch processing
     # -------------------------------------------------------------------------
 
-    async def _process_batch(self, batch: TiledBatch) -> Optional[InferTiming]:
+    async def _process_batch(self, batch: TiledBatch) -> Tuple[Optional[InferTiming], float]:
         """
         Process a TiledBatch: run GPU inference, stitch, emit results.
         
         Returns:
-            InferTiming if successful, None on error.
+            Tuple of (InferTiming if successful else None, emit_time_seconds).
         """
+        emit_time = 0.0
         try:
             results, timing = infer_batch(
                 self.model,
@@ -417,10 +418,12 @@ class LDInferenceRunner:
                 self.patch_size,
             )
 
+            emit_start = time.perf_counter()
             for meta, mask_np in results:
                 await self._emit_result(meta, mask_np)
+            emit_time = time.perf_counter() - emit_start
             
-            return timing
+            return timing, emit_time
 
         except Exception as e:
             # On error, emit PipelineError for each frame in the batch
@@ -435,7 +438,7 @@ class LDInferenceRunner:
                     retryable=retryable,
                     attempt=1,
                 )
-            return None
+            return None, 0.0
 
     # -------------------------------------------------------------------------
     # Main run loop
@@ -451,6 +454,7 @@ class LDInferenceRunner:
         # Timing stats
         batches_processed = 0
         total_wait_time = 0.0
+        total_emit_time = 0.0  # Time emitting results to queues
         total_tiles = 0
         total_frames = 0
         
@@ -461,6 +465,10 @@ class LDInferenceRunner:
         total_d2h_ms = 0.0
         
         detailed_timing = getattr(self.cfg, "detailed_inference_timing", False)
+        
+        # Track time from GPU perspective
+        run_start_time = time.perf_counter()
+        last_batch_end_time = None  # Time when last batch finished (including emission)
         
         try:
             while True:
@@ -492,6 +500,10 @@ class LDInferenceRunner:
                         total_transfer_ms = total_h2d_ms + total_d2h_ms
                         total_gpu_ms = total_forward_ms + total_stitch_ms
                         
+                        # Calculate actual GPU utilization
+                        run_total_time = time.perf_counter() - run_start_time
+                        gpu_utilization = (total_infer_ms / 1000) / run_total_time * 100 if run_total_time > 0 else 0
+                        
                         logger.info(
                             f"[InferenceRunner] DONE - batches={batches_processed}, frames={total_frames}, tiles={total_tiles}"
                         )
@@ -503,10 +515,16 @@ class LDInferenceRunner:
                             f"stitch={total_stitch_ms:.0f}ms ({100*total_stitch_ms/total_infer_ms:.1f}%), "
                             f"d2h={total_d2h_ms:.0f}ms ({100*total_d2h_ms/total_infer_ms:.1f}%)"
                         ) if total_infer_ms > 0 else None
+                        
+                        # Key insight: GPU utilization shows if GPU is the bottleneck
+                        # - >80%: GPU is bottleneck (good!)
+                        # - <50%: Pipeline is bottleneck (GPU starved)
                         logger.info(
-                            f"[InferenceRunner] GPU busy={total_gpu_ms:.0f}ms, PCIe transfers={total_transfer_ms:.0f}ms, "
-                            f"queue_wait={total_wait_time*1000:.0f}ms"
+                            f"[InferenceRunner] GPU UTILIZATION: {gpu_utilization:.1f}% "
+                            f"(run={run_total_time:.1f}s, gpu_work={total_infer_ms/1000:.1f}s, "
+                            f"queue_wait={total_wait_time:.1f}s, emit={total_emit_time:.1f}s)"
                         )
+                        
                         if total_infer_ms > 0:
                             logger.info(
                                 f"[InferenceRunner] Throughput: {total_tiles/(total_infer_ms/1000):.1f} tiles/s, "
@@ -531,7 +549,8 @@ class LDInferenceRunner:
                     n_tiles = msg.all_tiles.shape[0]
                     n_frames = len(msg.metas)
                     
-                    timing = await self._process_batch(msg)
+                    timing, emit_time = await self._process_batch(msg)
+                    total_emit_time += emit_time
                     
                     if timing:
                         total_tiles += n_tiles
@@ -552,7 +571,7 @@ class LDInferenceRunner:
                                 f"total={timing.total_ms:.1f}ms ({tiles_per_sec:.0f} t/s) | "
                                 f"h2d={timing.h2d_ms:.1f}ms, fwd={timing.forward_ms:.1f}ms, "
                                 f"stitch={timing.stitch_ms:.1f}ms, d2h={timing.d2h_ms:.1f}ms | "
-                                f"wait={wait_time*1000:.0f}ms"
+                                f"wait={wait_time*1000:.0f}ms, emit={emit_time*1000:.0f}ms"
                             )
                         else:
                             logger.info(
