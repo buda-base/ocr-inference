@@ -147,17 +147,36 @@ class LDPostProcessor:
         p2_count = 0
         total_p1_time = 0.0
         total_p2_time = 0.0
+        
+        # NEW: Detailed timing for diagnosing overhead
+        total_p1_wait_time = 0.0  # Time waiting for pass 1 queue
+        total_p2_wait_time = 0.0  # Time waiting for pass 2 queue
+        total_idle_time = 0.0     # Time in sleep(0) / no work available
+        pass2_submitted = 0       # Count of frames sent to pass 2
+        transform_time = 0.0      # Time spent in apply_transform_1
+        p1_eos_time = None        # When we received pass 1 EOS
+        p2_eos_time = None        # When we received pass 2 EOS
 
         while True:
+            loop_start = time.perf_counter()
+            
             # Terminate only after both GPU streams have ended.
             if self._p1_done and self._p2_done:
                 run_time = time.perf_counter() - run_start
                 avg_p1 = total_p1_time / max(1, p1_count)
                 avg_p2 = total_p2_time / max(1, p2_count)
+                # Calculate time between EOS events
+                eos_gap = (p2_eos_time - p1_eos_time) if (p1_eos_time and p2_eos_time) else 0.0
                 logger.info(
                     f"[PostProcessor] DONE - p1={p1_count} ({total_p1_time:.2f}s, avg={avg_p1*1000:.1f}ms), "
                     f"p2={p2_count} ({total_p2_time:.2f}s, avg={avg_p2*1000:.1f}ms), "
                     f"run_time={run_time:.2f}s"
+                )
+                logger.info(
+                    f"[PostProcessor] TIMING BREAKDOWN: "
+                    f"p1_wait={total_p1_wait_time:.2f}s, p2_wait={total_p2_wait_time:.2f}s, "
+                    f"idle={total_idle_time:.2f}s, transform={transform_time:.2f}s, "
+                    f"pass2_submitted={pass2_submitted}, eos_gap={eos_gap:.2f}s"
                 )
                 await self.q_post_processor_to_writer.put(EndOfStream(stream="record", producer="LDPostProcessor"))
                 return
@@ -167,13 +186,17 @@ class LDPostProcessor:
             # --- Prefer gpu_pass_2 results (non-blocking check since often empty) ---
             if not self._p2_done:
                 for _ in range(p2_budget):
+                    wait_start = time.perf_counter()
                     msg = self._try_get_nowait(self.q_second)
+                    # Note: _try_get_nowait doesn't actually wait, but track for consistency
                     if msg is None:
                         break
                     took = True
 
                     if isinstance(msg, EndOfStream) and msg.stream == "gpu_pass_2":
                         self._p2_done = True
+                        p2_eos_time = time.perf_counter() - run_start
+                        logger.info(f"[PostProcessor] Received gpu_pass_2 EOS at t={p2_eos_time:.2f}s")
                         break
 
                     if isinstance(msg, PipelineError):
@@ -203,11 +226,13 @@ class LDPostProcessor:
             if not self._p1_done:
                 for i in range(p1_budget):
                     # First try non-blocking, then one blocking attempt at the end
+                    wait_start = time.perf_counter()
                     if i < p1_budget - 1:
                         msg = self._try_get_nowait(self.q_first)
                     else:
                         # Last iteration: use blocking to avoid busy-spin
                         msg = await self._pop_one(self.q_first, timeout_s)
+                        total_p1_wait_time += time.perf_counter() - wait_start
                     
                     if msg is None:
                         break
@@ -215,6 +240,8 @@ class LDPostProcessor:
 
                     if isinstance(msg, EndOfStream) and msg.stream == "gpu_pass_1":
                         self._p1_done = True
+                        p1_eos_time = time.perf_counter() - run_start
+                        logger.info(f"[PostProcessor] Received gpu_pass_1 EOS at t={p1_eos_time:.2f}s")
                         # No more pass1 frames => no more reprocess frames will be generated.
                         await self.q_post_processor_to_gpu_pass_2.put(
                             EndOfStream(stream="transformed_pass_1", producer="LDPostProcessor")
@@ -228,9 +255,14 @@ class LDPostProcessor:
                     frame: InferredFrame = msg
                     try:
                         t0 = time.perf_counter()
-                        await self._handle_pass1(frame)
-                        total_p1_time += time.perf_counter() - t0
+                        needs_pass2 = await self._handle_pass1(frame)
+                        elapsed = time.perf_counter() - t0
+                        total_p1_time += elapsed
                         p1_count += 1
+                        if needs_pass2:
+                            pass2_submitted += 1
+                            # Attribute most of the time to transform if pass2 was needed
+                            transform_time += elapsed * 0.5  # Rough estimate
                     except Exception as e:
                         await self._emit_pipeline_error(
                             internal_stage="run.handle_pass1",
@@ -242,9 +274,17 @@ class LDPostProcessor:
                         )
 
             if not took:
+                idle_start = time.perf_counter()
                 await asyncio.sleep(0)
+                total_idle_time += time.perf_counter() - idle_start
 
-    async def _handle_pass1(self, inf_frame: InferredFrame) -> None:
+    async def _handle_pass1(self, inf_frame: InferredFrame) -> bool:
+        """
+        Handle a pass 1 frame: analyze contours, decide if pass 2 is needed.
+        
+        Returns:
+            True if frame was sent to pass 2, False if finalized directly.
+        """
         # Decode packed-bit masks if GPU stage sent them
         line_mask = _decode_line_mask(inf_frame.line_mask)
         # Check debug mode once and reuse
@@ -312,7 +352,7 @@ class LDPostProcessor:
                 contours_bboxes=contours_bboxes,
             )
             await self.q_post_processor_to_writer.put(rec)
-            return
+            return False  # Finalized directly, no pass 2
 
         input_pts = output_pts = None
         alpha = None
@@ -347,6 +387,7 @@ class LDPostProcessor:
                 tps_data=(input_pts, output_pts, alpha),
             )
         )
+        return True  # Sent to pass 2
 
     async def _finalize_record(self, inf_frame: InferredFrame) -> None:
         # Decode packed-bit masks if GPU stage sent them

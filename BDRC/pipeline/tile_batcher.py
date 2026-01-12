@@ -400,6 +400,10 @@ class TileBatcher:
             frames_to_take += 1
             total_tiles += n_tiles
         
+        # Track batch composition (pass 1 vs pass 2)
+        p1_count = 0
+        p2_count = 0
+        
         # Second pass: collect the frames
         for entry in self._buffer[:frames_to_take]:
             tiles = entry["tiles"]
@@ -407,6 +411,12 @@ class TileBatcher:
             
             tile_ranges.append((offset, offset + n_tiles))
             all_tiles.append(tiles)
+            
+            # Track pass composition
+            if entry["second_pass"]:
+                p2_count += 1
+            else:
+                p1_count += 1
             
             metas.append({
                 "dec_frame": entry["dec_frame"],
@@ -431,11 +441,17 @@ class TileBatcher:
         # Remove taken frames from buffer
         self._buffer = self._buffer[frames_to_take:]
         
-        return TiledBatch(
+        # Store composition for logging (will be used by caller)
+        batch = TiledBatch(
             all_tiles=all_tiles_tensor,
             tile_ranges=tile_ranges,
             metas=metas,
         )
+        # Attach composition info as attributes for logging
+        batch._p1_count = p1_count
+        batch._p2_count = p2_count
+        
+        return batch
 
     # -------------------------------------------------------------------------
     # Queue helpers
@@ -503,6 +519,11 @@ class TileBatcher:
         frames_submitted = 0
         batches_emitted = 0
         
+        # Pass composition stats (for diagnosing pass-2 overhead)
+        total_p1_frames = 0
+        total_p2_frames = 0
+        p2_only_batches = 0  # Batches with only pass-2 frames (inefficient)
+        
         # Max frames to have in-flight (tiling) at once
         max_inflight = self.tile_workers * 2  # 2x workers for good overlap
         
@@ -531,6 +552,12 @@ class TileBatcher:
                         f"batches={batches_emitted}, total_wait={total_wait_time:.2f}s, "
                         f"total_tile={total_tile_time:.2f}s, total_emit={total_batch_emit_time:.2f}s"
                     )
+                    # Log pass composition summary if any pass-2 frames were processed
+                    if total_p2_frames > 0:
+                        logger.info(
+                            f"[TileBatcher] COMPOSITION: p1_frames={total_p1_frames}, p2_frames={total_p2_frames}, "
+                            f"p2_only_batches={p2_only_batches} (potential inefficiency if >0)"
+                        )
                     # Flush remaining buffer
                     if self._buffer:
                         batch = self._prepare_batch()
@@ -579,6 +606,9 @@ class TileBatcher:
                     batch = self._prepare_batch()
                     n_frames = len(batch.metas)  # Actual frames in batch (after max_tiles limit)
                     n_tiles = batch.all_tiles.shape[0]
+                    # Get batch composition (p1/p2)
+                    p1_count = getattr(batch, '_p1_count', 0)
+                    p2_count = getattr(batch, '_p2_count', 0)
                     
                     put_start = time.perf_counter()
                     await self.q_to_inference.put(batch)
@@ -588,8 +618,16 @@ class TileBatcher:
                     total_batch_emit_time += emit_time
                     batches_emitted += 1
                     
+                    # Track composition totals
+                    total_p1_frames += p1_count
+                    total_p2_frames += p2_count
+                    if p1_count == 0 and p2_count > 0:
+                        p2_only_batches += 1
+                    
+                    # Only show composition if there are pass-2 frames
+                    composition = f", p1={p1_count}/p2={p2_count}" if p2_count > 0 else ""
                     logger.info(
-                        f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles, "
+                        f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles{composition}, "
                         f"reason=full, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s, "
                         f"pending={len(self._pending_tiles)}, buffer={len(self._buffer)}"
                     )
@@ -694,6 +732,9 @@ class TileBatcher:
                         batch = self._prepare_batch()
                         n_frames = len(batch.metas)  # Actual frames in batch
                         n_tiles = batch.all_tiles.shape[0]
+                        # Get batch composition (p1/p2)
+                        p1_count = getattr(batch, '_p1_count', 0)
+                        p2_count = getattr(batch, '_p2_count', 0)
                         
                         put_start = time.perf_counter()
                         await self.q_to_inference.put(batch)
@@ -703,9 +744,16 @@ class TileBatcher:
                         total_batch_emit_time += emit_time
                         batches_emitted += 1
                         
+                        # Track composition totals
+                        total_p1_frames += p1_count
+                        total_p2_frames += p2_count
+                        if p1_count == 0 and p2_count > 0:
+                            p2_only_batches += 1
+                        
                         reason = "decoder_done" if self._decoder_done else "nearly_full"
+                        composition = f", p1={p1_count}/p2={p2_count}" if p2_count > 0 else ""
                         logger.info(
-                            f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles, "
+                            f"[TileBatcher] Emitted batch #{batches_emitted}: {n_frames} frames, {n_tiles} tiles{composition}, "
                             f"reason={reason}, prepare={emit_time-put_time:.3f}s, put_wait={put_time:.3f}s"
                         )
                     else:
