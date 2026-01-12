@@ -255,14 +255,13 @@ class LDPostProcessor:
                     frame: InferredFrame = msg
                     try:
                         t0 = time.perf_counter()
-                        needs_pass2 = await self._handle_pass1(frame)
+                        needs_pass2, frame_transform_time = await self._handle_pass1(frame)
                         elapsed = time.perf_counter() - t0
                         total_p1_time += elapsed
                         p1_count += 1
                         if needs_pass2:
                             pass2_submitted += 1
-                            # Attribute most of the time to transform if pass2 was needed
-                            transform_time += elapsed * 0.5  # Rough estimate
+                            transform_time += frame_transform_time
                     except Exception as e:
                         await self._emit_pipeline_error(
                             internal_stage="run.handle_pass1",
@@ -278,13 +277,16 @@ class LDPostProcessor:
                 await asyncio.sleep(0)
                 total_idle_time += time.perf_counter() - idle_start
 
-    async def _handle_pass1(self, inf_frame: InferredFrame) -> bool:
+    async def _handle_pass1(self, inf_frame: InferredFrame) -> Tuple[bool, float]:
         """
         Handle a pass 1 frame: analyze contours, decide if pass 2 is needed.
         
         Returns:
-            True if frame was sent to pass 2, False if finalized directly.
+            Tuple of (needs_pass2, transform_time_seconds):
+            - needs_pass2: True if frame was sent to pass 2, False if finalized directly
+            - transform_time_seconds: Time spent in apply_transform_1 (0.0 if no transform)
         """
+        import time
         # Decode packed-bit masks if GPU stage sent them
         line_mask = _decode_line_mask(inf_frame.line_mask)
         # Check debug mode once and reuse
@@ -352,7 +354,7 @@ class LDPostProcessor:
                 contours_bboxes=contours_bboxes,
             )
             await self.q_post_processor_to_writer.put(rec)
-            return False  # Finalized directly, no pass 2
+            return (False, 0.0)  # Finalized directly, no pass 2, no transform time
 
         input_pts = output_pts = None
         alpha = None
@@ -360,7 +362,21 @@ class LDPostProcessor:
             input_pts, output_pts = tps_points
             alpha = self.cfg.tps_alpha
 
-        transformed_frame = apply_transform_1(inf_frame.frame, rotation_angle, input_pts, output_pts, alpha)
+        # Run transform in thread pool to avoid blocking the event loop.
+        # This is critical: blocking transforms cause cascading pipeline stalls,
+        # starving the GPU and causing 20s+ of idle time.
+        transform_start = time.perf_counter()
+        loop = asyncio.get_event_loop()
+        transformed_frame = await loop.run_in_executor(
+            None,  # Use default thread pool
+            apply_transform_1,
+            inf_frame.frame,
+            rotation_angle,
+            input_pts,
+            output_pts,
+            alpha,
+        )
+        transform_elapsed = time.perf_counter() - transform_start
         
         # Debug: save TPS image (if TPS was applied)
         if debug_this_image and tps_points is not None:
@@ -387,7 +403,7 @@ class LDPostProcessor:
                 tps_data=(input_pts, output_pts, alpha),
             )
         )
-        return True  # Sent to pass 2
+        return (True, transform_elapsed)  # Sent to pass 2, with transform time
 
     async def _finalize_record(self, inf_frame: InferredFrame) -> None:
         # Decode packed-bit masks if GPU stage sent them
