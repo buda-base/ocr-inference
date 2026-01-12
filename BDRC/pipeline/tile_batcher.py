@@ -119,25 +119,20 @@ def tile_frame_sync(
         (tiles, x_steps, y_steps, pad_x, pad_y)
         - tiles: [N, 3, patch_size, patch_size] tensor in specified dtype (on CPU)
     """
-    # Convert to torch [1, H, W] - start with float32 for precision in padding/normalize
-    img = torch.from_numpy(gray).unsqueeze(0).float()
+    # Convert to torch [1, H, W] and normalize in one step
+    # Using the target dtype directly if possible to avoid extra conversion
+    img = torch.from_numpy(gray).unsqueeze(0).to(dtype).div_(255.0)
     
-    # Pad to multiple of patch_size (white background = 255)
-    img, pad_x, pad_y = pad_to_multiple(img, patch_size, value=255.0)
+    # Pad to multiple of patch_size (white background = 1.0 after normalization)
+    img, pad_x, pad_y = pad_to_multiple(img, patch_size, value=1.0)
     
-    # Tile the image
+    # Tile the image using unfold (creates views, very fast)
     tiles, x_steps, y_steps = tile_image(img, patch_size)
+    # tiles shape: [N, 1, patch_size, patch_size]
     
-    # Normalize to [0, 1]
-    tiles = tiles.div_(255.0)
-    
-    # Expand grayscale to 3 channels for model input
-    # tiles shape: [N, 1, H, W] -> [N, 3, H, W]
-    tiles = tiles.expand(-1, 3, -1, -1).contiguous()
-    
-    # Convert to target dtype (fp16/bf16 saves memory)
-    if dtype != torch.float32:
-        tiles = tiles.to(dtype)
+    # Expand grayscale to 3 channels using repeat (single operation)
+    # repeat() allocates new memory and copies, but is faster than expand+contiguous
+    tiles = tiles.repeat(1, 3, 1, 1)
     
     return tiles, x_steps, y_steps, pad_x, pad_y
 
