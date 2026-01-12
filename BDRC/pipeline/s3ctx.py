@@ -24,32 +24,45 @@ class S3Context:
         self._session = get_session()
         self._client = None
         self._client_ctx = None
+        self._lock: asyncio.Lock | None = None  # Created lazily
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Get or create the lock (must be in event loop context)."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def _ensure_client(self):
-        """Lazily create the shared S3 client on first use."""
+        """Lazily create the shared S3 client on first use (thread-safe)."""
         if self._client is not None:
             return
         
-        client_config = {
-            "region_name": self.cfg.s3_region,
-        }
-        
-        # Only use a profile if explicitly set to a non-default value
-        aws_profile = getattr(self.cfg, "aws_profile", None)
-        if aws_profile and aws_profile != "default":
-            client_config["profile_name"] = aws_profile
-        
-        logger.info(f"[S3Context] Creating shared S3 client (region={self.cfg.s3_region})")
-        self._client_ctx = self._session.create_client("s3", **client_config)
-        self._client = await self._client_ctx.__aenter__()
+        async with self._get_lock():
+            # Double-check after acquiring lock
+            if self._client is not None:
+                return
+            
+            client_config = {
+                "region_name": self.cfg.s3_region,
+            }
+            
+            # Only use a profile if explicitly set to a non-default value
+            aws_profile = getattr(self.cfg, "aws_profile", None)
+            if aws_profile and aws_profile != "default":
+                client_config["profile_name"] = aws_profile
+            
+            logger.info(f"[S3Context] Creating shared S3 client (region={self.cfg.s3_region})")
+            self._client_ctx = self._session.create_client("s3", **client_config)
+            self._client = await self._client_ctx.__aenter__()
 
     async def close(self):
         """Close the shared S3 client. Call this when done with all S3 operations."""
-        if self._client_ctx is not None:
-            await self._client_ctx.__aexit__(None, None, None)
-            self._client = None
-            self._client_ctx = None
-            logger.info("[S3Context] Closed shared S3 client")
+        async with self._get_lock():
+            if self._client_ctx is not None:
+                await self._client_ctx.__aexit__(None, None, None)
+                self._client = None
+                self._client_ctx = None
+                logger.info("[S3Context] Closed shared S3 client")
 
     @contextlib.asynccontextmanager
     async def client(self):
