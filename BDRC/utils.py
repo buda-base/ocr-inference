@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from datetime import datetime
 from math import ceil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import cv2
 import matplotlib.pyplot as plt
@@ -53,7 +53,7 @@ from BDRC.line_detection import (
 )
 from Config import (
     CHARSETENCODER,
-    OCRARCHITECTURE,
+    OCR_ARCHITECTURES,
     COLOR_DICT,
     LINE_DETECTION_SCHEMA,
 )
@@ -141,17 +141,17 @@ def read_layout_model_config(config_file: str) -> LayoutDetectionConfig:
     return config
 
 
-def get_charset(charset: str) -> List[str]:
+def get_charset(charset: str) -> list[str]:
     if isinstance(charset, str):
         charset = [x for x in charset]
 
-    elif isinstance(charset, List):
+    elif isinstance(charset, list):
         charset = charset
 
     return [x for x in charset]
 
 
-def get_execution_providers() -> List[str]:
+def get_execution_providers() -> list[str]:
     """
     Get available ONNX runtime execution providers.
 
@@ -233,7 +233,7 @@ def build_ocr_data(id_val, file_path: str, target_width: int = 2048):
     return ocr_data
 
 
-def read_theme_file(file_path: str) -> Dict | None:
+def read_theme_file(file_path: str) -> dict | None:
     """
     Load theme configuration from a JSON file.
 
@@ -344,9 +344,12 @@ def read_ocr_model_config(config_file: str):
     characters = json_content["charset"]
     add_blank = True if json_content["add_blank"] == "yes" else False
 
+    if architecture not in list(OCR_ARCHITECTURES.keys()):
+        raise ValueError("Unsupported OCR Architecture provided.")
+
     config = OCRModelConfig(
         onnx_model_file,
-        OCRARCHITECTURE[architecture],
+        OCR_ARCHITECTURES[architecture],
         input_width,
         input_height,
         input_layer,
@@ -362,7 +365,7 @@ def read_ocr_model_config(config_file: str):
     return config
 
 
-def resize_to_height(image, target_height: int):
+def resize_to_height(image: NDArray, target_height: int) -> tuple[NDArray, float]:
     """
     Resize image to a specific height while maintaining aspect ratio.
 
@@ -382,7 +385,7 @@ def resize_to_height(image, target_height: int):
     return image, scale_ratio
 
 
-def resize_to_width(image: NDArray, target_width: int = 2048):
+def resize_to_width(image: NDArray, target_width: int = 2048) -> tuple[NDArray, float]:
     """
     Resize image to a specific width while maintaining aspect ratio.
 
@@ -402,7 +405,7 @@ def resize_to_width(image: NDArray, target_width: int = 2048):
     return image, scale_ratio
 
 
-def calculate_steps(image: NDArray, patch_size: int = 512) -> Tuple[int, int]:
+def calculate_steps(image: NDArray, patch_size: int = 512) -> tuple[int, int]:
     """
     Calculate number of patches needed to tile an image.
 
@@ -424,7 +427,7 @@ def calculate_steps(image: NDArray, patch_size: int = 512) -> Tuple[int, int]:
 
 def calculate_paddings(
     image: NDArray, x_steps: int, y_steps: int, patch_size: int = 512
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """
     Calculate padding needed to make image divisible into patches.
 
@@ -468,7 +471,7 @@ def pad_image(image: NDArray, pad_x: int, pad_y: int, pad_value: int = 0) -> NDA
     return padded_img
 
 
-def sigmoid(x):
+def sigmoid(x) -> float:
     """
     Apply sigmoid activation function.
 
@@ -483,7 +486,7 @@ def sigmoid(x):
 
 def get_text_area(
     image: NDArray, prediction: NDArray
-) -> Tuple[NDArray, BBox] | Tuple[None, None, None]:
+) -> tuple[NDArray, BBox] | tuple[None, None, None]:
     dil_kernel = np.ones((12, 2))
     dil_prediction = cv2.dilate(prediction, kernel=dil_kernel, iterations=10)
 
@@ -516,7 +519,7 @@ def get_text_area(
         return None, None, None
 
 
-def get_text_bbox(lines: List[Line]):
+def get_text_bbox(lines: list[Line]):
     all_bboxes = [x.bbox for x in lines]
     min_x = min(a.x for a in all_bboxes)
     min_y = min(a.y for a in all_bboxes)
@@ -529,7 +532,7 @@ def get_text_bbox(lines: List[Line]):
     return bbox
 
 
-def pol2cart(theta, rho):
+def pol2cart(theta, rho) -> tuple[float, float]:
     x = rho * np.cos(theta)
     y = rho * np.sin(theta)
     return x, y
@@ -541,7 +544,7 @@ def cart2pol(x, y):
     return theta, rho
 
 
-def rotate_contour(cnt, center: Tuple[int, int], angle: float):
+def rotate_contour(cnt, center: tuple[int, int], angle: float):
     cx = center[0]
     cy = center[1]
 
@@ -566,13 +569,13 @@ def rotate_contour(cnt, center: Tuple[int, int], angle: float):
     return cnt_rotated
 
 
-def is_inside_rectangle(point, rect):
+def is_inside_rectangle(point: tuple, rect: tuple) -> bool:
     x, y = point
     xmin, ymin, xmax, ymax = rect
     return xmin <= x <= xmax and ymin <= y <= ymax
 
 
-def filter_contours(prediction: NDArray, textarea_contour: NDArray) -> List[NDArray]:
+def filter_contours(prediction: NDArray, textarea_contour: NDArray) -> list[NDArray]:
     filtered_contours = []
     x, y, w, h = cv2.boundingRect(textarea_contour)
     line_contours, _ = cv2.findContours(
@@ -609,7 +612,7 @@ def post_process_prediction(image: NDArray, prediction: NDArray):
         return None, None, None, None
 
 
-def generate_line_preview(prediction: NDArray, filtered_contours: List[NDArray]):
+def generate_line_preview(prediction: NDArray, filtered_contours: list[NDArray]) -> NDArray:
     preview = np.zeros(shape=prediction.shape, dtype=np.uint8)
 
     for cnt in filtered_contours:
@@ -618,7 +621,7 @@ def generate_line_preview(prediction: NDArray, filtered_contours: List[NDArray])
     return preview
 
 
-def tile_image(padded_img: NDArray, patch_size: int = 512):
+def tile_image(padded_img: NDArray, patch_size: int = 512) -> tuple[list[NDArray], int]:
     x_steps = int(padded_img.shape[1] / patch_size)
     y_steps = int(padded_img.shape[0] / patch_size)
     y_splits = np.split(padded_img, y_steps, axis=0)
@@ -637,7 +640,7 @@ def stitch_predictions(prediction: NDArray, y_steps: int) -> NDArray:
     return concat_img
 
 
-def get_paddings(image: NDArray, patch_size: int = 512) -> Tuple[int, int]:
+def get_paddings(image: NDArray, patch_size: int = 512) -> tuple[int, int]:
     max_x = ceil(image.shape[1] / patch_size) * patch_size
     max_y = ceil(image.shape[0] / patch_size) * patch_size
     pad_x = max_x - image.shape[1]
@@ -652,7 +655,7 @@ def preprocess_image(
     clamp_width: int = 4096,
     clamp_height: int = 2048,
     clamp_size: bool = True,
-):
+) -> tuple[NDArray, int, int]:
     """
     Preprocess image for OCR by resizing and padding to patch-compatible dimensions.
 
@@ -809,10 +812,10 @@ def pad_ocr_line(
 
 def create_preview_image(
     image: NDArray,
-    image_predictions: Optional[List],
-    line_predictions: Optional[List],
-    caption_predictions: Optional[List],
-    margin_predictions: Optional[List],
+    image_predictions: Optional[list],
+    line_predictions: Optional[list],
+    caption_predictions: Optional[list],
+    margin_predictions: Optional[list],
     alpha: float = 0.4,
 ) -> NDArray:
     mask = np.zeros(image.shape, dtype=np.uint8)

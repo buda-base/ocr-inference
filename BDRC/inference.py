@@ -1,4 +1,4 @@
-from typing import List, Tuple, Union
+from typing import Union
 
 import os
 import cv2
@@ -17,10 +17,12 @@ from scipy.special import softmax
 
 from torch.utils.data import Dataset
 from torchvision.io import read_image
+from tqdm import tqdm
 
 from BDRC.data import (
     CharsetEncoder,
     Encoding,
+    EvaluationSet,
     DewarpingResult,
     LayoutDetectionConfig,
     Line,
@@ -30,6 +32,8 @@ from BDRC.data import (
     OpStatus,
 )
 from BDRC.image_dewarping import apply_global_tps, check_for_tps
+from BDRC.label_encoder import WylieEncoder
+
 from BDRC.line_detection import (
     build_line_data,
     build_raw_line_data,
@@ -41,10 +45,12 @@ from BDRC.line_detection import (
 from BDRC.utils import (
     binarize,
     get_execution_providers,
+    get_filename,
     normalize,
     pad_to_height,
     pad_to_width,
     preprocess_image,
+    read_ocr_model_config,
     sigmoid,
     stitch_predictions,
     tile_image,
@@ -53,12 +59,12 @@ from Config import COLOR_DICT
 
 
 class CTCDecoder:
-    def __init__(self, charset: str | List[str], add_blank: bool):
+    def __init__(self, charset: str | list[str], add_blank: bool):
 
         if isinstance(charset, str):
             self.charset = [x for x in charset]
 
-        elif isinstance(charset, List):
+        elif isinstance(charset, list):
             self.charset = charset
 
         self.ctc_vocab = self.charset.copy()
@@ -71,14 +77,15 @@ class CTCDecoder:
     def encode(self, label: str):
         return [self.charset.index(x) + 1 for x in label]
 
-    def decode(self, inputs: List[int]) -> str:
+    def decode(self, inputs: list[int]) -> str:
         return "".join(self.charset[x - 1] for x in inputs)
 
     def ctc_decode(self, logits: NDArray) -> str:
         return self.ctc_decoder.decode(logits).replace(" ", "")
 
-    def ctc_beam_decode(self, logits: NDArray) ->List[OutputBeam]:
+    def ctc_beam_decode(self, logits: NDArray) -> list[OutputBeam]:
         return self.ctc_decoder.decode_beams(logits)
+
 
 class Detection:
     def __init__(self, config: LineDetectionConfig | LayoutDetectionConfig):
@@ -153,7 +160,7 @@ class LayoutDetection(Detection):
 
     def _get_contours(
         self, prediction: NDArray, optimize: bool = True, size_tresh: int = 200
-    ) -> List:
+    ) -> list:
         prediction = np.where(prediction > 200, 255, 0)
         prediction = prediction.astype(np.uint8)
 
@@ -251,9 +258,7 @@ class OCRInference:
         self._squeeze_channel_dim = ocr_config.squeeze_channel
         self._swap_hw = ocr_config.swap_hw
         self._execution_providers = get_execution_providers()
-        self.ocr_session = ort.InferenceSession(
-            self._onnx_model_file, providers=self._execution_providers
-        )
+        self.ocr_session = ort.InferenceSession(self._onnx_model_file)
         self._add_blank = ocr_config.add_blank
         self.decoder = CTCDecoder(self._characters, self._add_blank)
 
@@ -305,6 +310,8 @@ class OCRInference:
 
     def _predict(self, image_batch: NDArray) -> NDArray:
         image_batch = image_batch.astype(np.float32)
+
+        #print(f"ImageBatch: {image_batch.shape}")
         ort_batch = ort.OrtValue.ortvalue_from_numpy(image_batch)
         ocr_results = self.ocr_session.run_with_ort_values(
             [self._output_layer], {self._input_layer: ort_batch}
@@ -322,18 +329,18 @@ class OCRInference:
             )  # adjust logits to have shape time, vocab
 
         return self.decoder.ctc_decode(logits)
-    
-    
-    def _decode_beams(self, logits: NDArray) -> List[OutputBeam]:
+
+    def _decode_beams(self, logits: NDArray) -> list[OutputBeam]:
         if logits.shape[0] == len(self.decoder.ctc_vocab):
             logits = np.transpose(
                 logits, axes=[1, 0]
             )  # adjust logits to have shape time, vocab
 
         return self.decoder.ctc_beam_decode(logits)
-    
 
-    def run_beam_code(self, line_image: NDArray, pre_pad: bool = True) -> List[OutputBeam]:
+    def run_beam_code(
+        self, line_image: NDArray, pre_pad: bool = True
+    ) -> list[OutputBeam]:
         if pre_pad:
             line_image = self._pre_pad(line_image)
         line_image = self._prepare_ocr_line(line_image)
@@ -346,7 +353,6 @@ class OCRInference:
 
         logits = self._predict(line_image)
         return self._decode_beams(logits)
-    
 
     def run(self, line_image: NDArray, pre_pad: bool = True) -> str:
 
@@ -361,6 +367,7 @@ class OCRInference:
             line_image = np.expand_dims(line_image, axis=1)
 
         logits = self._predict(line_image)
+        #print(f"Logits: {logits.shape}")
         return self._decode(logits)
 
 
@@ -419,15 +426,21 @@ class OCRPipeline:
     # These methods break down the OCR pipeline into discrete stages
     # that can be called individually or composed together.
 
-    def detect_lines(self, image: NDArray) -> Tuple[OpStatus, NDArray | str]:
+    def detect_lines(self, image: NDArray) -> tuple[OpStatus, NDArray | str]:
         """Stage 1: Run line/layout detection to get line mask.
 
         Returns:
             (OpStatus.SUCCESS, line_mask) or (OpStatus.FAILED, error_message)
         """
-        if isinstance(self.line_config, LineDetectionConfig) and self.line_inference is not None:
+        if (
+            isinstance(self.line_config, LineDetectionConfig)
+            and self.line_inference is not None
+        ):
             line_mask = self.line_inference.predict(image)
-        elif isinstance(self.line_config, LayoutDetectionConfig) and self.line_inference is not None:
+        elif (
+            isinstance(self.line_config, LayoutDetectionConfig)
+            and self.line_inference is not None
+        ):
             layout_mask = self.line_inference.predict(image)
             line_mask = layout_mask[:, :, self.line_config.classes.index("line")]
 
@@ -435,7 +448,7 @@ class OCRPipeline:
 
     def build_lines(
         self, image: NDArray, line_mask: NDArray
-    ) -> Tuple[OpStatus, Tuple[NDArray, NDArray, List, List, float] | str]:
+    ) -> tuple[OpStatus, tuple[NDArray, NDArray, list, list, float] | str]:
         """Stage 2: Build and filter line contours from mask.
 
         Returns:
@@ -464,11 +477,11 @@ class OCRPipeline:
         self,
         rot_img: NDArray,
         rot_mask: NDArray,
-        filtered_contours: List,
+        filtered_contours: list,
         page_angle: float,
         use_tps: bool = False,
         tps_threshold: float = 0.25,
-    ) -> Tuple[OpStatus, DewarpingResult | str]:
+    ) -> tuple[OpStatus, DewarpingResult | str]:
         """Stage 3: Optionally apply TPS dewarping.
 
         Returns:
@@ -520,11 +533,11 @@ class OCRPipeline:
         self,
         work_img: NDArray,
         rot_mask: NDArray,
-        filtered_contours: List,
+        filtered_contours: list,
         merge_lines: bool = True,
         k_factor: float = 2.5,
         bbox_tolerance: float = 4.0,
-    ) -> Tuple[OpStatus, Tuple[List, List] | str]:
+    ) -> tuple[OpStatus, tuple[list, list] | str]:
         """Stage 4: Build line data, sort lines, and extract line images.
 
         Returns:
@@ -545,9 +558,10 @@ class OCRPipeline:
 
     def run_text_recognition(
         self,
-        line_images: List,
-        sorted_lines: List,
-        target_encoding: Encoding = Encoding.UNICODE) -> Tuple[OpStatus, List[OCRLine] | str]:
+        line_images: list,
+        sorted_lines: list,
+        target_encoding: Encoding = Encoding.UNICODE,
+    ) -> tuple[OpStatus, list[OCRLine] | str]:
         """Stage 5: Run OCR inference on line images.
 
         Returns:
@@ -557,7 +571,7 @@ class OCRPipeline:
         for line_img, line_info in zip(line_images, sorted_lines):
             if line_img.shape[0] == 0 or line_img.shape[1] == 0:
                 continue
-            
+
             pred = (
                 self.ocr_inference.run(line_img, self.use_line_prepadding)
                 .strip()
@@ -579,14 +593,15 @@ class OCRPipeline:
                 OCRLine(
                     guid=line_info.guid,
                     text=pred,
-                    encoding=(Encoding.WYLIE.name
+                    encoding=(
+                        Encoding.WYLIE.name
                         if target_encoding == Encoding.WYLIE.name
                         else Encoding.UNICODE.name
                     ),
                     ctc_conf=None,
                     norm_logp=None,
                     logits=None,
-                    lm_scores = None
+                    lm_scores=None,
                 )
             )
 
@@ -594,11 +609,11 @@ class OCRPipeline:
 
     def run_text_recognition_eval(
         self,
-        line_images: List,
-        sorted_lines: List,
+        line_images: list,
+        sorted_lines: list,
         target_encoding: Encoding = Encoding.UNICODE,
-        top_k_beams: int = 10
-    ) -> Tuple[OpStatus, List[OCRLine]]:
+        top_k_beams: int = 10,
+    ) -> tuple[OpStatus, list[OCRLine]]:
         """Stage 5: Run OCR inference on line images.
 
         Returns:
@@ -608,7 +623,7 @@ class OCRPipeline:
         for line_img, line_info in zip(line_images, sorted_lines):
             if line_img.shape[0] == 0 or line_img.shape[1] == 0:
                 continue
-            
+
             beams = self.ocr_inference.run_beam_code(line_img, self.use_line_prepadding)
 
             if not beams:
@@ -617,7 +632,7 @@ class OCRPipeline:
             if len(beams) > top_k_beams:
                 beams = beams[:top_k_beams]
 
-            pred = beams[0].text.strip().replace(" ", "") # beams[0] = top-1 pred
+            pred = beams[0].text.strip().replace(" ", "")  # beams[0] = top-1 pred
             pred = pred.replace("§", " ")
 
             if (
@@ -641,11 +656,12 @@ class OCRPipeline:
                     text=pred,
                     encoding=(
                         Encoding.WYLIE.name
-                        if target_encoding == Encoding.WYLIE._name_ else Encoding.UNICODE.name
+                        if target_encoding == Encoding.WYLIE._name_
+                        else Encoding.UNICODE.name
                     ),
                     ctc_conf=float(math.exp(norm_logp)),
                     logits=[float(x.logit_score) for x in beams],
-                    lm_scores = None
+                    lm_scores=None,
                 )
             )
 
@@ -664,8 +680,8 @@ class OCRPipeline:
         use_tps: bool = False,
         tps_threshold: float = 0.25,
         target_encoding: Encoding = Encoding.UNICODE,
-        eval_mode: bool = False
-    ) -> Tuple[OpStatus, List[OCRLine] | List[Line] | str]:
+        eval_mode: bool = False,
+    ) -> tuple[OpStatus, list[OCRLine] | list[Line] | str]:
         try:
             if not self.ready:
                 return OpStatus.FAILED, "OCR pipeline not ready"
@@ -725,7 +741,7 @@ class OCRPipeline:
             # Stage 5: OCR inference
             try:
 
-                if (eval_mode):
+                if eval_mode:
                     status, result = self.run_text_recognition_eval(
                         line_images, sorted_lines, target_encoding=target_encoding
                     )
@@ -741,8 +757,13 @@ class OCRPipeline:
             except Exception as e:
                 return OpStatus.FAILED, f"OCR processing failed: {str(e)}"
 
-            return OpStatus.SUCCESS, [rot_mask, sorted_lines, ocr_lines, float(page_angle)]
-        
+            return OpStatus.SUCCESS, [
+                rot_mask,
+                sorted_lines,
+                ocr_lines,
+                float(page_angle),
+            ]
+
         except Exception as e:
             return OpStatus.FAILED, f"OCR pipeline failed: {str(e)}"
 
@@ -768,3 +789,70 @@ class ImageInferenceDataset(Dataset):
         }
 
         return img, meta
+
+
+class OCREvaluator:
+    """
+    A simple wrapper class around some inference functions ro run ocr inference and CER calculation
+    based on line-image and line-label inputs
+    """
+
+    def __init__(self, config_path: str, cer_scorer, label_encoding: Encoding.UNICODE = Encoding.UNICODE):
+        assert os.path.isfile(config_path)
+
+        self._config_file = config_path
+        self._cer_scorer = cer_scorer
+        self._label_encoding = label_encoding  # mostly Unicode anyways
+
+        try:
+            self._model_config = read_ocr_model_config(self._config_file)
+        except BaseException as e:
+            print(
+                f"Failed to load ocr model config from file: {self._config_file}, {e}"
+            )
+
+        # TODO: add StackEncoder
+        self._label_encoder = WylieEncoder(self._model_config.charset)
+
+        try:
+            self._inference = OCRInference(self._model_config)
+        except BaseException as e:
+            print(f"Failed to create OCRInference instance: {e}")
+
+    def evaluate(self, image_path: str, label_path: str) -> float:
+        img = cv2.imread(image_path)
+        label = self._label_encoder.read_label(label_path)
+
+        prediction = self._inference.run(img)
+        cer_score = self._cer_scorer.compute(
+            predictions=[prediction], references=[label]
+        )
+
+        return cer_score
+
+    def evaluate_distribution(self, folder_name: str, image_paths: list[str], label_paths: list[str]) -> EvaluationSet:
+
+        cer_scores = dict()
+
+        # TODO: add batched inference
+        for image_path, label_path in tqdm(zip(image_paths, label_paths), total=len(image_paths)):
+            img = cv2.imread(image_path)
+            img_name = get_filename(image_path)
+            img = binarize(img)
+            label = self._label_encoder.read_label(label_path)
+
+            prediction = self._inference.run(img)
+            cer_score = self._cer_scorer.compute(
+                predictions=[prediction], references=[label]
+            )
+
+            cer_scores[img_name] = cer_score
+
+        return EvaluationSet(
+            folder_name,
+            image_paths,
+            label_paths,
+            cer_scores
+        )
+
+        

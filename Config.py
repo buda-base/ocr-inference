@@ -67,7 +67,12 @@ ENCODINGS = {"unicode": Encoding.UNICODE, "wylie": Encoding.WYLIE}
 
 CHARSETENCODER = {"wylie": CharsetEncoder.WYLIE, "stack": CharsetEncoder.STACK}
 
-OCRARCHITECTURE = {"Easter2": OCRArchitecture.EASTER2, "CRNN": OCRArchitecture.CRNN}
+OCR_ARCHITECTURES = {
+    "Easter2": OCRArchitecture.EASTER2,
+    "Easter2b": OCRArchitecture.EASTER2,
+    "Easter2-Vit": OCRArchitecture.EASTER2,
+    "CRNN": OCRArchitecture.CRNN
+    }
 
 EXPORTERS = {"xml": ExportFormat.XML, "json": ExportFormat.JSON, "text": ExportFormat.TXT}
 

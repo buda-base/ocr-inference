@@ -260,6 +260,12 @@ class OCRSettings:
     tps_mode: TPSMode
     output_encoding: Encoding
 
+@dataclass
+class EvaluationSet:
+    distribution: str
+    image_paths: list[str]
+    label_paths: list[str]
+    cer_scores: list[float]
 
 @dataclass
 class ArtifactConfig:
