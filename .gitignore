@@ -211,6 +211,7 @@ Data
 Datasets
 Models
 Output
+ScoresOutput
 
 # custom files
 dev_cli.py

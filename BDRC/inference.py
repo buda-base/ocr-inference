@@ -24,6 +24,7 @@ from BDRC.data import (
     Encoding,
     EvaluationSet,
     DewarpingResult,
+    KenLMConfig,
     LayoutDetectionConfig,
     Line,
     LineDetectionConfig,
@@ -58,21 +59,40 @@ from BDRC.utils import (
 from Config import COLOR_DICT
 
 
+
+
 class CTCDecoder:
-    def __init__(self, charset: str | list[str], add_blank: bool):
+    def __init__(
+        self,
+        charset: str | list[str],
+        add_blank: bool,
+        kenlm_config: KenLMConfig | None,
+    ):
+        self.blank_sign = "<blk>"
+        self.ctc_beam_width = 64
 
         if isinstance(charset, str):
-            self.charset = [x for x in charset]
-
-        elif isinstance(charset, list):
+            self.charset = list(charset)
+        else:
             self.charset = charset
 
         self.ctc_vocab = self.charset.copy()
 
-        if add_blank and " " not in self.ctc_vocab:
-            self.ctc_vocab.insert(0, " ")
+        if add_blank:
+            self.ctc_vocab.insert(0, "<blk>")
 
-        self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
+        if kenlm_config is not None:
+            try:
+                self.ctc_decoder = build_ctcdecoder(
+                    self.ctc_vocab,
+                    kenlm_model_path=str(kenlm_config.kenlm_file),
+                    unigrams=kenlm_config.unigrams,
+                )
+            except Exception as e:
+                print(f"KenLM disabled: {e}")
+                self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
+        else:
+            self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
 
     def encode(self, label: str):
         return [self.charset.index(x) + 1 for x in label]
@@ -80,10 +100,10 @@ class CTCDecoder:
     def decode(self, inputs: list[int]) -> str:
         return "".join(self.charset[x - 1] for x in inputs)
 
-    def ctc_decode(self, logits: NDArray) -> str:
-        return self.ctc_decoder.decode(logits).replace(" ", "")
+    def ctc_decode(self, logits) -> str:
+        return self.ctc_decoder.decode(logits).replace(self.blank_sign, "")
 
-    def ctc_beam_decode(self, logits: NDArray) -> list[OutputBeam]:
+    def ctc_beam_decode(self, logits):
         return self.ctc_decoder.decode_beams(logits)
 
 
@@ -246,7 +266,7 @@ class LayoutDetection(Detection):
 
 
 class OCRInference:
-    def __init__(self, ocr_config: OCRModelConfig):
+    def __init__(self, ocr_config: OCRModelConfig, kenlm_config: KenLMConfig | None):
 
         self.config = ocr_config
         self._onnx_model_file = ocr_config.model_file
@@ -257,11 +277,28 @@ class OCRInference:
         self._characters = ocr_config.charset
         self._squeeze_channel_dim = ocr_config.squeeze_channel
         self._swap_hw = ocr_config.swap_hw
+        self._add_blank = ocr_config.add_blank
+
         self._execution_providers = get_execution_providers()
         self.ocr_session = ort.InferenceSession(self._onnx_model_file)
-        self._add_blank = ocr_config.add_blank
-        self.decoder = CTCDecoder(self._characters, self._add_blank)
 
+        self.ctc_decoder = CTCDecoder(
+            self._characters,
+            self._add_blank,
+            kenlm_config=None
+        )
+        
+        # KenLM-based CTC-Decoder if KenLM model is provided
+        self.ctc_decoder_lm = None
+
+        if kenlm_config is not None:
+
+            self.ctc_decoder_lm = CTCDecoder(
+            self._characters,
+            self._add_blank,
+            kenlm_config
+        )
+        
     def _pad_ocr_line(
         self,
         img: NDArray,
@@ -311,7 +348,6 @@ class OCRInference:
     def _predict(self, image_batch: NDArray) -> NDArray:
         image_batch = image_batch.astype(np.float32)
 
-        #print(f"ImageBatch: {image_batch.shape}")
         ort_batch = ort.OrtValue.ortvalue_from_numpy(image_batch)
         ocr_results = self.ocr_session.run_with_ort_values(
             [self._output_layer], {self._input_layer: ort_batch}
@@ -322,21 +358,33 @@ class OCRInference:
 
         return logits
 
-    def _decode(self, logits: NDArray) -> str:
-        if logits.shape[0] == len(self.decoder.ctc_vocab):
+    def _decode(self, logits: NDArray, use_lm: bool = False) -> str:
+        if logits.shape[0] == len(self.ctc_decoder.ctc_vocab):
             logits = np.transpose(
                 logits, axes=[1, 0]
             )  # adjust logits to have shape time, vocab
 
-        return self.decoder.ctc_decode(logits)
+        if not use_lm:
+            return self.ctc_decoder.ctc_decode(logits)
+        elif self.ctc_decoder_lm is not None:
+                return self.ctc_decoder_lm.ctc_decoder(logits)
+        else:
+            print("Warning: KenLM-based CTC-Decoder is None! Using default CTC-Decoder")
+            return self.ctc_decoder.ctc_decode(logits)
 
-    def _decode_beams(self, logits: NDArray) -> list[OutputBeam]:
-        if logits.shape[0] == len(self.decoder.ctc_vocab):
+    def _decode_beams(self, logits: NDArray, use_lm: bool) -> list[OutputBeam]:
+        if logits.shape[0] == len(self.ctc_decoder.ctc_vocab):
             logits = np.transpose(
                 logits, axes=[1, 0]
             )  # adjust logits to have shape time, vocab
 
-        return self.decoder.ctc_beam_decode(logits)
+        if not use_lm:
+            return self.ctc_decoder.ctc_beam_decode(logits)
+        elif self.ctc_decoder_lm is not None:
+            return self.ctc_decoder_lm.ctc_beam_decode(logits)
+        else:
+            print("Warning: KenLM-based CTC-Decoder is None! Using default CTC-Decoder")
+            return self.ctc_decoder.ctc_beam_decode(logits)
 
     def run_beam_code(
         self, line_image: NDArray, pre_pad: bool = True
@@ -354,7 +402,7 @@ class OCRInference:
         logits = self._predict(line_image)
         return self._decode_beams(logits)
 
-    def run(self, line_image: NDArray, pre_pad: bool = True) -> str:
+    def run(self, line_image: NDArray, pre_pad: bool = True, use_lm: bool = False) -> str:
 
         if pre_pad:
             line_image = self._pre_pad(line_image)
@@ -367,7 +415,6 @@ class OCRInference:
             line_image = np.expand_dims(line_image, axis=1)
 
         logits = self._predict(line_image)
-        #print(f"Logits: {logits.shape}")
         return self._decode(logits)
 
 
@@ -797,11 +844,18 @@ class OCREvaluator:
     based on line-image and line-label inputs
     """
 
-    def __init__(self, config_path: str, cer_scorer, label_encoding: Encoding.UNICODE = Encoding.UNICODE):
+    def __init__(
+        self,
+        config_path: str,
+        cer_scorer,
+        kenlm_config: KenLMConfig | None = None,
+        label_encoding: Encoding.UNICODE = Encoding.UNICODE,
+    ):
         assert os.path.isfile(config_path)
 
         self._config_file = config_path
         self._cer_scorer = cer_scorer
+        self._kenlm_config = kenlm_config
         self._label_encoding = label_encoding  # mostly Unicode anyways
 
         try:
@@ -815,9 +869,12 @@ class OCREvaluator:
         self._label_encoder = WylieEncoder(self._model_config.charset)
 
         try:
-            self._inference = OCRInference(self._model_config)
+            self._inference = OCRInference(self._model_config, self._kenlm_config)
         except BaseException as e:
             print(f"Failed to create OCRInference instance: {e}")
+
+    def get_architecture(self) -> str:
+        return self._model_config.architecture
 
     def evaluate(self, image_path: str, label_path: str) -> float:
         img = cv2.imread(image_path)
@@ -830,12 +887,16 @@ class OCREvaluator:
 
         return cer_score
 
-    def evaluate_distribution(self, folder_name: str, image_paths: list[str], label_paths: list[str]) -> EvaluationSet:
+    def evaluate_distribution(
+        self, folder_name: str, image_paths: list[str], label_paths: list[str]
+    ) -> EvaluationSet:
 
         cer_scores = dict()
 
         # TODO: add batched inference
-        for image_path, label_path in tqdm(zip(image_paths, label_paths), total=len(image_paths)):
+        for image_path, label_path in tqdm(
+            zip(image_paths, label_paths), total=len(image_paths)
+        ):
             img = cv2.imread(image_path)
             img_name = get_filename(image_path)
             img = binarize(img)
@@ -852,7 +913,4 @@ class OCREvaluator:
             folder_name,
             image_paths,
             label_paths,
-            cer_scores
-        )
-
-        
+            cer_scores)

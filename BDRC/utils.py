@@ -35,6 +35,7 @@ import pyarrow.parquet as pq
 
 from BDRC.data import (
     BBox,
+    KenLMConfig,
     Line,
     OCRData,
     OCRModel,
@@ -53,7 +54,6 @@ from BDRC.line_detection import (
 )
 from Config import (
     CHARSETENCODER,
-    OCR_ARCHITECTURES,
     COLOR_DICT,
     LINE_DETECTION_SCHEMA,
 )
@@ -108,10 +108,52 @@ def download_model(identifier: str) -> str:
         force_download=True,
     )
 
-    model_config = f"{model_path}/model_config.json"
-    assert os.path.isfile(model_config)
+    json_files = list(model_path.glob("*.json"))
 
-    return model_config
+    if len(json_files) == 0:
+        raise FileNotFoundError(
+            f"No JSON config file found in {model_path}"
+        )
+    
+    if len(json_files) > 1:
+        raise RuntimeError(
+            f"Multiple JSON files found in {model_path}: "
+            f"{[p.name for p in json_files]} — cannot decide which is the model config"
+        )
+    
+    assert os.path.isfile(json_files[0])
+
+    return str(json_files[0])
+
+
+def download_kenlm(identifier: str) -> tuple[str, str]:
+    lm_path = snapshot_download(
+        repo_id=identifier,
+        repo_type="model",
+        local_dir=f"Models/{identifier}",
+        force_download=True,
+    )
+
+    lm_dir = Path(lm_path)
+
+    bin_files = list(lm_dir.glob("*.binary"))
+    arpa_files = list(lm_dir.glob("*.arpa"))
+
+    if len(bin_files) == 0:
+        raise FileNotFoundError(f"No .bin file found in {lm_dir}")
+    if len(arpa_files) == 0:
+        raise FileNotFoundError(f"No .arpa file found in {lm_dir}")
+
+    if len(bin_files) > 1:
+        raise RuntimeError(
+            f"Multiple .bin files found in {lm_dir}: {[p.name for p in bin_files]}"
+        )
+    if len(arpa_files) > 1:
+        raise RuntimeError(
+            f"Multiple .arpa files found in {lm_dir}: {[p.name for p in arpa_files]}"
+        )
+
+    return str(bin_files[0]), str(arpa_files[0])
 
 
 def read_line_model_config(config_file: str) -> LineDetectionConfig:
@@ -344,12 +386,9 @@ def read_ocr_model_config(config_file: str):
     characters = json_content["charset"]
     add_blank = True if json_content["add_blank"] == "yes" else False
 
-    if architecture not in list(OCR_ARCHITECTURES.keys()):
-        raise ValueError("Unsupported OCR Architecture provided.")
-
     config = OCRModelConfig(
         onnx_model_file,
-        OCR_ARCHITECTURES[architecture],
+        architecture,
         input_width,
         input_height,
         input_layer,
@@ -363,6 +402,50 @@ def read_ocr_model_config(config_file: str):
     )
 
     return config
+
+def parse_arpa_unigrams(arpa_path: str | Path) -> list[str] | None:
+        """
+        Extract unigram symbols from a KenLM ARPA file.
+        """
+        unigrams = []
+        in_1grams = False
+
+        with open(arpa_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+
+                if line == r"\1-grams:":
+                    in_1grams = True
+                    continue
+
+                if in_1grams and line.startswith("\\"):
+                    break
+
+                if in_1grams:
+                    if not line or line.startswith("#"):
+                        continue
+
+                    # Format: <logprob> <token> [<backoff>]
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        token = parts[1]
+                        unigrams.append(token)
+
+        if not unigrams:
+            print("No valid unigrams found")
+            return None
+
+        return unigrams
+
+def get_kenlm_config(model_path: str | Path, arpa_file: str | Path) -> KenLMConfig:
+        unigrams = parse_arpa_unigrams(arpa_file)
+
+        return KenLMConfig(
+            model_path,
+            arpa_file,
+            unigrams
+        )
+
 
 
 def resize_to_height(image: NDArray, target_height: int) -> tuple[NDArray, float]:

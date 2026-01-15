@@ -71,6 +71,7 @@ OCR_ARCHITECTURES = {
     "Easter2": OCRArchitecture.EASTER2,
     "Easter2b": OCRArchitecture.EASTER2,
     "Easter2-Vit": OCRArchitecture.EASTER2,
+    "Easter2-Attention": OCRArchitecture.EASTER2,
     "CRNN": OCRArchitecture.CRNN
     }
 

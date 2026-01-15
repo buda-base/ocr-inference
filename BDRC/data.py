@@ -8,10 +8,10 @@ various configuration options.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Tuple, Optional
+from numpy.typing import NDArray
+from pathlib import Path
+from typing import Optional
 from uuid import UUID
-
-import numpy.typing as npt
 
 
 class OpStatus(Enum):
@@ -19,6 +19,7 @@ class OpStatus(Enum):
 
     SUCCESS = 0
     FAILED = 1
+
 
 class Encoding(Enum):
     """Text encoding formats for OCR output."""
@@ -40,7 +41,6 @@ class ExportFormat(Enum):
     TXT = 0
     XML = 1
     JSON = 2
-
 
 
 class LineMode(Enum):
@@ -115,9 +115,9 @@ class Line:
     """Detected text line with contour and bounding box information."""
 
     guid: UUID
-    contour: npt.NDArray
+    contour: NDArray
     bbox: BBox
-    center: Tuple[int, int]
+    center: tuple[int, int]
 
 
 @dataclass
@@ -128,22 +128,22 @@ class OCRLine:
     text: str
     encoding: str
     ctc_conf: Optional[float] | None
-    logits: Optional[List[float]] | None
-    lm_scores: Optional[List[float]] | None
+    logits: Optional[list[float]] | None
+    lm_scores: Optional[list[float]] | None
 
 
 @dataclass
 class LayoutData:
     """Layout analysis results containing detected regions and predictions."""
 
-    image: npt.NDArray
+    image: NDArray
     rotation: float
-    images: List[BBox]
-    text_bboxes: List[BBox]
-    lines: List[Line]
-    captions: List[BBox]
-    margins: List[BBox]
-    predictions: Dict[str, npt.NDArray]
+    images: list[BBox]
+    text_bboxes: list[BBox]
+    lines: list[Line]
+    captions: list[BBox]
+    margins: list[BBox]
+    predictions: dict[str, NDArray]
 
 
 @dataclass
@@ -153,24 +153,26 @@ class OCRData:
     guid: UUID
     image_path: str
     image_name: str
-    image: npt.NDArray
-    ocr_lines: List[OCRLine] | None
-    lines: List[Line] | None
-    preview: npt.NDArray | None
+    image: NDArray
+    ocr_lines: list[OCRLine] | None
+    lines: list[Line] | None
+    preview: NDArray | None
     angle: float
+
 
 @dataclass
 class DewarpingResult:
     """Result from dewarping stage."""
 
-    work_img: npt.NDArray
-    work_mask: npt.NDArray
-    filtered_contours: List
+    work_img: NDArray
+    work_mask: NDArray
+    filtered_contours: list
     page_angle: float
     applied: bool
     tps_ratio: Optional[float] = None
-    dewarped_img: Optional[npt.NDArray] = None
-    dewarped_mask: Optional[npt.NDArray] = None
+    dewarped_img: Optional[NDArray] = None
+    dewarped_mask: Optional[NDArray] = None
+
 
 @dataclass
 class LineDetectionConfig:
@@ -186,7 +188,7 @@ class LayoutDetectionConfig:
 
     model_file: str
     patch_size: int
-    classes: List[str]
+    classes: list[str]
 
 
 @dataclass
@@ -194,7 +196,7 @@ class OCRModelConfig:
     """Configuration parameters for OCR model."""
 
     model_file: str
-    architecture: OCRArchitecture
+    architecture: str
     input_width: int
     input_height: int
     input_layer: str
@@ -202,7 +204,7 @@ class OCRModelConfig:
     squeeze_channel: bool
     swap_hw: bool
     encoder: CharsetEncoder
-    charset: List[str]
+    charset: list[str]
     add_blank: bool
     version: str
 
@@ -212,7 +214,7 @@ class LineDataResult:
     """Result container for line detection operations."""
 
     guid: UUID
-    lines: List[Line]
+    lines: list[Line]
 
 
 @dataclass
@@ -220,9 +222,9 @@ class OCResult:
     """Complete OCR processing result for an image."""
 
     guid: UUID
-    mask: npt.NDArray
-    lines: List[Line]
-    text: List[OCRLine]
+    mask: NDArray
+    lines: list[Line]
+    text: list[OCRLine]
     angle: float
 
 
@@ -260,12 +262,21 @@ class OCRSettings:
     tps_mode: TPSMode
     output_encoding: Encoding
 
+
 @dataclass
 class EvaluationSet:
     distribution: str
     image_paths: list[str]
     label_paths: list[str]
-    cer_scores: list[float]
+    cer_scores: dict[str, float]
+
+
+@dataclass
+class KenLMConfig:
+    kenlm_file: str | Path
+    arpa_file: str | Path
+    unigrams: list[str]
+
 
 @dataclass
 class ArtifactConfig:
