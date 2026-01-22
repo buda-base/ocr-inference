@@ -51,12 +51,15 @@ def main():
         raise FileNotFoundError(f"Model config not found: {config_path}")
     ocr_model = import_local_model(os.path.dirname(args.model))
 
+    assert ocr_model is not None
     # Line detection config
     if args.line_mode == "line":
         line_config = LineDetectionConfig(model_file="Models/Lines/PhotiLines.onnx", patch_size=512)
     else:
         line_config = LayoutDetectionConfig(
-            model_file="Models/Layout/photi.onnx",
+            checkpoint="",
+            onnx_file="Models/Layout/photi.onnx",
+            architecture="deeplabv3",
             patch_size=512,
             classes=["background", "image", "line", "caption", "margin"],
         )

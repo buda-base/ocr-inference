@@ -117,7 +117,8 @@ class StackEncoder(LabelEncoder):
         stacks = tokenize_in_stacks(label)
 
         return stacks
-
+    
+    @property
     def num_classes(self) -> int:
         return len(self._charset) + 1
 
@@ -136,5 +137,6 @@ class WylieEncoder(LabelEncoder):
 
         return label
 
+    @property
     def num_classes(self) -> int:
         return len(self._charset) + 1

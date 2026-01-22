@@ -18,6 +18,7 @@ import os
 import torch
 import torch.nn.functional as F
 
+from cv2.typing import Rect
 from datetime import datetime
 from math import ceil
 from pathlib import Path
@@ -42,6 +43,7 @@ from BDRC.data import (
     OCRModelConfig,
     LineDetectionConfig,
     LayoutDetectionConfig,
+    RotatedBBox
 )
 
 # Import functions from specialized modules for backward compatibility
@@ -108,6 +110,7 @@ def download_model(identifier: str) -> str:
         force_download=True,
     )
 
+    model_path = Path(model_path)
     json_files = list(model_path.glob("*.json"))
 
     if len(json_files) == 0:
@@ -174,16 +177,23 @@ def read_layout_model_config(config_file: str) -> LayoutDetectionConfig:
     file = open(config_file, encoding="utf-8")
     json_content = json.loads(file.read())
 
-    onnx_model_file = f"{model_dir}/{json_content['onnx-model']}"
+    checkpoint = f"{model_dir}/{json_content["checkpoint"]}"
+    onnx_model_file = f"{model_dir}/{json_content["onnx-model"]}"
+    architecture = f"{model_dir}/{json_content["architecture"]}"
     patch_size = int(json_content["patch_size"])
     classes = json_content["classes"]
 
-    config = LayoutDetectionConfig(onnx_model_file, patch_size, classes)
+    config = LayoutDetectionConfig(
+        checkpoint,
+        onnx_model_file,
+        architecture,
+        patch_size,
+        classes)
 
     return config
 
 
-def get_charset(charset: str) -> list[str]:
+def get_charset(charset: str | list[str]) -> list[str]:
     if isinstance(charset, str):
         charset = [x for x in charset]
 
@@ -293,41 +303,6 @@ def read_theme_file(file_path: str) -> dict | None:
     else:
         logging.error("Theme File %s does not exist", file_path)
         return None
-
-
-def import_local_models(model_path: str):
-    """
-    Import all OCR models from a directory.
-
-    Args:
-        model_path: Directory path containing OCR model subdirectories
-
-    Returns:
-        List of OCRModel instances loaded from the directory
-    """
-    tick = 1
-    ocr_models = []
-
-    if os.path.isdir(model_path):
-        for sub_dir in Path(model_path).iterdir():
-            if os.path.isdir(sub_dir):
-                _config_file = os.path.join(sub_dir, "model_config.json")
-                if not os.path.isfile(_config_file):
-                    logging.warning("ignore %s", sub_dir)
-                    tick += 1
-                    continue
-
-                _config = read_ocr_model_config(_config_file)
-                _model = OCRModel(
-                    guid=generate_guid(tick),
-                    name=sub_dir.name,
-                    path=str(sub_dir),
-                    config=_config,
-                )
-                ocr_models.append(_model)
-            tick += 1
-
-    return ocr_models
 
 
 def import_local_model(model_path: str):
@@ -446,6 +421,23 @@ def get_kenlm_config(model_path: str | Path, arpa_file: str | Path) -> KenLMConf
             unigrams
         )
 
+def resize_image(image: NDArray, target_width: int, target_height: int) -> NDArray:
+    return cv2.resize(
+        image, (target_width, target_height),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+def resize_image_gpu(image: torch.Tensor, target_width: int, target_height: int) -> torch.Tensor:
+    image = image.unsqueeze(0).float()
+    image = torch.nn.functional.interpolate(
+            image,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+    image = image.squeeze(0)
+
+    return image
 
 
 def resize_to_height(image: NDArray, target_height: int) -> tuple[NDArray, float]:
@@ -652,7 +644,7 @@ def rotate_contour(cnt, center: tuple[int, int], angle: float):
     return cnt_rotated
 
 
-def is_inside_rectangle(point: tuple, rect: tuple) -> bool:
+def is_inside_rectangle(point: tuple[float, float], rect: tuple[int, int, int, int]) -> bool:
     x, y = point
     xmin, ymin, xmax, ymax = rect
     return xmin <= x <= xmax and ymin <= y <= ymax
@@ -893,6 +885,22 @@ def pad_ocr_line(
     )
 
 
+def draw_bbox(image, bbox: BBox, color=(0, 255, 0), thickness=2):
+    cv2.rectangle(image, (bbox.x, bbox.y), (bbox.x + bbox.w, bbox.y + bbox.h), color, thickness)
+    return image
+
+
+def draw_rotated_bbox(image, obb: RotatedBBox, color=(0, 0, 255), thickness=2):
+    cv2.polylines(
+        image,
+        [obb.points],
+        isClosed=True,
+        color=color,
+        thickness=thickness
+    )
+    return image
+
+
 def create_preview_image(
     image: NDArray,
     image_predictions: Optional[list],
@@ -942,7 +950,6 @@ def create_preview_image(
 
 ### Functions for PyTorch-based inference ###
 
-
 def resize_clamp(
     img: torch.Tensor, patch_size: int = 512, max_w: int = 4096, max_h: int = 2048
 ):
@@ -989,7 +996,7 @@ def pad_to_multiple(img: torch.Tensor, patch_size=512, value=255):
     return img, pad_w, pad_h
 
 
-def tile_timage(img: torch.Tensor, patch_size=512):
+def tile_timage(img: torch.Tensor, patch_size: int = 512):
     C, H, W = img.shape
     y_steps = H // patch_size
     x_steps = W // patch_size
@@ -1030,7 +1037,7 @@ def stitch_tiles(
     return full
 
 
-def contour_to_cv(contour):
+def contour_to_cv(contour: list[int, int]):
     """
     contour: list[(x, y)]
     returns: np.ndarray [N, 1, 2] int32
@@ -1038,7 +1045,7 @@ def contour_to_cv(contour):
     return np.array(contour, dtype=np.int32).reshape(-1, 1, 2)
 
 
-def contour_to_original(contour, scale_x: float, scale_y: float):
+def contour_to_original(contour: list[tuple[int, int]], scale_x: float, scale_y: float) -> list[tuple[int, int]]:
     return [
         (
             int(round(x / scale_x)),
@@ -1048,7 +1055,7 @@ def contour_to_original(contour, scale_x: float, scale_y: float):
     ]
 
 
-def bbox_to_original(bbox, scale_x: float, scale_y: float):
+def bbox_to_original(bbox: Rect, scale_x: float, scale_y: float) -> tuple[int, int, int, int]:
     x, y, w, h = bbox
     return (
         int(round(x / scale_x)),
@@ -1056,6 +1063,24 @@ def bbox_to_original(bbox, scale_x: float, scale_y: float):
         int(round(w / scale_x)),
         int(round(h / scale_y)),
     )
+
+def get_union_bbox(contours: list[NDArray]):   
+    if len(contours) == 0:
+        return None, None
+    
+    all_points = np.vstack(contours)
+
+    x, y, w, h = cv2.boundingRect(all_points)
+    bbox = BBox(x, y, w, h)
+
+    # Rotated
+    center, (width, height), angle = cv2.minAreaRect(all_points)
+    points = cv2.boxPoints((center, (width, height), angle))
+    points = points.astype(np.int32)
+    cx, cy = center
+    rot_bbox = RotatedBBox((float(cx), float(cy)), width, height, angle, points)
+
+    return bbox, rot_bbox
 
 
 def crop_padding(mask: torch.Tensor, pad_x: int, pad_y: int):
@@ -1077,7 +1102,7 @@ def contours_to_arrow(contours):
     return [[{"x": x, "y": y} for x, y in contour] for contour in contours]
 
 
-def write_result_parquet(result, out_dir):
+def write_result_parquet(result: dict, out_dir: str | Path):
     os.makedirs(out_dir, exist_ok=True)
     base_name, _ = os.path.splitext(result["image_name"])
 
@@ -1149,10 +1174,10 @@ def load_model(checkpoint_path: str, num_classes: int, device: str = "cuda"):
 
 
 def infer_batch(
-    model,
-    all_tiles,
-    tile_ranges,
-    metas,
+    model: torch.nn.Module,
+    all_tiles: list[torch.Tensor],
+    tile_ranges: list[tuple[int, int]],
+    metas: list[dict],
     class_threshold: float = 0.9,
     device: str = "cuda",
 ):
@@ -1169,7 +1194,7 @@ def infer_batch(
 
         binary = (stitched > class_threshold).to(torch.uint8) * 255
         mask_np = binary.squeeze(0).cpu().numpy()
-
+        
         contours, _ = cv2.findContours(mask_np, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
         result = {
@@ -1196,7 +1221,6 @@ def infer_batch(
         }
 
         return result
-
 
 
 def save_ocr_lines_parquet(ocr_lines, out_path):

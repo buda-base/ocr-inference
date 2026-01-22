@@ -11,7 +11,7 @@ This module contains functions for:
 import cv2
 import numpy as np
 from numpy.typing import NDArray
-from typing import List, Tuple, Sequence
+from typing import Sequence
 
 from BDRC.data import BBox, Line
 from uuid import uuid1
@@ -244,7 +244,7 @@ def build_raw_line_data(image: NDArray, line_mask: NDArray, rot_threshold: float
     return out_img, out_mask, line_contours, angle
 
 
-def filter_line_contours(image: NDArray, line_contours, threshold: float = 0.01) -> List:
+def filter_line_contours(image: NDArray, line_contours, threshold: float = 0.01) -> list:
     """
     Filter line contours based on size criteria.
     
@@ -288,7 +288,7 @@ def extract_line(image: NDArray, mask: NDArray, bbox_h: int, k_factor: float = 1
     return masked_line
 
 
-def get_line_image(image: NDArray, mask: NDArray, bbox_h: int, bbox_tolerance: float = 2.5, k_factor: float = 1.2) -> Tuple[NDArray, float]:
+def get_line_image(image: NDArray, mask: NDArray, bbox_h: int, bbox_tolerance: float = 2.5, k_factor: float = 1.2) -> tuple[NDArray, float]:
     """
     Extract line image with adaptive height tolerance.
     
@@ -327,7 +327,7 @@ def get_line_image(image: NDArray, mask: NDArray, bbox_h: int, bbox_tolerance: f
         return fallback_img, k_factor
 
 
-def extract_line_images(image: NDArray, line_data: List[Line], default_k: float = 1.7, bbox_tolerance: float = 3) -> List[NDArray]:
+def extract_line_images(image: NDArray, line_data: list[Line], default_k: float = 1.7, bbox_tolerance: float = 3) -> list[NDArray]:
     """
     Extract individual line images from detected line data.
     
@@ -421,7 +421,7 @@ def get_line_threshold(line_prediction: NDArray, slice_width: int = 20) -> float
     return line_threshold
 
 
-def sort_bbox_centers(bbox_centers: List[Tuple[int, int]], line_threshold: int = 20) -> List:
+def sort_bbox_centers(bbox_centers: list[tuple[int, int]], line_threshold: float = 20) -> list:
     """
     Sort bounding box centers into horizontal lines.
     
@@ -486,7 +486,7 @@ def sort_bbox_centers(bbox_centers: List[Tuple[int, int]], line_threshold: int =
     return sorted_bbox_centers
 
 
-def group_line_chunks(sorted_bbox_centers, lines: List[Line], adaptive_grouping: bool = True) -> List[Line]:
+def group_line_chunks(sorted_bbox_centers, lines: list[Line], adaptive_grouping: bool = True) -> list[Line]:
     """
     Group line chunks into unified line objects.
     
@@ -550,7 +550,7 @@ def group_line_chunks(sorted_bbox_centers, lines: List[Line], adaptive_grouping:
 
 def sort_lines_by_threshold(
     line_mask: NDArray,
-    lines: List[Line],
+    lines: list[Line],
     threshold: int = 20,
     calculate_threshold: bool = True,
     group_lines: bool = True
@@ -593,11 +593,11 @@ def sort_lines_by_threshold(
 
 def sort_lines_by_threshold2(
     line_mask: NDArray,
-    lines: List[Line],
+    lines: list[Line],
     threshold: int = 20,
     calculate_threshold: bool = True,
     group_lines: bool = True
-) -> Tuple[List[Line], float]:
+) -> tuple[list[Line], float]:
     """
     Alternative implementation for sorting lines by threshold.
     

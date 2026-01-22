@@ -2,8 +2,11 @@ from typing import Union
 
 import os
 import cv2
+import json
 import math
 import numpy as np
+import torch
+
 from numpy.typing import NDArray
 
 from glob import glob
@@ -15,9 +18,11 @@ from pyctcdecode.decoder import OutputBeam
 
 from scipy.special import softmax
 
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torchvision.io import read_image
+from torchvision.io.image import ImageReadMode
 from tqdm import tqdm
+from typing import Optional
 
 from BDRC.data import (
     CharsetEncoder,
@@ -45,15 +50,21 @@ from BDRC.line_detection import (
 )
 from BDRC.utils import (
     binarize,
+    crop_padding,
     get_execution_providers,
     get_filename,
+    get_union_bbox,
+    load_model,
+    multi_image_collate_fn,
     normalize,
     pad_to_height,
     pad_to_width,
     preprocess_image,
     read_ocr_model_config,
+    resize_image_gpu,
     sigmoid,
     stitch_predictions,
+    stitch_tiles,
     tile_image,
 )
 from Config import COLOR_DICT
@@ -62,14 +73,7 @@ from Config import COLOR_DICT
 
 
 class CTCDecoder:
-    def __init__(
-        self,
-        charset: str | list[str],
-        add_blank: bool,
-        kenlm_config: KenLMConfig | None,
-    ):
-        self.blank_sign = "<blk>"
-        self.ctc_beam_width = 64
+    def __init__(self, charset: str | list[str], add_blank: bool):
 
         if isinstance(charset, str):
             self.charset = list(charset)
@@ -78,21 +82,10 @@ class CTCDecoder:
 
         self.ctc_vocab = self.charset.copy()
 
-        if add_blank:
-            self.ctc_vocab.insert(0, "<blk>")
+        if add_blank and " " not in self.ctc_vocab:
+            self.ctc_vocab.insert(0, " ")
 
-        if kenlm_config is not None:
-            try:
-                self.ctc_decoder = build_ctcdecoder(
-                    self.ctc_vocab,
-                    kenlm_model_path=str(kenlm_config.kenlm_file),
-                    unigrams=kenlm_config.unigrams,
-                )
-            except Exception as e:
-                print(f"KenLM disabled: {e}")
-                self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
-        else:
-            self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
+        self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
 
     def encode(self, label: str):
         return [self.charset.index(x) + 1 for x in label]
@@ -816,7 +809,8 @@ class OCRPipeline:
 
 
 class ImageInferenceDataset(Dataset):
-    def __init__(self, root_dir: str):
+    def __init__(self, root_dir: str, mode: str = "rgb"):
+        self._mode = mode
         self.paths = sorted(
             p
             for p in glob(os.path.join(root_dir, "*"))
@@ -825,10 +819,17 @@ class ImageInferenceDataset(Dataset):
 
     def __len__(self):
         return len(self.paths)
+    
+    def get_item(self, idx):
+         return self.__getitem__(idx)
 
     def __getitem__(self, idx):
         # TODO: check if images are .tif/.tiff and use alternative loading since torchvision doesn't support tif/tiff
-        img = read_image(self.paths[idx])
+        
+        if self._mode == "rgb":
+            img = read_image(self.paths[idx], ImageReadMode.RGB)
+        else:
+            img = read_image(self.paths[idx])
 
         meta = {
             "image_name": os.path.basename(self.paths[idx]),
@@ -836,6 +837,110 @@ class ImageInferenceDataset(Dataset):
         }
 
         return img, meta
+
+
+class ModernBookFormatLayoutDetection:
+    def __init__(self, config: LayoutDetectionConfig):
+        self.config = config
+        self.classes = config.classes
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = load_model(self.config.checkpoint, len(self.classes), self.device)
+
+    
+    def extract_json_data(self, meta: dict, predicton: torch.Tensor, filter_classes: list[str] | None, output_dir: str):
+        np_predicton = predicton.cpu().detach().numpy()
+
+        found_classes = dict()
+        
+        if filter_classes is not None and len(filter_classes) > 0:
+            for idx, class_name in enumerate(self.classes):
+                if class_name in filter_classes:
+                    bbox = self.post_process_sample(np_predicton, idx)
+                    if bbox is None:
+                        continue
+
+                    found_classes[class_name] = bbox
+        else:
+            for idx, class_name in enumerate(self.classes):
+                bbox = self.post_process_sample(np_predicton, idx)
+
+                if bbox is None:
+                    continue
+
+                found_classes[class_name] = bbox
+            
+        file_name = get_filename(meta["image_name"])
+        self.save_to_json(file_name, output_dir, found_classes)
+    
+    def save_to_json(self, image_name: str, output_dir: str, json_record: dict):
+        out_file = f"{output_dir}/{image_name}.json"
+
+        with open(out_file, "w", encoding="UTF-8") as f:
+            json.dump(json_record, f, ensure_ascii=False, indent=1)
+
+    def post_process_sample(self, prediction: NDArray, class_index: int) -> dict | None:
+        class_map = prediction[class_index, :, :]
+        contours, _ = cv2.findContours(class_map, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+
+        if len(contours) == 0:
+            return None
+
+        bbox, _ = get_union_bbox(contours)
+
+        if bbox is None:
+            return None
+        
+        return {
+            "bbox": {
+                "x": bbox.x,
+                "y": bbox.y,
+                "w": bbox.w,
+                "h": bbox.h
+            }
+        }
+
+
+    def run(self, directory: str, output_dir: str, filter_classes: list[str] | None, batch_size: int = 4, num_workers: int = 4, class_threshold: float = 0.8):
+        
+        if filter_classes is not None and len(filter_classes) > 0:
+            for f_class in filter_classes:
+                if f_class not in self.classes:
+                    raise ValueError(f"ERROR: provided filter classes: {filter_classes} are not part of the model's classes!")
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        dataset = ImageInferenceDataset(directory, mode="rgb")
+
+        data_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=multi_image_collate_fn)
+
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+
+        with torch.no_grad():
+            for all_tiles, tile_ranges, metas in tqdm(data_loader, total=len(data_loader)):
+                all_tiles = all_tiles.to("cuda", non_blocking=True)
+                preds = self.model(all_tiles)
+   
+                soft = torch.softmax(preds, dim=1)
+
+                for (start, end), meta in zip(tile_ranges, metas):
+                    pred = soft[start:end]
+                    pred = stitch_tiles(pred, meta["x_steps"], meta["y_steps"])
+                    pred = crop_padding(pred, meta["pad_x"], meta["pad_y"])
+                    
+                    orig_height, original_width = meta["orig_shape"]
+                    pred = resize_image_gpu(pred, original_width, orig_height)
+                    pred = (pred > class_threshold).to(torch.uint8) * 255
+                    
+                    self.extract_json_data(meta, pred, filter_classes, output_dir)
+                
+        if self.device == "cuda":
+            torch.cuda.synchronize()
 
 
 class OCREvaluator:
@@ -849,7 +954,7 @@ class OCREvaluator:
         config_path: str,
         cer_scorer,
         kenlm_config: KenLMConfig | None = None,
-        label_encoding: Encoding.UNICODE = Encoding.UNICODE,
+        label_encoding: Encoding = Encoding.UNICODE,
     ):
         assert os.path.isfile(config_path)
 
@@ -907,10 +1012,11 @@ class OCREvaluator:
                 predictions=[prediction], references=[label]
             )
 
-            cer_scores[img_name] = cer_score
+            cer_scores[img_name] = float(cer_score)
 
         return EvaluationSet(
             folder_name,
             image_paths,
             label_paths,
-            cer_scores)
+            cer_scores
+        )

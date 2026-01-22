@@ -109,6 +109,13 @@ class BBox:
     w: int
     h: int
 
+@dataclass
+class RotatedBBox:
+    center: tuple[float, float]
+    width: float
+    height: float
+    angle: float
+    points: NDArray  # (4,2)
 
 @dataclass
 class Line:
@@ -173,7 +180,6 @@ class DewarpingResult:
     dewarped_img: Optional[NDArray] = None
     dewarped_mask: Optional[NDArray] = None
 
-
 @dataclass
 class LineDetectionConfig:
     """Configuration for line detection model."""
@@ -185,8 +191,9 @@ class LineDetectionConfig:
 @dataclass
 class LayoutDetectionConfig:
     """Configuration for layout detection model."""
-
-    model_file: str
+    checkpoint: str
+    onnx_file: str
+    architecture: str
     patch_size: int
     classes: list[str]
 
