@@ -183,10 +183,11 @@ class DewarpingResult:
 @dataclass
 class LineDetectionConfig:
     """Configuration for line detection model."""
-
-    model_file: str
+    checkpoint: str
+    onnx_file: str
+    architecture: str
     patch_size: int
-
+    classes: list[str]
 
 @dataclass
 class LayoutDetectionConfig:

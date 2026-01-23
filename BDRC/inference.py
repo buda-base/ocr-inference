@@ -73,7 +73,14 @@ from Config import COLOR_DICT
 
 
 class CTCDecoder:
-    def __init__(self, charset: str | list[str], add_blank: bool):
+    def __init__(
+        self,
+        charset: str | list[str],
+        add_blank: bool,
+        kenlm_config: KenLMConfig | None,
+    ):
+        self.blank_sign = "<blk>"
+        self.ctc_beam_width = 64
 
         if isinstance(charset, str):
             self.charset = list(charset)
@@ -82,10 +89,21 @@ class CTCDecoder:
 
         self.ctc_vocab = self.charset.copy()
 
-        if add_blank and " " not in self.ctc_vocab:
-            self.ctc_vocab.insert(0, " ")
+        if add_blank:
+            self.ctc_vocab.insert(0, "<blk>")
 
-        self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
+        if kenlm_config is not None:
+            try:
+                self.ctc_decoder = build_ctcdecoder(
+                    self.ctc_vocab,
+                    kenlm_model_path=str(kenlm_config.kenlm_file),
+                    unigrams=kenlm_config.unigrams,
+                )
+            except Exception as e:
+                print(f"KenLM disabled: {e}")
+                self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
+        else:
+            self.ctc_decoder = build_ctcdecoder(self.ctc_vocab)
 
     def encode(self, label: str):
         return [self.charset.index(x) + 1 for x in label]
@@ -104,7 +122,7 @@ class Detection:
     def __init__(self, config: LineDetectionConfig | LayoutDetectionConfig):
         self.config = config
         self._config_file = config
-        self._onnx_model_file = config.model_file
+        self._onnx_model_file = config.onnx_file
         self._patch_size = config.patch_size
         self._execution_providers = get_execution_providers()
         self._inference = ort.InferenceSession(
@@ -365,11 +383,11 @@ class OCRInference:
             print("Warning: KenLM-based CTC-Decoder is None! Using default CTC-Decoder")
             return self.ctc_decoder.ctc_decode(logits)
 
-    def _decode_beams(self, logits: NDArray, use_lm: bool) -> list[OutputBeam]:
+    def _decode_beams(self, logits: NDArray, use_lm: bool = False) -> list[OutputBeam]:
         if logits.shape[0] == len(self.ctc_decoder.ctc_vocab):
             logits = np.transpose(
                 logits, axes=[1, 0]
-            )  # adjust logits to have shape time, vocab
+            )  # adjust log_decode_beamsits to have shape time, vocab
 
         if not use_lm:
             return self.ctc_decoder.ctc_beam_decode(logits)
@@ -423,13 +441,14 @@ class OCRPipeline:
         self,
         ocr_config: OCRModelConfig,
         line_config: LineDetectionConfig | LayoutDetectionConfig,
+        kenlm_config: KenLMConfig | None,
         use_line_prepadding: bool = False,
     ):
         self.ready = False
         self.ocr_model_config = ocr_config
         self.line_config = line_config
         self.encoder = ocr_config.encoder
-        self.ocr_inference = OCRInference(self.ocr_model_config)
+        self.ocr_inference = OCRInference(self.ocr_model_config, kenlm_config=kenlm_config)
         self.converter = pyewts.pyewts()
         self.use_line_prepadding = use_line_prepadding
 
@@ -443,9 +462,9 @@ class OCRPipeline:
             self.line_inference = None
             self.ready = False
 
-    def update_ocr_model(self, config: OCRModelConfig):
+    def update_ocr_model(self, config: OCRModelConfig, kenlm_config: KenLMConfig | None):
         self.ocr_model_config = config
-        self.ocr_inference = OCRInference(config)
+        self.ocr_inference = OCRInference(config, kenlm_config)
 
     def update_line_detection(
         self, config: Union[LineDetectionConfig, LayoutDetectionConfig]
@@ -639,7 +658,6 @@ class OCRPipeline:
                         else Encoding.UNICODE.name
                     ),
                     ctc_conf=None,
-                    norm_logp=None,
                     logits=None,
                     lm_scores=None,
                 )

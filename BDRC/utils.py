@@ -164,10 +164,18 @@ def read_line_model_config(config_file: str) -> LineDetectionConfig:
     file = open(config_file, encoding="utf-8")
     json_content = json.loads(file.read())
 
-    onnx_model_file = f"{model_dir}/{json_content['onnx-model']}"
+    checkpoint = f"{model_dir}/{json_content['checkpoint']}"
+    onnx_file = f"{model_dir}/{json_content['onnx-model']}"
+    architecture = json_content["architecture"]
     patch_size = int(json_content["patch_size"])
+    classes = json_content["classes"]
 
-    config = LineDetectionConfig(onnx_model_file, patch_size)
+    config = LineDetectionConfig(
+        checkpoint,
+        onnx_file,
+        architecture,
+        patch_size,
+        classes)
 
     return config
 
@@ -179,6 +187,12 @@ def read_layout_model_config(config_file: str) -> LayoutDetectionConfig:
 
     checkpoint = f"{model_dir}/{json_content["checkpoint"]}"
     onnx_model_file = f"{model_dir}/{json_content["onnx-model"]}"
+
+    if "architecture" in json_content:
+        architecture = f"{model_dir}/{json_content["architecture"]}"
+    else:
+        architecture = "deeplabv3"
+
     architecture = f"{model_dir}/{json_content["architecture"]}"
     patch_size = int(json_content["patch_size"])
     classes = json_content["classes"]

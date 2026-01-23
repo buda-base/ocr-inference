@@ -16,7 +16,7 @@ MODELS on HuggingFace
 """
 
 MODEL_DICT = {
-    "Lines_v1": "BDRC/PhotiLines",
+    "Lines_v2" : "BDRC/PhotiLines_v2",
     "Photi_v2": "BDRC/Photi-v2",
     "Woodblock": "BDRC/Woodblock",
     "UCHAN": "BDRC/BigUCHAN_v1",
@@ -26,6 +26,7 @@ MODEL_DICT = {
     "Norbuketaka_C": "BDRC/Norbuketaka_C_V1",
     "Norbuketaka_E": "BDRC/Norbuketaka_E_V1",
     "Drutsa-A_E": "BDRC/Drutsa-A_E_v1",
+    "ModernBooks": "BDRC/ModernBookFormat"
 }
 
 
